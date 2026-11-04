@@ -1,0 +1,84 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      KEY_PASS: totk-personal-build
+      NDK_VERSION: 28.2.13676358
+      TURNIP_SHA: 9b87afeb3d8d30c6a0ad5aab3e0703bc1500e0321e9f17a922106fa556389ec6
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Install Python dependency
+        run: pip install cryptography==50.0.2
+
+      - name: Install Android NDK
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "ndk;$NDK_VERSION" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Extract the Turnip driver from the official APK
+        run: |
+          mkdir -p turnip official
+          curl -L -o official.apk https://github.com/AurelioB/totk-android/releases/download/v1.0.0/TotK-Native-1.0.0.apk
+          unzip -q official.apk -d official
+          found=""
+          while IFS= read -r f; do
+            if [ "$(sha256sum "$f" | cut -d' ' -f1)" = "$TURNIP_SHA" ]; then
+              cp "$f" turnip/driver.so
+              found="$f"
+              break
+            fi
+          done < <(find official -type f)
+          echo "Turnip found at: $found"
+          test -n "$found"
+
+      - name: Restore or create signing key
+        uses: actions/cache@v4
+        with:
+          path: signing
+          key: signing-key-v1
+
+      - name: Create signing key if missing
+        run: |
+          mkdir -p signing
+          if [ ! -f signing/key.p12 ]; then
+            keytool -genkeypair -keystore signing/key.p12 -storetype PKCS12 \
+              -alias totk -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$KEY_PASS" -keypass "$KEY_PASS" -dname "CN=Personal TotK build"
+          fi
+
+      - name: Build APK
+        run: |
+          python3 games/totk/android/build_release.py \
+            --ndk "$ANDROID_HOME/ndk/$NDK_VERSION" \
+            --turnip "$PWD/turnip/driver.so" \
+            --key signing/key.p12 --key-pass-env KEY_PASS \
+            -o totk-native.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: totk-native-apk
+          path: totk-native.apk
