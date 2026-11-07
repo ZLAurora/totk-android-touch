@@ -290,7 +290,7 @@ def ab_log(windows, ctl):
 
 class UncappedReporting(unittest.TestCase):
     @staticmethod
-    def make_run(d, spikes=False, setting='1', override=None, force=False, speedup=False):
+    def make_run(d, spikes=False, setting='1', override=None, force=False, speedup=False, cap=None):
         (d / 'logs').mkdir(parents=True)
         lines = [f'[totk-ctl] gen={i + 1} frame={i * 900 + 1} mark ab arm={arm} block={i + 1}'
                  for i, arm in enumerate('ABBA')]
@@ -306,6 +306,9 @@ class UncappedReporting(unittest.TestCase):
                       f'[nvn-vk] frame {frame}, stutter: longest frame {worst} ms, {over33} frames over 33 ms, {over50} over 50 ms']
         (d / 'logs/thor.log').write_text('\n'.join(lines) + '\n')
         (d / 'settings-thor.env').write_text(f'TOTK_FPS60=1\nTOTK_UNCAPPED={setting}\n')
+        if cap is not None:
+            with (d / 'settings-thor.env').open('a') as stream:
+                stream.write(f'TOTK_UNCAPPED_HZ={cap}\n')
         if override is not None:
             (d / 'totk-env-thor.txt').write_text(f'TOTK_UNCAPPED={override}\n')
         (d / 'pans.txt').write_text(''.join(f'thor hateno F0={i * 900} F1={(i + 1) * 900} '
@@ -341,6 +344,19 @@ class UncappedReporting(unittest.TestCase):
         self.assertEqual(s['fps_stddev'], 10)
         self.assertIsNone(s['p99_ms_max'])
         self.assertEqual(s['p99_windows'], 0)
+
+    def test_forty_target_uses_effective_cap_and_cli_override(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name, override, target in (('forty', None, 40), ('disabled', '0', 60)):
+                doc, _ = self.make_run(root / name, cap='40', override=override)
+                self.assertEqual(doc['runs'][0]['pans'][0]['target_fps'], target)
+                self.assertTrue(all(w['target_fps'] == target for w in doc['runs'][0]['windows']))
+            result = run(BENCH / 'analyze.py', root / 'disabled', '--target-fps', '40',
+                         '--json', root / 'explicit.json')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            doc = json.loads((root / 'explicit.json').read_text())
+            self.assertEqual(doc['runs'][0]['pans'][0]['target_fps'], 40)
 
     def test_uncapped_comparisons_use_throughput_and_tails_never_dip_confounding(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -982,7 +998,7 @@ class PanMeasurement(unittest.TestCase):
                 'sleep': '#!/bin/sh\necho "sleep $*" >> "$CALLS"\n',
                 'date': '#!/bin/sh\nn=$(cat "$CLOCK" 2>/dev/null); n=$(( ${n:-100} + 1 )); echo "$n" > "$CLOCK"; echo "$n"\n',
                 'python3': '#!/bin/sh\necho "python $*" >> "$CALLS"\n'
-                           'case "$1" in *rootsh.py) case "$*" in *settings.env*) echo 1;; '
+                           'case "$1" in *rootsh.py) case "$*" in *settings.env*) printf "%s\\n" "${PRESET_ENV:-TOTK_FPS60=1}";; '
                            '*) n=$(cat "$FRAME" 2>/dev/null); n=$(( ${n:-0} + 300 )); '
                            'echo "$n" > "$FRAME"; echo "至帧 $n";; esac;; esac\n',
             }
@@ -1018,6 +1034,20 @@ class PanMeasurement(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('TARGET_FPS=60', (d / 'auto/pans.txt').read_text())
             self.assertEqual((d / 'calls').read_text().count('sleep 72\n'), 2)
+            for name, preset, target in (
+                    ('forty', 'TOTK_FPS60=1\nTOTK_UNCAPPED=1\nTOTK_UNCAPPED_HZ=40', 40),
+                    ('thirty', 'TOTK_FPS60=0\nTOTK_UNCAPPED=1\nTOTK_UNCAPPED_HZ=40', 30),
+                    ('disabled', 'TOTK_FPS60=1\nTOTK_UNCAPPED=1\nTOTK_UNCAPPED_HZ=40\nTOTK_UNCAPPED=0', 60),
+                    ('override', 'TOTK_FPS60=1\nTOTK_UNCAPPED=1\nTOTK_UNCAPPED_HZ=40\nTOTK_UNCAPPED_HZ=55', 60)):
+                result = subprocess.run(auto + ['--out', str(d / name)], env={**env, 'PRESET_ENV': preset},
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f'TARGET_FPS={target}', (d / name / 'pans.txt').read_text())
+            explicit = [*common]
+            explicit[explicit.index('--target-fps') + 1] = '40'
+            result = subprocess.run(explicit + ['--out', str(d / 'explicit40')], env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('TARGET_FPS=40', (d / 'explicit40/pans.txt').read_text())
 
 
 class GpuResidency(unittest.TestCase):

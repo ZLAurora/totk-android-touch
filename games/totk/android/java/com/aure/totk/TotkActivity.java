@@ -7,6 +7,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.util.Log;
 import android.view.AttachedSurfaceControl;
+import android.view.Display;
 import android.view.View;
 import com.aure.totk.companion.AssetStore;
 import com.aure.totk.companion.CompanionNative;
@@ -84,6 +85,22 @@ public final class TotkActivity extends NativeActivity {
     public void rumble(int left, int right) {
         GameFeedback f = feedback;
         if (f != null) f.rumble(left, right);
+    }
+
+    /** Native UI thread, on each window/display lifecycle update. This is an app-local content-rate request,
+     * not a preferred mode or Android setting; allow only integer Hz advertised by this window's own display.
+     * 0.01 Hz tolerates the float representation (e.g. 120.00001), not a distinct fractional refresh mode. */
+    public boolean supportsFrameRateHint(int hz) {
+        Display display = getWindow().getDecorView().getDisplay();
+        if (hz > 0 && display != null) {
+            for (Display.Mode mode : display.getSupportedModes()) {
+                if (Math.abs((double)mode.getRefreshRate() - hz) <= 0.01) return true;
+            }
+        }
+        Log.w("TotkPerf", "TOTK_FRAME_RATE_HINT_HZ=" + hz + " refused: "
+                + (display == null ? "window has no display" : "not advertised by window display " + display.getDisplayId())
+                + "; retaining existing policy");
+        return false;
     }
 
     /** Native UI thread only, after its explicit parent transaction succeeded.

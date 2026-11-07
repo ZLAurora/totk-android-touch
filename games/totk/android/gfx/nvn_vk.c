@@ -4091,6 +4091,14 @@ int vk_lag_test_query_bench(void) {
     return errors != 0;
 }
 #endif
+#ifdef TOTK_VK_TESTS
+static _Atomic int *g_test_gpu_write_ready, *g_test_gpu_write_resume;
+static uint64_t g_test_gpu_write_guards;
+void vk_record_test_gpu_write_pause(_Atomic int *ready, _Atomic int *resume) {
+    g_test_gpu_write_ready = ready; g_test_gpu_write_resume = resume;
+}
+uint64_t vk_record_test_gpu_write_guards(void) { return g_test_gpu_write_guards; }
+#endif
 static void gpu_write_inner(uint64_t a, uint64_t n, int guard) {
     if (!n) return;
     vk_wb_gpu_wrote(a, n);
@@ -4101,14 +4109,37 @@ static void gpu_write_inner(uint64_t a, uint64_t n, int guard) {
     snap_drop(physical, n);
     if (vk_lag_capture_on() || replay) ub_changed(physical, n);
     lag_producer_changed(physical, n);
-    /* the same range again in this submission (every material draw binds the per-tile flag buffer it writes):
-       its snapshot copies are already dropped and its range already logged */
-    { enum { NG = 256 }; static struct { uint64_t a, n, sub; int guarded; } seen[NG]; uint64_t sub = vk_submit_serial(); unsigned h = (unsigned)((a >> 6) ^ (a >> 20) ^ n) % NG;
-      if (seen[h].a == a && seen[h].n == n && seen[h].sub == sub) {
-          if (guard && !seen[h].guarded) { lag_guard_mark(a, n, NVN_DIRTY_LAG_WRITABLE | NVN_DIRTY_LAG_GPU); seen[h].guarded = 1; }
+#ifdef TOTK_VK_TESTS
+    /* Fixture-owned gates remain alive until the remapping thread joins. Pause after canonicalization
+       to pin the otherwise narrow donor/generation handoff; production has no hook or counter. */
+    if (g_test_gpu_write_ready) {
+        atomic_store_explicit(g_test_gpu_write_ready, 1, memory_order_release);
+        while (!atomic_load_explicit(g_test_gpu_write_resume, memory_order_acquire)) sched_yield();
+    }
+#endif
+    /* Keep both the selected canonical donor and current alias graph. A remap can complete after
+       canonicalization but before this generation load, so generation alone can label the old donor
+       with the new graph. New aliases must also revoke guarded=true even when the donor is unchanged. */
+    uint64_t spans = atomic_load_explicit(&g_span_gen, memory_order_acquire);
+    { enum { NG = 256 }; static struct { uint64_t a, n, sub, physical, spans; int guarded; } seen[NG];
+      uint64_t sub = vk_submit_serial(); unsigned h = (unsigned)((a >> 6) ^ (a >> 20) ^ n) % NG;
+      if (seen[h].a == a && seen[h].n == n && seen[h].sub == sub &&
+          seen[h].physical == physical && seen[h].spans == spans) {
+          if (guard && !seen[h].guarded) {
+#ifdef TOTK_VK_TESTS
+              g_test_gpu_write_guards++;
+#endif
+              lag_guard_mark(a, n, NVN_DIRTY_LAG_WRITABLE | NVN_DIRTY_LAG_GPU); seen[h].guarded = 1;
+          }
           return;
       }
-      seen[h].a = a; seen[h].n = n; seen[h].sub = sub; seen[h].guarded = guard; }
+      seen[h].a = a; seen[h].n = n; seen[h].sub = sub; seen[h].physical = physical;
+      seen[h].spans = spans; seen[h].guarded = guard; }
+    /* Count guard forwarding rather than eventual registrations: fresh frozen alias projection is
+       required here; the existing late submit path still owns ticket arming and its failures. */
+#ifdef TOTK_VK_TESTS
+    if (guard) g_test_gpu_write_guards++;
+#endif
     if (guard) lag_guard_mark(a, n, NVN_DIRTY_LAG_WRITABLE | NVN_DIRTY_LAG_GPU);
     a = physical;
     if (!snap_on() && !vk_lag_capture_on() && !replay) return;

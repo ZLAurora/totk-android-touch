@@ -11,6 +11,9 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   Per-thread period-weighted self/inclusive reports separate walker, recorder, submit and game CPU.
 - Give newly linked `libtotk.so` a SHA-1 GNU build ID retained in the packaged library,
   so native profiles can identify matching unstripped symbols without relying on source revision alone.
+- Add experimental `TOTK_FRAME_RATE_HINT_HZ` (default off, needs `TOTK_FRAME_RATE_HINT=1`): request only integer
+  rates advertised by the current game-window display, through the existing FIXED_SOURCE window/AHB-child hints.
+  Invalid or unavailable rates retain the old hint policy; game pacing and Android settings remain unchanged.
 
 ### Runtime
 - Keep `totk.log` as the direct primary log, but make its duplicate logcat mirror opt-in (`TOTK_LOGCAT=1`).
@@ -21,6 +24,14 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   incrementing an atomic counter every frame; publish immutable stage names only when they change.
 
 ### Menu
+- Add **40 fps** to Frame rate without changing existing presets or 30/60 settings. It caps real game updates
+  at 40 with normal game speed and frame lag off, requesting 120 Hz when advertised. Presentation slots follow
+  the actual display clock: smoothest on 120 Hz; on 60 Hz (including a user-imposed cap) it is uneven.
+  Selecting 40 disables frame generation; returning to 30/60 removes the 40-specific timing and refresh request.
+- Preserve the scripted-camera 30 fps safety floor at 40 fps using a 33.333 ms producer period and matching
+  two-/four-refresh slots on 60/120 Hz. If 120 Hz is unavailable, request at least 60 Hz content cadence so a
+  30/60 Hz panel does not drop to 30 Hz; ADPF work targets and the existing 30/60 settings stay unchanged.
+  The 120 Hz three-refresh path is fixture-tested only, not yet device-qualified; device smokes remain at the user's 60 Hz limit.
 - **Keep the GPU busy** in Graphics → Performance feeds smaller batches earlier and requests clocks that keep up.
   On by default only on Snapdragon 8 Elite-class chips (Odin 3), independently of the chosen preset; it uses a
   little more GPU and CPU clock, power and heat. Restart-based Odin 3 tests raised Hateno from 46.5 to 57.3 fps

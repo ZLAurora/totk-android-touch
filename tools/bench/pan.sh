@@ -1,15 +1,15 @@
 #!/bin/sh
-# pan.sh -s <serial> --device <label> --scene <label> --out <dir> [--target-fps 30|60] [--seconds N] [--repeat N]
+# pan.sh -s <serial> --device <label> --scene <label> --out <dir> [--target-fps 30|40|60] [--seconds N] [--repeat N]
 #        [--value 16000] [--first right|left] [--no-shot] [--event /dev/input/eventN] [--display <id>]
 #        [--package <pkg>] [--game-dir <dir>]
 #
 # Steady horizontal camera pan: the right stick held at --value (of 32767) to the right for the first half of the time,
 # then to the left for the second half (--first left: left, then right), then released, so the view returns.
-# Defaults: infer the preset target (settings.env plus totk.env override); 30 uses 48 seconds and 60 uses 144 seconds
+# Defaults: infer the effective target (settings.env plus totk.env override); 30 uses 48 seconds and 40/60 use 144 seconds
 # to retain twelve complete windows even near 30 fps. Unknown target uses 48 seconds without claiming a pacing target.
 # --target-fps overrides detection; --seconds overrides duration; --repeat runs N pans without another settle.
 # Appends one line per pan to <out>/pans.txt (TARGET_FPS lets the analyzer warn when fewer than twelve windows survive):
-#   <device> <scene> F0=<before> F1=<after> T0=<epoch s> T1=<epoch s> V=<value> D=<1|-1> TARGET_FPS=<30|60>
+#   <device> <scene> F0=<before> F1=<after> T0=<epoch s> T1=<epoch s> V=<value> D=<1|-1> TARGET_FPS=<30|40|60>
 # (D: 1 right first, -1 left first) and two lines to <out>/freqs.txt, the frequency limits (`bench_input.sh freqs`)
 # just before and just after the pan, plus raw cumulative GPU counters at both boundaries in gpu-time-in-state.jsonl:
 #   <device> <scene> T0=<epoch s> start|end <cpuN=... gpu_...>
@@ -45,7 +45,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ -n "$SER" ] && [ -n "$DEV" ] && [ -n "$SCENE" ] && [ -n "$OUT" ] || usage
-case $TARGET_FPS in ''|30|60) ;; *) die "--target-fps: 30 or 60" ;; esac
+case $TARGET_FPS in ''|30|40|60) ;; *) die "--target-fps: 30, 40 or 60" ;; esac
 case $REPEAT in ''|*[!0-9]*) die "--repeat: a positive integer" ;; esac
 [ "$REPEAT" -gt 0 ] || die "--repeat: a positive integer"
 case $DEV$SCENE in *[!A-Za-z0-9_-]*) die "--device / --scene: letters, digits, _ and - only" ;; esac
@@ -54,10 +54,17 @@ case $FIRST in right) D=1 ;; left) D=-1 ;; *) die "--first: right or left" ;; es
 LOG=$GAME/totk.log
 if [ -z "$TARGET_FPS" ]; then
   PRESET=$(python3 "$HERE/rootsh.py" -s "$SER" run -c \
-    "cat /data/user/0/$PKG/files/settings.env $GAME/totk.env 2>/dev/null | grep '^TOTK_FPS60=' | tail -n1 | cut -d= -f2" | tr -d '\r')
-  case $PRESET in 1) TARGET_FPS=60 ;; 0) TARGET_FPS=30 ;; esac
+    "cat /data/user/0/$PKG/files/settings.env $GAME/totk.env 2>/dev/null" | tr -d '\r')
+  TARGET_FPS=$(printf '%s\n' "$PRESET" | awk -F= '
+    $1 == "TOTK_FPS60" { fps = $2 }
+    $1 == "TOTK_UNCAPPED" { uncapped = $2 }
+    $1 == "TOTK_UNCAPPED_HZ" { hz = $2 }
+    END {
+      if (fps == "1") print uncapped == "1" && hz == "40" ? 40 : 60
+      else if (fps == "0") print 30
+    }')
 fi
-[ -n "$SECS" ] || { if [ "$TARGET_FPS" = 60 ]; then SECS=144; else SECS=48; fi; }
+[ -n "$SECS" ] || { case $TARGET_FPS in 40|60) SECS=144 ;; *) SECS=48 ;; esac; }
 HALF=$(awk -v seconds="$SECS" 'BEGIN {
   if (seconds !~ /^([0-9]+([.][0-9]*)?|[.][0-9]+)$/ || seconds <= 0) exit 1
   print seconds / 2

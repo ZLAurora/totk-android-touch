@@ -741,6 +741,10 @@ start adds the whole GPU time to the frame. Measured standing in the Gerudo Dese
   sleep behind that ownership handoff while queue submission is waiting for its worker to join.
   Hot selection and private copies remain walking-thread operations. The software-GPU path retains late writable
   exclusion and merging; software shader-written host VAs are not armed by recorder workers.
+  Repeated GPU-writer deduplication keys both the selected canonical donor VA and alias-graph generation,
+  not only raw VA/extent/submission. A same-serial remap must index the new donor, and an alias join must
+  refresh frozen guard projection even with an unchanged donor. Keeping the donor separately also covers
+  a remap completing between canonicalization and the generation sample; no guard is armed earlier.
 
   Lag ticket and unit-gate waits exceeding 500 ms emit one `[dirty-lag-wait]` record per wait episode, including
   waiting TID and scoped runtime role plus OS thread name, unit VA/extent, captured ticket, GPU completion and latest

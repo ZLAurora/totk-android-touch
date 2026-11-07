@@ -1340,7 +1340,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             ((Widgets.Selector) value).set(Strings.valueName(key, settings.get(key)), count, option.index(settings.get(key)));
             if (key.equals("latency")) {
                 row.dimmed(settings.latencyLocked());
-                row.hint.setText(settings.latencyLocked() ? Strings.LOCKED_FRAMEGEN : Strings.optionHint(key));
+                row.hint.setText(settings.latencyLocked() ? Strings.latencyConstraint(settings) : Strings.optionHint(key));
             }
         }
         String preset = settings.preset();
@@ -1385,7 +1385,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     private void fact(String key, String value) { fact(key, Theme.text(this, value, false, 20, Theme.TEXT)); }
     private static int cost(String key, String value) {
         switch (key) {
-            case "frame_rate": return value.equals("60") ? 4 : 2;
+            case "frame_rate": return value.equals("60") ? 4 : value.equals("40") ? 3 : 2;
             case "frame_gen": return value.equals("on") ? 3 : 0;
             case "gpu_feed": return value.equals("on") ? 1 : 0;
             case "render_res": return value.equals("960x540") ? 1 : value.equals("1152x648") ? 2 : 3;
@@ -1429,7 +1429,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             if (!Settings.option(key).tab.equals(Settings.CONTROLS)) fact(Strings.GPU_COST, new Widgets.Meter(this).set(cost(key, value)));
             switch (key) {
                 case "frame_rate":
-                    fact(Strings.WORKS_WITH, value.equals("60") ? Strings.valueName("frame_gen", "off") + " frame generation" : "every option");
+                    fact(Strings.WORKS_WITH, !value.equals("30") ? Strings.valueName("frame_gen", "off") + " frame generation" : "every option");
                     break;
                 case "frame_gen":
                     fact(Strings.ADDED_LATENCY, Strings.addedLatency(key, value));
@@ -1437,11 +1437,11 @@ public final class SetupActivity extends Activity implements SetupService.Listen
                     break;
                 case "gpu_feed":
                     fact(Strings.WORKS_WITH, "Frame generation off");
-                    if (settings.latencyLocked()) constraint = Strings.LOCKED_FRAMEGEN;
+                    if ("on".equals(settings.get("frame_gen"))) constraint = Strings.LOCKED_FRAMEGEN;
                     break;
                 case "latency":
-                    fact(Strings.ADDED_LATENCY, settings.latencyLocked() ? Strings.LOCKED_FRAMEGEN : Strings.addedLatency(key, value));
-                    // the fact row already says "Set by frame generation"; no second line
+                    fact(Strings.ADDED_LATENCY, settings.latencyLocked() ? Strings.latencyConstraint(settings) : Strings.addedLatency(key, value));
+                    // The fact row already explains the fixed latency; no second line.
                     break;
                 case "sharpness_fsr": case "sharpness_sgsr":
                     fact(Strings.APPLIES, Strings.WHEN_STARTS);

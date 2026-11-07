@@ -341,6 +341,19 @@ int main(int argc, char **argv) {
         self.assertNotIn('ignored', log)
         self.assertIn('settings.env (launcher menu; totk.env overrides): ' + ' '.join(block) + '\n', log)
 
+    def test_forty_fps_timing_and_hint_block_is_allowed(self):
+        block = ('TOTK_FPS60=1 TOTK_UNCAPPED=1 TOTK_UNCAPPED_HZ=40 TOTK_UNCAPPED_INTERVAL=1 '
+                 'TOTK_REALTIME=1 TOTK_FRAME_LAG=0 TOTK_FPS_AUTO=0 TOTK_PACE=0 TOTK_PRESENT_SLOTS=auto '
+                 'TOTK_ACQUIRE_SLACK=0 TOTK_ACQUIRE_CLOCK=0 TOTK_FRAME_RATE_HINT=1 TOTK_FRAME_RATE_HINT_HZ=120').split()
+        _, log = self.startup(settings='\n'.join(block) + '\n')
+        self.assertNotIn('ignored', log)
+        self.assertIn('settings.env (launcher menu; totk.env overrides): ' + ' '.join(block) + '\n', log)
+        _, log = self.startup(settings='\n'.join(block) + '\n',
+                              lines='TOTK_UNCAPPED_HZ=41\nTOTK_PRESENT_SLOTS=0\n')
+        self.assertIn('UNCAPPED=1 PACE=0 ACQUIRE_CLOCK=0 ACQUIRE_SLACK=0 PRESENT_SLOTS=0', log)
+        self.assertIn('totk.env: TOTK_UNCAPPED_HZ=41\n', log)
+        self.assertIn('totk.env: TOTK_PRESENT_SLOTS=0\n', log)
+
     def test_acquire_slack_two_no_longer_enables_the_frame_timeline(self):
         output, _ = self.startup(settings='TOTK_ACQUIRE_SLACK=2\n')
         self.assertIn('ENV TOTK_ACQUIRE_SLACK=2', output)

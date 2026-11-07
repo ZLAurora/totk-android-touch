@@ -164,6 +164,99 @@ static void disabled_unavailable(void) {
     runtime_android_present_wait(UINT64_MAX); /* host stub cannot sleep */
 #endif
 }
+static void auto40_policy(void) {
+    const uint64_t refresh120 = 8333333, producer = 25000000;
+    assert(vk_present_slots_config("1") == VK_PRESENT_SLOTS_CONFIG_FIXED);
+    assert(vk_present_slots_config("auto") == VK_PRESENT_SLOTS_CONFIG_AUTO40);
+    const char *off[] = {NULL, "", "0", "01", "AUTO", "auto40", " auto", "auto "};
+    for (unsigned i = 0; i < sizeof off / sizeof *off; i++)
+        assert(vk_present_slots_config(off[i]) == VK_PRESENT_SLOTS_CONFIG_OFF);
+    vk_present_slots p = {0};
+    vk_present_slot r = vk_present_slots_auto40_reserve(&p, 0.025, 0, 0, base);
+    assert(r.mode == VK_PRESENT_SLOTS_NO_CLOCK && r.desired_ns == base);
+    assert(!r.interval && !r.refresh_ns && !r.copy_open_ns);
+    for (unsigned i = 0; i < 600; i++) {
+        uint64_t now = base + (uint64_t)(i + 1) * producer;
+        uint64_t callback = base + (now - base) / refresh60 * refresh60;
+        r = vk_present_slots_auto40_reserve(&p, 0.025, callback, refresh60, now);
+        assert(r.mode == VK_PRESENT_SLOTS_OFF && r.desired_ns == now);
+        assert(!r.interval && !r.refresh_ns && !r.copy_open_ns && !p.refresh_ns);
+    }
+    p = (vk_present_slots){0};
+    for (unsigned i = 0; i < 600; i++) {
+        uint64_t callback = base + (uint64_t)i * 3 * refresh120;
+        r = vk_present_slots_auto40_reserve(&p, 0.025, callback, refresh120,
+            callback + (i % 3 + 1) * 1000000);
+        assert(r.mode == VK_PRESENT_SLOTS_ACTIVE && r.interval == 3);
+        assert(r.refresh_ns == refresh120 && !r.skipped);
+        assert(r.desired_ns == base + (uint64_t)(i + 1) * 3 * refresh120);
+        assert(r.copy_open_ns == r.desired_ns);
+    }
+    const double other_periods[] = {0, -1, 1.0 / 60, 0.025001, 0.024999};
+    for (unsigned i = 0; i < sizeof other_periods / sizeof *other_periods; i++) {
+        p = (vk_present_slots){0};
+        r = vk_present_slots_auto40_reserve(&p, other_periods[i], base, refresh120, base);
+        assert(r.mode == VK_PRESENT_SLOTS_OFF && !r.interval && r.desired_ns == base);
+    }
+    const uint64_t other_refreshes[] = {refresh60, 11111111, 6944444, 7999999, 8650001};
+    for (unsigned i = 0; i < sizeof other_refreshes / sizeof *other_refreshes; i++) {
+        p = (vk_present_slots){0};
+        r = vk_present_slots_auto40_reserve(&p, 0.025, base, other_refreshes[i], base);
+        assert(r.mode == VK_PRESENT_SLOTS_OFF && !r.interval && r.desired_ns == base);
+    }
+    p = (vk_present_slots){0};
+    r = vk_present_slots_auto40_reserve(&p, 0.025, base, 8341675, base);
+    assert(r.mode == VK_PRESENT_SLOTS_ACTIVE && r.interval == 3); /*119.88Hz*/
+    const uint64_t cutscene_refreshes[] = {refresh60, refresh120};
+    for (unsigned i = 0; i < 2; i++) {
+        uint64_t refresh = cutscene_refreshes[i], previous = 0;
+        p = (vk_present_slots){0};
+        for (unsigned frame = 0; frame < 600; frame++) {
+            unsigned interval = i ? 4 : 2;
+            uint64_t callback = base + (uint64_t)frame * interval * refresh;
+            r = vk_present_slots_auto40_reserve(&p, (1000000000ull / 30) / 1e9, callback, refresh, callback + 1);
+            assert(r.mode == VK_PRESENT_SLOTS_ACTIVE && r.interval == interval);
+            assert(r.desired_ns == callback + interval * refresh);
+            if (previous) assert(r.desired_ns - previous == interval * refresh);
+            previous = r.desired_ns;
+        }
+        r = vk_present_slots_auto40_reserve(&p, 0.025, previous, refresh, previous + 1);
+        assert(r.interval == (i ? 3 : 0) && r.desired_ns > previous);
+    }
+}
+static void auto40_transitions(void) {
+    const uint64_t refresh120 = 8333333;
+    vk_present_slots p = {0};
+    vk_present_slot queued = vk_present_slots_auto40_reserve(&p, 0.025, base, refresh120, base);
+    vk_present_slot saved = queued;
+    vk_present_slot fallback = vk_present_slots_auto40_reserve(&p, 0.025,
+        base + refresh60, refresh60, base + refresh60);
+    assert(fallback.mode == VK_PRESENT_SLOTS_OFF && fallback.desired_ns == queued.desired_ns + 1);
+    assert(!fallback.refresh_ns && !fallback.copy_open_ns && !fallback.interval && !p.refresh_ns);
+    vk_present_slot unavailable = vk_present_slots_auto40_reserve(&p, 0.025, 0, 0, base + refresh60 + 1);
+    assert(unavailable.mode == VK_PRESENT_SLOTS_NO_CLOCK);
+    assert(unavailable.desired_ns == fallback.desired_ns + 1 && !p.refresh_ns);
+    uint64_t callback = base + 10 * refresh120;
+    vk_present_slot resumed = vk_present_slots_auto40_reserve(&p, 0.025,
+        callback, refresh120, callback + 1);
+    assert(resumed.mode == VK_PRESENT_SLOTS_ACTIVE && resumed.desired_ns == callback + 3 * refresh120);
+    assert(resumed.desired_ns > unavailable.desired_ns);
+    assert(!memcmp(&queued, &saved, sizeof queued)); /* Owned targets are immutable. */
+    /* Calibrated period changes retain ordering on the new physical lattice. */
+    vk_present_slot calibrated = vk_present_slots_auto40_reserve(&p, 0.025,
+        callback + refresh120, 8341675, callback + refresh120 + 1);
+    assert(calibrated.desired_ns >= resumed.desired_ns + 3 * UINT64_C(8341675));
+    assert(calibrated.interval == 3 && calibrated.refresh_ns == 8341675);
+    assert(runtime_present_auto_clock_fresh(base, refresh120, 0, base));
+    assert(runtime_present_auto_clock_fresh(base, refresh120, 0, base + 2 * refresh120));
+    assert(!runtime_present_auto_clock_fresh(base, refresh120, 0, base + 2 * refresh120 + 1));
+    assert(!runtime_present_auto_clock_fresh(base, refresh120, base, base));
+    assert(!runtime_present_auto_clock_fresh(base, refresh120, base + 1, base));
+    assert(!runtime_present_auto_clock_fresh(base, refresh120, 0, base - 1));
+    assert(!runtime_present_auto_clock_fresh(0, refresh120, 0, base));
+    assert(!runtime_present_auto_clock_fresh(base, 0, 0, base));
+    assert(!runtime_present_auto_clock_fresh(base, UINT64_MAX, 0, base));
+}
 static void interpolation_order(void) {
     vk_present_slots slots = {0};
     vk_present_interp interp = {.retained = -1};
@@ -1048,6 +1141,7 @@ int main(void) {
     assert(vk_present_slots_interval(0, refresh60) == 1);
     assert(vk_present_slots_interval(1.0 / 30, 0) == 1);
     cadence(2); cadence(1); late_short(); long_stall(); mode_changes(); fractional_refresh(); disabled_unavailable();
+    auto40_policy(); auto40_transitions();
     interpolation_order(); interpolation_late(); interpolation_buffered(); interpolation_boundaries();
     interpolation_pool(); interpolation_fsr_phase(); interpolation_odin();
     timelines();

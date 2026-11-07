@@ -12,6 +12,15 @@ static inline int runtime_present_can_submit(uint64_t frame_ns, uint64_t target_
                                               uint64_t refresh_ns, uint64_t now_ns) {
     return now_ns >= target_ns && runtime_present_slot_reached(frame_ns, target_ns, refresh_ns);
 }
+/* Auto40 must not use the startup's assumed60Hz period, an old callback with
+ * a newly declared period, or a suspended callback stream. Explicit slot1
+ * keeps its legacy clock contract. Two refreshes of callback age are allowed. */
+static inline int runtime_present_auto_clock_fresh(uint64_t frame_ns, uint64_t refresh_ns,
+        uint64_t refresh_frame_ns, uint64_t now_ns) {
+    return refresh_ns >= 1000000 && refresh_ns <= 1000000000 &&
+        frame_ns > refresh_frame_ns && frame_ns <= now_ns && now_ns <= (uint64_t)INT64_MAX &&
+        now_ns - frame_ns <= 2 * refresh_ns;
+}
 /* Predictor budget: one mandatory picture plus one optional extra. Discrete
  * slack admission uses its own pending < 1+lead gate (lead 0/1/2). */
 enum { RUNTIME_PRESENT_SLACK_PENDING = 2 };

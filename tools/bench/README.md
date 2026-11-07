@@ -19,7 +19,7 @@ Common options: `-s <serial>` (adb serial), `--device <label>` (a short name use
 | Script | Use |
 |---|---|
 | `bench_input.sh -s <serial> [--event /dev/input/eventN] [--display <id>] <action>` | `press <A\|B\|X\|Y\|L\|R\|PLUS\|MINUS\|UP\|DOWN\|LEFT\|RIGHT> [ms]`, `rstick <x> [y]` (`rstick 0` releases), `shot <file>`, `log`, `detect`, `freqs` (the frequency limits as one line: `cpuN=<cpus>:<scaling_min>:<scaling_max>:<cpuinfo_max>` kHz per cpufreq policy, `gpu_maxclk`, `gpu_freqs`, `gpu_devfreq_max`, GPU power levels). Auto-detects the controller node (`getevent -p`: ABS_Z/ABS_RZ + BTN_SOUTH) and the first display (`dumpsys SurfaceFlinger --display-id`). |
-| `pan.sh -s <serial> --device <label> --scene <label> [--target-fps 30\|60] [--seconds N] [--repeat N] [--value 16000] [--first right\|left] [--no-shot] --out <dir>` | Return pan: stick right for half the time then left (`--first left`: reverse). Defaults to 48 s at 30 target, 144 s at 60 target. Records frame/time/frequency boundaries and exact GPU cumulative snapshots per pan, then optional screenshot outside motion. |
+| `pan.sh -s <serial> --device <label> --scene <label> [--target-fps 30\|40\|60] [--seconds N] [--repeat N] [--value 16000] [--first right\|left] [--no-shot] --out <dir>` | Return pan: stick right for half the time then left (`--first left`: reverse). Defaults to 48 s at 30 target, 144 s at 40/60 target. Records frame/time/frequency boundaries and exact GPU cumulative snapshots per pan, then optional screenshot outside motion. |
 | `rootsh.py -s <serial> run [-c <script>] \| status \| stop` | The serial's persistent root shell: a host-side broker holding one `adb shell su -c sh`, started by the first `run`, ended by `stop`, after 30 idle minutes or when the device goes. `run` executes the script (default: stdin) in its own `sh -c` and passes its stdout, stderr and status through (124: no answer in time, 125: no root shell). The shell pins itself to the slowest cpufreq cluster (`status` prints the cores). |
 | `live.sh -s <serial> set KEY=VALUE \| unset KEY \| mark <text>...` | Live switches (APP.md *Live switches*): atomically replaces `<game>/totk.ctl` with only the new batch (one generation at the next presented frame) and prints the game's `[totk-ctl]` answer (a mark's acknowledgement, refusals); exit 3 when a mark is not acknowledged, 4 when a line was refused. |
 | `ab.sh -s <serial> --device <label> --scene <label> --arms 'A:<lines>;B:<lines>' [--order ABBAABBA] [--pan-seconds 30] [--settle 15] --out <dir>` | In-session A/B in one loaded scene: per block, the arm's lines plus `mark ab arm=<X> block=<n> scene=<scene> direction=<right\|left>` (live.sh), a settle, a pan (direction alternating). Writes `<dir>/arms.txt` with the direction recorded. |
@@ -38,8 +38,9 @@ cap, so it gives reference-only comparisons.
 
 ### Pacing states, not just a session average
 
-`analyze.py` uses the preset's `TOTK_FPS60` (`1`: 60 target, `0`: 30 target), recorded pan target, or explicit
-`--target-fps 30|60`. Unknown targets remain unclassified, never silently treated as 60. At 60, a window with
+`analyze.py` uses effective menu/developer settings (`TOTK_FPS60=1` with `TOTK_UNCAPPED=1` and
+`TOTK_UNCAPPED_HZ=40`: 40 target; otherwise FPS60 `1`: 60, `0`: 30), recorded pan target, or explicit
+`--target-fps 30|40|60`. Unknown targets remain unclassified, never silently treated as 60. At 60, a window with
 at least 60/300 frames in 29–37.5 ms is a dip: complete frame durations take priority, then the complete
 present-fence interval histogram. Sparse `[长帧]` / `[frame-tl late]` traces only establish lower bounds; otherwise
 the fallback is window fps below 5/6 of target (below 50 for 60). A normal 30-target 33 ms window is steady.
@@ -112,6 +113,7 @@ do not mix traced/untraced arms, and use independent distinct-picture evidence f
 
 The target defaults to the active preset (`settings.env`, then developer `totk.env` override); `--target-fps`
 overrides detection. Unknown targets use 48 s and omit target metadata rather than incorrectly labelling a 60 run.
+The 40 fps menu choice is detected as 40 rather than 60 despite `TOTK_FPS60=1`, and defaults to a 144 s pan.
 For 60-target measurements use `pan.sh --target-fps 60 --out "$OUT" ...`: the default is a continuous **144 s**
 pan (72 s each direction), long enough for >=12 complete 300-frame windows even during 30-interval stretches.
 `--seconds N` explicitly chooses another length; `--repeat N` runs back-to-back return pans, each with independent

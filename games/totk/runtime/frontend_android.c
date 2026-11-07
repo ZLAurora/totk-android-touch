@@ -39,6 +39,7 @@
 #include "live_ctl.h"
 #include "thread_sampler.h"
 #include "build_kind.h"
+#include "android_perf.h"
 #include <android/api-level.h>
 #include <android/choreographer.h>
 #include <android/asset_manager.h>
@@ -101,6 +102,7 @@ const char *runtime_android_private_files(void) { return g_activity ? g_activity
  * must not change the legacy VI source: only TOTK_PACE=display selects real VI
  * signals. The fixed acquire lattice is independent of display_pace_take(). */
 static int display_pace_on, display_pace_ready, present_slots_on, acquire_clock_on, predict_requested;
+static int present_slots_auto, display_refresh_observed;
 static _Atomic int predict_on;
 static pthread_mutex_t display_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t display_cv = PTHREAD_COND_INITIALIZER;
@@ -568,9 +570,13 @@ int runtime_android_acquire_wait(unsigned interval) {
     return 1;
 }
 int runtime_android_present_clock(uint64_t *frame_ns, uint64_t *refresh_ns) {
-    if (!present_slots_on) return 0;
+    if (!present_slots_on && !present_slots_auto) return 0;
     pthread_mutex_lock(&display_mu);
     int ready = display_clock.frame_ns != 0;
+    if (present_slots_auto)
+        ready = ready && display_refresh_observed &&
+            runtime_present_auto_clock_fresh(display_clock.frame_ns, (uint64_t)display_period_ns,
+                display_refresh_frame_ns, runtime_now_ns());
     if (ready) { *frame_ns = display_clock.frame_ns; *refresh_ns = (uint64_t)display_period_ns; }
     pthread_mutex_unlock(&display_mu);
     return ready;
@@ -612,7 +618,7 @@ int runtime_android_adaptive_slot_timelines(runtime_present_timelines *out) {
     return ready;
 }
 void runtime_android_present_wait(uint64_t target_ns) {
-    if (!present_slots_on) return;
+    if (!present_slots_on && !present_slots_auto) return;
     pthread_mutex_lock(&display_mu);
     /* Match the callback lattice, not nanosecond rounding of refresh-period
      * multiplication. A sub-quarter-refresh difference is the same slot. */
@@ -1000,6 +1006,12 @@ static void display_refresh(int64_t period_ns, void *arg) {
     (void)arg;
     if (period_ns < 1000000 || period_ns > 1000000000) return;
     pthread_mutex_lock(&display_mu);
+    /* Even the first declaration matching the assumed60Hz period needs a
+     * subsequent callback before auto may use its phase. No supported-mode
+     * list or frame-rate hint can establish this observed clock. */
+    if (!display_refresh_observed && present_slots_auto)
+        display_refresh_frame_ns = display_clock.frame_ns;
+    display_refresh_observed = 1;
     if (display_nominal_period_ns != (uint64_t)period_ns) {
         display_nominal_period_ns = (uint64_t)period_ns;
         display_period_ns = period_ns;
@@ -1069,7 +1081,9 @@ static int android_display_vsync_start(void) {
     const char *mode = getenv("TOTK_PACE"), *slots = getenv("TOTK_PRESENT_SLOTS");
     const char *acquire = getenv("TOTK_ACQUIRE_CLOCK"), *slack = getenv("TOTK_ACQUIRE_SLACK");
     display_pace_on = mode && !strcmp(mode, "display");
-    present_slots_on = slots && !strcmp(slots, "1");
+    int slot_mode = vk_present_slots_config(slots);
+    present_slots_on = slot_mode == VK_PRESENT_SLOTS_CONFIG_FIXED;
+    present_slots_auto = slot_mode == VK_PRESENT_SLOTS_CONFIG_AUTO40;
     present_timeline_configure();
     adaptive_slots_configure();
     acquire_clock_on = acquire && !strcmp(acquire, "vsync");
@@ -1114,6 +1128,8 @@ static int android_display_vsync_start(void) {
                 slack && !strcmp(slack, "2") ? "two-period requested" :
                 slack && !strcmp(slack, "1") ? "requested" : "off",
                 display_pace_on ? "display" : "legacy 60 Hz");
+    if (present_slots_auto)
+        fprintf(stderr, "[totk-pace] presenter slots auto requested: UNCAPPED=1/HZ=40 +25ms frames + observed120Hz use interval3; scripted30 floor uses interval2/4 at60/120Hz; other caps/refresh/unknown/stale clock retain producer pacing; auto never enables acquire lead or frame lag\n");
     if (acquire_clock_on)
         fprintf(stderr, "[totk-pace] acquire clock available (TOTK_ACQUIRE_CLOCK=vsync): persistent real-vsync lattice, guest interval; strict >one-period stall reanchor, bounded catch-up; VI %s\n",
                 display_pace_on ? "display" : "legacy 60 Hz");
@@ -1246,6 +1262,8 @@ static const char *const settings_keys[] = {
     /* frame generation timing block */
     "TOTK_REALTIME", "TOTK_FRAME_LAG", "TOTK_FPS_AUTO", "DM_PRESENT_HZ", "DM_PRESENT_INTERVAL", "TOTK_PRESENT_SLOTS",
     "TOTK_VK_PRESENT", "TOTK_ACQUIRE_CLOCK", "TOTK_PACE", "TOTK_ASYNC_REPLAY",
+    /* 40fps producer clock and optional120Hz request (not observed mode). */
+    "TOTK_UNCAPPED", "TOTK_UNCAPPED_HZ", "TOTK_UNCAPPED_INTERVAL", "TOTK_FRAME_RATE_HINT", "TOTK_FRAME_RATE_HINT_HZ",
     "TOTK_DATA_DIR",
 };
 static int settings_key(const char *name) {
@@ -2086,6 +2104,25 @@ static jmethodID surface_parent_method(JNIEnv *env, jobject obj, const char *nam
     (*env)->DeleteLocalRef(env, cls);
     return method;
 }
+/* Validate before publishing a new window, and again on existing window/display lifecycle notifications.
+ * A previous window's accepted override must never authorize a rate on a different display. */
+static void frame_rate_hint_update(ANativeActivity *a) {
+    unsigned requested = totk_perf_rate_request();
+    if (!requested) return;   /* Off leaves the existing path unchanged, including no Java query. */
+    JNIEnv *env = a->env;
+    jmethodID method = surface_parent_method(env, a->clazz, "supportsFrameRateHint", "(I)Z");
+    jboolean supported = method && !(*env)->ExceptionCheck(env) ?
+        (*env)->CallBooleanMethod(env, a->clazz, method, (jint)requested) : JNI_FALSE;
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        supported = JNI_FALSE;
+        fprintf(stderr, "[totk-perf] TOTK_FRAME_RATE_HINT_HZ=%u refused: display query JNI error; retaining existing policy\n", requested);
+    } else if (!method || !supported) {
+        fprintf(stderr, "[totk-perf] TOTK_FRAME_RATE_HINT_HZ=%u refused: unavailable or not advertised by current window display; retaining existing policy\n", requested);
+    }
+    totk_perf_rate_override(supported ? requested : 0);
+    if (supported) fprintf(stderr, "[totk-perf] TOTK_FRAME_RATE_HINT_HZ=%u validated for current window display; FIXED_SOURCE request, not observed panel cadence\n", requested);
+}
 /* Optional Java32 root hint listener, never a guessed panel orientation or a
  * default-display query. Keep JNI and AttachedSurfaceControl on this UI thread.
  * The successful explicit parent attachment gates the initial hint query.
@@ -2301,6 +2338,7 @@ static void window_clear(ANativeActivity *a) {
     g_window_display_id = -1;
 }
 static void surface_parent_retry(ANativeActivity *a, ANativeWindow *w, const char *event) {
+    if (w && w == g_window) frame_rate_hint_update(a);
     if (w && w == g_window && g_window_ahb && !g_surface_parent_window && surface_parent_create(a, event))
         g_window_epoch = vk_window_set(g_window, g_surface_parent_window, g_window_display_id);
     if (w && w == g_window) present_transform_update(a,g_window_epoch);
@@ -2311,6 +2349,7 @@ static void on_window_created(ANativeActivity *a, ANativeWindow *w) {
     g_window = w;
     const char *present = getenv("TOTK_VK_PRESENT");
     g_window_ahb = !present || !*present || !strcmp(present, "ahb");
+    frame_rate_hint_update(a);
     if (g_window_ahb) surface_parent_create(a, "created");
     g_window_epoch = vk_window_set(w, g_surface_parent_window, g_window_display_id);
     present_transform_update(a,g_window_epoch);
@@ -2387,6 +2426,7 @@ static void on_resume(ANativeActivity *a) {
     (void)a;
     game_input_after_ns = (int64_t)mono_ns();
     android_game_lifecycle_pause(0);
+    if (g_window) frame_rate_hint_update(a);
     /* The focus facet may still hold the gate until the window regains focus. */
     vk_window_resized(g_window, g_window_epoch);
     present_transform_update(a,g_window_epoch);

@@ -82,6 +82,17 @@ static inline uint32_t vk_present_slots_interval(double period, uint64_t refresh
     return ticks < 1 ? 1 : (uint32_t)(ticks + 0.5);
 }
 
+/* auto is deliberately the 40fps gameplay policy plus its30fps cutscene
+ * floor, not nearest-refresh quantization for arbitrary caps. The producer's
+ * 25ms period remains authoritative at60Hz; observed120Hz admits three slots.
+ * The cutscene floor uses two60Hz/four120Hz slots. Physical bands match
+ * adaptive presentation. Explicit0/1 retain their existing behavior. */
+enum { VK_PRESENT_SLOTS_CONFIG_OFF, VK_PRESENT_SLOTS_CONFIG_FIXED, VK_PRESENT_SLOTS_CONFIG_AUTO40 };
+static inline int vk_present_slots_config(const char *value) {
+    return value && !strcmp(value, "1") ? VK_PRESENT_SLOTS_CONFIG_FIXED :
+        value && !strcmp(value, "auto") ? VK_PRESENT_SLOTS_CONFIG_AUTO40 : VK_PRESENT_SLOTS_CONFIG_OFF;
+}
+
 /* One full requested game period of initial lead. Thereafter arrival jitter
  * never resets phase. A reservation up to one game period late is retained so
  * a short following frame can catch up; a longer stall skips directly to the
@@ -122,6 +133,33 @@ static inline vk_present_slot vk_present_slots_reserve(vk_present_slots *p, int 
     *p = (vk_present_slots){.desired_ns = target, .refresh_ns = refresh_ns};
     return (vk_present_slot){.desired_ns = target, .copy_open_ns = target,
         .refresh_ns = refresh_ns, .skipped = skipped, .interval = interval, .mode = VK_PRESENT_SLOTS_ACTIVE};
+}
+
+/* Dropping out of auto slots clears phase, not the queued-target floor. The
+ * 40fps gameplay period only slots on120Hz; its scripted-camera30fps floor
+ * slots on either120Hz (four refreshes) or60Hz (two). Other pictures retain
+ * interval/refresh/copy-open zero without nearest-refresh rounding. A pending
+ * future target is crossed monotonically; re-entry reanchors beyond it. */
+static inline vk_present_slot vk_present_slots_auto40_reserve(vk_present_slots *p,
+        double requested_period, uint64_t callback_ns, uint64_t refresh_ns, uint64_t now_ns) {
+    vk_present_slot r;
+    unsigned interval = 0;
+    int cutscene30 = requested_period == (1000000000ull / 30) / 1e9 || requested_period == 1.0 / 30.0;
+    if (refresh_ns >= 8000000 && refresh_ns <= 8650000)
+        interval = requested_period == 1.0 / 40.0 ? 3 : cutscene30 ? 4 : 0;
+    else if (cutscene30 && refresh_ns >= 16000000 && refresh_ns <= 17300000)
+        interval = 2;
+    if (interval) {
+        r = vk_present_slots_reserve(p, 1, callback_ns, refresh_ns, interval, now_ns);
+        if (r.mode == VK_PRESENT_SLOTS_ACTIVE) return r;
+    }
+    r = (vk_present_slot){.desired_ns = now_ns,
+        .mode = callback_ns && refresh_ns ? VK_PRESENT_SLOTS_OFF : VK_PRESENT_SLOTS_NO_CLOCK};
+    if (p->desired_ns >= now_ns && p->desired_ns < (uint64_t)INT64_MAX)
+        r.desired_ns = p->desired_ns + 1;
+    p->desired_ns = r.desired_ns;
+    p->refresh_ns = 0;
+    return r;
 }
 
 /* Interpolation retains the current real picture until its successor exists.

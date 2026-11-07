@@ -3402,6 +3402,10 @@ static unsigned cutscene_present_ticks(unsigned ticks) {
     if (!runtime_cutscene_present_ticks || dm_detclock_enabled() || mfx_enabled() != MFX_OFF) return ticks;
     uint64_t refresh = g_hz > 0 ? 1000000000ull / (unsigned)g_hz : 0;
 #if defined(__ANDROID__) && defined(TOTK_ANDROID_APP)
+    /* A 33.3ms floor cannot be represented by integral 25ms producer ticks.
+     * present_period resolves this mode in guest60 units instead, once per
+     * period query; do not alternate runtime diagnostics between two clocks. */
+    if (uncapped_now() && g_hz == 40) return ticks;
     if (!uncapped_now()) {
         uint64_t measured = runtime_android_display_period(1);
         if (measured) refresh = measured;
@@ -3443,7 +3447,15 @@ static uint64_t present_period(const win_t *o) {
                                     m == MFX_MAX ? (g_uncapped ? "补帧 不限帧：不限帧率，每帧补一帧" : "补帧 不限帧：按游戏的出图间隔，每帧补一帧") :
                                     g_uncapped ? "补帧关：不限帧率" : "补帧关：按游戏的出图间隔"); was = m; }
     if (m == MFX_30) return 1000000000ull / 30;   /* exactly 30 fps, by display ticks or by our own clock */
-    return hz > 0 ? (uint64_t)itv * 1000000000ull / (uint64_t)hz : 0;
+    uint64_t period = hz > 0 ? (uint64_t)itv * 1000000000ull / (uint64_t)hz : 0;
+#if defined(__ANDROID__) && defined(TOTK_ANDROID_APP)
+    if (uncapped_now() && hz == 40 && !dm_detclock_enabled() && m == MFX_OFF && runtime_cutscene_present_ticks) {
+        unsigned guest_floor = runtime_cutscene_present_ticks(1, 1000000000ull / 60);
+        uint64_t floor = (uint64_t)guest_floor * 1000000000ull / 60;
+        if (period < floor) period = floor;
+    }
+#endif
+    return period;
 }
 /* Exercise production policy, including the shrine's interval=2 and the
    legacy 30 FPS path. No sleep, present or GPU allocation is involved. */

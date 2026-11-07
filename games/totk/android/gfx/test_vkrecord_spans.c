@@ -222,6 +222,17 @@ static int lag_uniform_cover_fixture(uint64_t base, uint64_t alias, uint64_t pro
     return errors;
 }
 
+typedef struct {
+    _Atomic int ready, resume;
+    void *address; uint64_t donor, size;
+} producer_remap;
+static void *producer_remap_run(void *arg) {
+    producer_remap *r = arg;
+    while (!atomic_load_explicit(&r->ready, memory_order_acquire)) sched_yield();
+    vk_record_test_alias(r->address, r->donor, r->size);
+    atomic_store_explicit(&r->resume, 1, memory_order_release);
+    return NULL;
+}
 static int lag_cache_fixture(int *checks) {
     if (!vk_record_lag_enabled() || !vk_lag_uniform_private()) {
         printf("lag cache: protected rename-OFF wait policy required; policy-specific cases not exercised\n");
@@ -616,6 +627,62 @@ static int lag_cache_fixture(int *checks) {
         "partial virtual remap revokes mapping cache and resolves new physical producer");
     LAG_CHECK(!vk_lag_read_record(piece + 64, 16, 16, &same, &reason, VK_LAG_INDEX) && !(reason & NVN_DIRTY_LAG_GPU),
         "winning-span boundary cannot extend producer classification into adjacent virtual mapping");
+    vk_record_test_alias(alias, (uint64_t)(uintptr_t)physical, BYTES);
+    /* The producer seen-cache must not confuse a repeated virtual VA with its old donor. Use fresh
+       units so a producer already indexed elsewhere cannot make a missing second insertion pass. */
+    uint64_t remapped = tracked_alias + 6 * unit + 1024;
+    uint64_t donor_a = tracked + 6 * unit + 128, donor_b = tracked + 7 * unit + 128;
+    vk_record_test_alias((void *)(uintptr_t)remapped, donor_a, 64);
+    uint64_t remap_serial = vk_submit_serial();
+    mtl_sub_copy(unit_producer, remapped, 16);
+    LAG_CHECK(!vk_lag_read_record(donor_a, 16, 16, &same, &reason, VK_LAG_INDEX) &&
+        (reason & NVN_DIRTY_LAG_GPU), "first virtual write indexes donor A");
+    LAG_CHECK(!vk_lag_read_record(donor_b, 16, 16, &same, &reason, VK_LAG_INDEX) &&
+        !(reason & NVN_DIRTY_LAG_GPU), "donor B has no producer before the remapped write");
+    vk_record_test_alias((void *)(uintptr_t)remapped, donor_b, 64);
+    LAG_CHECK(vk_resolve(remapped, 16, &alias_buffer, &alias_offset) &&
+        vk_resolve(donor_b, 16, &physical_buffer, &physical_offset) &&
+        alias_buffer == physical_buffer && alias_offset == physical_offset,
+        "same virtual address now resolves to donor B");
+    mtl_sub_copy(unit_producer, remapped, 16);
+    LAG_CHECK(vk_submit_serial() == remap_serial, "both virtual writes and donor remap retain one seal serial");
+    LAG_CHECK(!vk_lag_read_record(donor_b, 16, 16, &same, &reason, VK_LAG_INDEX) &&
+        (reason & NVN_DIRTY_LAG_GPU), "same-serial remapped virtual write indexes donor B");
+    LAG_CHECK(!vk_lag_read_record(donor_a, 16, 16, &same, &reason, VK_LAG_INDEX) &&
+        (reason & NVN_DIRTY_LAG_GPU), "remapped virtual write does not discard donor A's producer");
+    /* A remap on another thread can finish after the writer selected donor A but before it records
+       the current generation. The following write must still index B even with that same generation. */
+    uint64_t raced = tracked_alias + 9 * unit + 1024;
+    uint64_t race_a = tracked + 9 * unit + 128, race_b = tracked + 10 * unit + 128;
+    vk_record_test_alias((void *)(uintptr_t)raced, race_a, 64);
+    vk_gpu_write_record(raced, 16);
+    producer_remap race = {.address = (void *)(uintptr_t)raced, .donor = race_b, .size = 64};
+    pthread_t remapper;
+    vk_record_test_gpu_write_pause(&race.ready, &race.resume);
+    if (pthread_create(&remapper, NULL, producer_remap_run, &race)) DIE("producer remapper thread failed");
+    vk_gpu_write_record(raced, 16);
+    pthread_join(remapper, NULL); vk_record_test_gpu_write_pause(NULL, NULL);
+    vk_gpu_write_record(raced, 16);
+    LAG_CHECK(vk_submit_serial() == remap_serial &&
+        !vk_lag_read_record(race_b, 16, 16, &same, &reason, VK_LAG_INDEX) &&
+        (reason & NVN_DIRTY_LAG_GPU), "concurrent canonical-donor/generation handoff cannot hide donor B");
+    /* guarded=true describes a frozen alias inventory, not just a donor. Keep the donor unchanged,
+       concurrently join one more alias, and require a fresh guard intent without disabling stable dedup. */
+    vk_gpu_write(remapped, 16);
+    uint64_t guards = vk_record_test_gpu_write_guards();
+    vk_gpu_write(remapped, 16);
+    LAG_CHECK(vk_record_test_gpu_write_guards() == guards, "unchanged mapping retains guarded duplicate suppression");
+    producer_remap join = {.address = (void *)(uintptr_t)(tracked_alias + 11 * unit + 1024),
+                          .donor = donor_b, .size = 64};
+    vk_record_test_gpu_write_pause(&join.ready, &join.resume);
+    if (pthread_create(&remapper, NULL, producer_remap_run, &join)) DIE("guard alias remapper thread failed");
+    vk_gpu_write(remapped, 16);
+    pthread_join(remapper, NULL); vk_record_test_gpu_write_pause(NULL, NULL);
+    LAG_CHECK(vk_record_test_gpu_write_guards() == guards + 1,
+        "concurrent alias join revokes guarded state and forwards a fresh protection intent");
+    vk_gpu_write(remapped, 16);
+    LAG_CHECK(vk_record_test_gpu_write_guards() == guards + 1,
+        "refreshed alias inventory permits guarded duplicate suppression again");
     vk_record_test_alias(alias, (uint64_t)(uintptr_t)physical, BYTES);
     LAG_CHECK(!vk_lag_read_record(tracked + unit - 8, 16, 16, &same, &reason, VK_LAG_INDEX) &&
         (reason & NVN_DIRTY_LAG_READONLY), "range crossing real unit boundary takes complete conservative path");

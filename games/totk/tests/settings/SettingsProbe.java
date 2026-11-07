@@ -18,7 +18,9 @@ import java.util.Map;
  *    applysoc name soc k=v...      firstRun(soc), optional overrides, then apply a preset
  *    profile soc                   Settings.profile, profileKnown and socClass ('-' = null SOC_MODEL), space-separated
  *    first soc                     Settings.firstRun values
+ *    latency k=v...                whether the effective latency is fixed by the selected timing mode
  *    env locale k=v...             Settings.env(locale) with newlines as '|' ('-' = no locale)
+ *    envset locale k=v...          defaults, sequential Settings.set, then env text (for mode transitions)
  *    envsoc soc locale k=v...      Settings.env(locale) from a stored map with this chip
  *    envpreset name locale k=v...  apply a preset, then Settings.env(locale)
  *    envsocpreset name soc locale k=v...  firstRun(soc), apply a preset, optional overrides, then Settings.env(locale)
@@ -71,8 +73,14 @@ public final class SettingsProbe {
                     break;
                 }
                 case "first": answer = dump(Settings.firstRun(w.length > 1 ? w[1] : null)); break;
+                case "latency": answer = String.valueOf(new Settings(pairs(w, 1), null).latencyLocked()); break;
                 case "defaults": { Settings s = new Settings(pairs(w, 3), w[2]); s.defaults(w[1], w[2]); answer = dump(s); break; }
                 case "env": answer = new Settings(pairs(w, 2), null).env(w[1].equals("-") ? null : w[1]).replace('\n', '|'); break;
+                case "envset": {
+                    Settings s = new Settings(null, null);
+                    for (Map.Entry<String, String> e : pairsInOrder(w, 2)) s.set(e.getKey(), e.getValue());
+                    answer = s.env(w[1].equals("-") ? null : w[1]).replace('\n', '|'); break;
+                }
                 case "envsoc": answer = new Settings(pairs(w, 3), w[1]).env(w[2].equals("-") ? null : w[2]).replace('\n', '|'); break;
                 case "envpreset": {
                     Settings s = new Settings(pairs(w, 3), null);

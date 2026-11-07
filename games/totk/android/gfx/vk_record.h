@@ -188,6 +188,9 @@ void vk_record_test_assemble(void);
 int vk_record_test_async_submit(void);
 int vk_record_test_take_failure(uint64_t ticket);
 void vk_record_test_alias(void *address, uint64_t source, uint64_t size);
+/* Test-only canonicalization/remap handoff; fixture owns the atomics through remapper join. */
+void vk_record_test_gpu_write_pause(_Atomic int *ready, _Atomic int *resume);
+uint64_t vk_record_test_gpu_write_guards(void);
 void vk_record_test_pause_draws(uint32_t minimum);
 void vk_record_test_delay(uint32_t maximum_us); /* deterministic varied worker timing; zero disables */
 uint64_t vk_record_test_pointer_hits(void);

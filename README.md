@@ -42,7 +42,7 @@ What changed in each version: [CHANGELOG.md](CHANGELOG.md). The full player guid
   *About*. **+** starts the game from any screen.
 - **Per-device profiles**: the first start picks the tested preset for your chip (AYN Odin 3, AYN Thor, Retroid Pocket
   Duo); every option can be changed, and **Y** brings back your device's defaults.
-- **Graphics options**: presets, 30 / 60 fps, render resolution, FSR 1 and Snapdragon GSR upscaling, FXAA / SMAA, shadow
+- **Graphics options**: presets, 30 / 40 / 60 fps, render resolution, FSR 1 and Snapdragon GSR upscaling, FXAA / SMAA, shadow
   quality, handheld or docked mode, a performance overlay. Experimental: frame generation and a native-resolution HUD.
 - **Every option explains itself**: the menu shows what each one does, with an illustration, its GPU cost and what it
   works with.
@@ -177,10 +177,11 @@ option shows *Custom*):
 
 #### Frame rate
 
-How often the game itself updates. 30 fps is what the game was made for; 60 fps doubles the work for the processor and
-the GPU, and busy areas may drop below it. 60 fps turns frame generation off.
+How often the game itself updates. 30 fps is what the game was made for; 40 fps is a middle ground.
+Smoothest on 120 Hz displays; on 60 Hz it is uneven. The app cannot override your display's refresh limit.
+60 fps doubles the work for the processor and GPU, and busy areas may drop below it. 40 and 60 fps turn frame generation off.
 
-Options: 30 fps, 60 fps · Default: **60 fps** on Odin 3, **30 fps** on Thor, Duo and Other.
+Options: 30 fps, 40 fps, 60 fps · Default: **60 fps** on Odin 3, **30 fps** on Thor, Duo and Other.
 
 <img src="docs/images/set-frame-rate.webp" width="640" alt="Frame rate">
 

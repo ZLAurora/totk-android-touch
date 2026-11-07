@@ -7673,12 +7673,19 @@ static void pres_slot_reserve(pres_buf *b, double requested_period) {
     static vk_present_slots slots;
     static uint64_t count, late, skipped, worst_late;
     static int hybrid_was_interpolating;
-    if (on < 0) { const char *e = getenv("TOTK_PRESENT_SLOTS"); on = e && !strcmp(e, "1"); }
+    if (on < 0) {
+        on = vk_present_slots_config(getenv("TOTK_PRESENT_SLOTS"));
+        if (on == VK_PRESENT_SLOTS_CONFIG_AUTO40) {
+            const char *uncapped = getenv("TOTK_UNCAPPED"), *hz = getenv("TOTK_UNCAPPED_HZ");
+            if (!uncapped || strcmp(uncapped, "1") || !hz || strcmp(hz, "40"))
+                on = VK_PRESENT_SLOTS_CONFIG_OFF; /* Developer overrides retain their producer policy. */
+        }
+    }
     if (!on) return;
     uint64_t callback = 0, refresh = 0;
     if (!runtime_android_present_clock(&callback, &refresh)) refresh = 0;
     uint64_t now = host_now_ns();
-    if (vk_fg_adaptive()) {
+    if (on == VK_PRESENT_SLOTS_CONFIG_FIXED && vk_fg_adaptive()) {
         static uint64_t last_real, generation;
         if (!callback || refresh<8000000 || refresh>18000000 || callback>now) return;
         if (generation!=b->generation) { last_real=0; generation=b->generation; }
@@ -7696,13 +7703,17 @@ static void pres_slot_reserve(pres_buf *b, double requested_period) {
      * floor: no previously queued native/child picture is retimed/overtaken. */
     if (hybrid_interpolating && !hybrid_was_interpolating) slots.refresh_ns=0;
     hybrid_was_interpolating=hybrid_interpolating;
-    vk_present_slot slot = vk_present_slots_reserve(&slots, 1, callback, refresh,
-        vk_present_slots_interval(requested_period, refresh), now);
+    vk_present_slot slot = on == VK_PRESENT_SLOTS_CONFIG_AUTO40 ?
+        vk_present_slots_auto40_reserve(&slots, requested_period, callback, refresh, now) :
+        vk_present_slots_reserve(&slots, 1, callback, refresh,
+            vk_present_slots_interval(requested_period, refresh), now);
     if (slot.mode==VK_PRESENT_SLOTS_ACTIVE && runtime_fps_hybrid_selected() &&
         !runtime_fps_hybrid_interpolating() && g_pres_interp.retained>=0 &&
         slot.desired_ns<=vk_present_interp_child_floor(&g_pres_interp))
         slot=vk_present_slots_reserve(&slots,1,callback,refresh,slot.interval,now);
     if (slot.mode != VK_PRESENT_SLOTS_ACTIVE) {
+        if (on == VK_PRESENT_SLOTS_CONFIG_AUTO40) b->desired_ns = slot.desired_ns;
+        if (slot.mode == VK_PRESENT_SLOTS_OFF) return;
         if (!unavailable) { LOGV("window present slots: display clock unavailable; using legacy presentation"); unavailable = 1; }
         return;
     }

@@ -563,8 +563,8 @@ def main():
     ap.add_argument('--arms', action='store_true', help='in-session A/B: assign windows to the arms of the live-switch marks')
     ap.add_argument('--uncapped', action='store_true',
                     help='uncapped measurement: disable dip classification and compare time-weighted throughput')
-    ap.add_argument('--target-fps', type=int, choices=(30, 60),
-                    help='override pacing target (otherwise pans.txt TARGET_FPS or preset TOTK_FPS60)')
+    ap.add_argument('--target-fps', type=int, choices=(30, 40, 60),
+                    help='override pacing target (otherwise pans.txt TARGET_FPS or effective menu target)')
     ap.add_argument('--guard-frames', type=int, default=GUARD_FRAMES,
                     help=f'frames after a live change before a window may start (default {GUARD_FRAMES})')
     a = ap.parse_args()
@@ -589,7 +589,7 @@ def main():
     order = [d for d in order if any(k[0] == d for k in pans)]
     scenes = list(dict.fromkeys(s for _, s in pans))
 
-    logs, facts, devices, caveats = {}, {}, {}, []
+    logs, facts, devices, caveats, env_targets = {}, {}, {}, [], {}
     for dev in order:
         lp = os.path.join(out, 'logs', f'{dev}.log')
         if not os.path.exists(lp):
@@ -600,6 +600,10 @@ def main():
         senv = read_kv(os.path.join(out, f'settings-{dev}.env')) or dict(info.get('settings', {}))
         senv.pop('TOTK_DATA_DIR', None)
         effective = {**senv, **read_kv(os.path.join(out, f'totk-env-{dev}.txt'))}
+        preset = effective.get('TOTK_FPS60')
+        env_targets[dev] = (40 if preset == '1' and effective.get('TOTK_UNCAPPED') == '1'
+                            and effective.get('TOTK_UNCAPPED_HZ') == '40' else
+                            60 if preset == '1' else 30 if preset == '0' else None)
         f = facts[dev]
         displays = f.get('displays')
         devices[dev] = {
@@ -649,8 +653,7 @@ def main():
             samples = parse_sample_rows(os.path.join(out, f'samples-{dev}.txt'))
             for kv in plist:
                 f0, f1 = kv['F0'], kv['F1']
-                preset = devices[dev]['settings_env'].get('TOTK_FPS60')
-                target = a.target_fps or kv.get('TARGET_FPS') or (60 if preset == '1' else 30 if preset == '0' else None)
+                target = a.target_fps or kv.get('TARGET_FPS') or env_targets[dev]
                 targets.append(target)
                 pan_window_start = len(windows)
                 for f in sorted(x for x in timing if f0 + 600 <= x <= f1):

@@ -40,6 +40,24 @@ static inline unsigned totk_frame_rate(unsigned real_hz, int framegen, int latti
     /* A 30-Hz physical mode would turn the two-slot 30fps lattice into 15fps. */
     return framegen || lattice || real_hz >= 60 ? 60 : 30;
 }
+/* The opt-in auto40 profile must not select a physical30Hz mode, even while
+ * its scripted-camera floor is active. Preserve higher validated overrides. */
+static inline unsigned totk_frame_rate_minimum(int auto40, unsigned hz) {
+    return auto40 && hz < 60 ? 60 : hz;
+}
+/* Startup-only integer decimal Hz; 0/unset disables the override. The actual window display must separately
+ * advertise the requested rate before it is used. Reject signs, fractions, suffixes and overflow. */
+static inline int totk_frame_rate_hint_parse(const char *s, unsigned *hz) {
+    *hz = 0;
+    if (!s || !*s) return 1;
+    unsigned value = 0;
+    for (; *s; s++) {
+        if (*s < '0' || *s > '9' || value > (2147483647u - (unsigned)(*s - '0')) / 10) return 0;
+        value = value * 10 + (unsigned)(*s - '0');
+    }
+    *hz = value;
+    return 1;
+}
 /* TOTK_RATE_HINT_HOLD: the window's output rate from the game's own interval (60-Hz units), never from the measured
  * present period, which follows the panel: a panel that took a 30 Hz request would otherwise read as a 30 fps game
  * forever. Host floors (cutscenes, FPS auto) only lower what is shown, so leaving them out can only ask for more.

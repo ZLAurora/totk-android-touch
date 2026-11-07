@@ -95,10 +95,16 @@ public interface AttachedSurfaceControl {
     void addOnBufferTransformHintChangedListener(OnBufferTransformHintChangedListener listener);
     void removeOnBufferTransformHintChangedListener(OnBufferTransformHintChangedListener listener);
 }''',
-    'android/view/Display.java': 'package android.view; public final class Display { public int getDisplayId() { return 0; } }',
+    'android/view/Display.java': '''package android.view;
+public final class Display {
+    public int getDisplayId() { return 0; }
+    public Mode[] getSupportedModes() { return new Mode[0]; }
+    public static final class Mode { public float getRefreshRate() { return 60; } }
+}''',
     'android/view/View.java': '''package android.view;
 public class View {
     public boolean isAttachedToWindow() { return false; }
+    public Display getDisplay() { return null; }
     public AttachedSurfaceControl getRootSurfaceControl() { return null; }
 }''',
     'android/view/Window.java': '''package android.view;

@@ -85,6 +85,9 @@ final class Strings {
     static final String STRENGTH = "Strength";
     static final String WHEN_STARTS = "when the game starts";
     static final String LOCKED_FRAMEGEN = "Set by frame generation";
+    static String latencyConstraint(Settings settings) {
+        return "40".equals(settings.get("frame_rate")) ? "Fixed for 40 fps" : LOCKED_FRAMEGEN;
+    }
     static final String NEEDS_UPSCALER = "Needs an upscaler (FSR 1 or Snapdragon GSR)";
     static final String HOLD = "Yes · press ";
     static final String HOLD_THEN = " then ";
@@ -147,7 +150,7 @@ final class Strings {
     }
     static String optionHint(String key) {
         switch (key) {
-            case "frame_rate": return "60 fps turns frame generation off";
+            case "frame_rate": return "40 fps: smoothest on 120 Hz displays; on 60 Hz it is uneven.";
             case "frame_gen": return "Shows an extra picture between two real ones";
             case "render_res": return "Size of the 3D scene before upscaling";
             case "latency": return "Responsive · Balanced · Smoothest";
@@ -171,8 +174,10 @@ final class Strings {
     }
     static String optionText(String key) {
         switch (key) {
-            case "frame_rate": return "How often the game itself updates. 30 fps is what the game was made for; 60 fps doubles the work "
-                    + "for the processor and the GPU, and busy areas may drop below it.";
+            case "frame_rate": return "How often the game itself updates. 30 fps is what the game was made for. "
+                    + "40 fps is a middle ground: Smoothest on 120 Hz displays; on 60 Hz it is uneven. "
+                    + "The app requests 120 Hz but cannot override your display settings. "
+                    + "40 and 60 fps turn frame generation off. 60 fps doubles the work for the processor and GPU; busy areas may drop below it.";
             case "frame_gen": return "Draws an in-between picture from two real frames, so the screen updates 60 times a second while "
                     + "the game itself runs at 30. Motion looks smoother; input feels about one frame later.";
             case "render_res": return "The size the game draws its 3D scene at before it is enlarged to fill the screen. Smaller is faster "
