@@ -134,7 +134,9 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(sorted(a[(A, 'name')][1] for t, a in m['all'] if t == 'uses-permission'),
                          sorted(['android.permission.FOREGROUND_SERVICE', 'android.permission.FOREGROUND_SERVICE_DATA_SYNC',
                                  'android.permission.POST_NOTIFICATIONS', 'android.permission.WAKE_LOCK',
-                                 'android.permission.MANAGE_EXTERNAL_STORAGE', 'android.permission.VIBRATE']))
+                                 'android.permission.MANAGE_EXTERNAL_STORAGE', 'android.permission.VIBRATE',
+                                 'android.permission.INTERNET', 'android.permission.ACCESS_NETWORK_STATE',
+                                 'android.permission.REQUEST_INSTALL_PACKAGES']))
         app = m['application']
         self.assertEqual(app[(A, 'label')], (3, 'TotK Native'))
         for name, value in (('hasCode', TRUE), ('debuggable', FALSE), ('extractNativeLibs', TRUE), ('allowBackup', FALSE),
@@ -145,16 +147,34 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(setup[(A, 'exported')], TRUE)
         self.assertEqual(setup[(A, 'process')], (3, ':setup'))
         self.assertEqual(setup[(A, 'launchMode')], (0x10, 1))
+        self.assertEqual(setup[(A, 'relinquishTaskIdentity')], TRUE)
+        self.assertNotIn((A, 'taskAffinity'), setup)
         self.assertEqual(setup[(A, 'theme')], (1, 0x01030011))
         self.assertNotIn((A, 'screenOrientation'), setup)
         game = by_name(m, 'activity', 'com.aure.totk.TotkActivity')
         self.assertEqual(game[(A, 'exported')], FALSE)
         self.assertNotIn((A, 'process'), game)
+        self.assertEqual(game[(A, 'launchMode')], (0x10, 2))
+        self.assertEqual(game[(A, 'label')], app[(A, 'label')])
+        self.assertNotIn((A, 'taskAffinity'), game)
+        self.assertNotIn((A, 'relinquishTaskIdentity'), game)
         self.assertEqual(game[(A, 'screenOrientation')], (0x10, 6))
         service = by_name(m, 'service', 'com.aure.totk.setup.SetupService')
         self.assertEqual(service[(A, 'foregroundServiceType')], (0x11, 1))
         self.assertEqual(service[(A, 'exported')], FALSE)
         self.assertEqual(service[(A, 'process')], (3, ':setup'))
+        control = by_name(m, 'service', 'com.aure.totk.GameControlService')
+        self.assertEqual(control[(A, 'exported')], FALSE)
+        self.assertNotIn((A, 'process'), control)
+        self.assertNotIn((A, 'foregroundServiceType'), control)
+        receiver = by_name(m, 'receiver', 'com.aure.totk.setup.UpdateReceiver')
+        self.assertEqual(receiver[(A, 'exported')], FALSE)
+        self.assertEqual(receiver[(A, 'process')], (3, ':setup'))
+        update_entry = by_name(m, 'activity', 'com.aure.totk.setup.UpdateEntryActivity')
+        self.assertEqual(update_entry[(A, 'exported')], FALSE)
+        self.assertEqual(update_entry[(A, 'process')], (3, ':setup'))
+        self.assertEqual(app[(A, 'usesCleartextTraffic')], TRUE)
+        self.assertNotIn((A, 'process'), app)
         # One launcher entry: the setup screen; the game is started by it once install.json says playable.
         tags = [t for t, _ in m['all']]
         self.assertEqual(tags.count('intent-filter'), 1)

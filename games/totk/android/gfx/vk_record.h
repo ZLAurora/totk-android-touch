@@ -110,7 +110,13 @@ vk_record_descriptor *vk_record_descriptors(vk_record_draw *draw, unsigned set, 
 VkDescriptorUpdateTemplate vk_record_template(VkDescriptorSetLayout layout, const vk_record_descriptor *input, uint32_t count); /* walking owner */
 void vk_record_draw_commit(void);
 void vk_record_draw_abort(void);
-int vk_record_pass_end(VkCommandBuffer primary); /* 1: parked; 0: empty secondary pass ended directly */
+void vk_record_pass_flush(void); /* walking owner: dispatch final chunk before closing profiler CPU bookkeeping */
+/* Caller selects the entry with cached vk_gpuprof_on; both return 1: parked, 0: empty pass ended.
+   Distinct entries leave the disabled core free of token/switch lifetimes across chunk dispatch. */
+int vk_record_pass_end(VkCommandBuffer primary);
+/* Enabled profiler only: captures the optional end token and emits it after EndRendering on this exact primary,
+   now or at assembly. Use this entry even for a NULL token when profiling is enabled. */
+int vk_record_pass_end_profiled(VkCommandBuffer primary, const vk_gpuprof_end_token *profile_end);
 void vk_record_slot_seal(unsigned slot); /* walking owner detaches immutable pending primaries and flushes queued chunks */
 void vk_record_assemble(unsigned slot, int background); /* sole slot-pool owner, before QueueSubmit */
 void vk_record_walk_wait(uint64_t ns); /* walking-only join of actual queue publication */
@@ -121,8 +127,46 @@ void vk_record_timestamp(VkQueryPool pool, uint32_t query, VkPipelineStageFlags2
 void vk_record_dynamic_emit(VkCommandBuffer cb, const vk_record_dynamic *state, vk_record_dynamic *last, int all);
 void vk_record_walk_time(uint64_t ns);  /* submission elapsed, excluding GPU waits */
 void vk_record_stats(uint64_t frame);
+void vk_record_descriptor_walk(uint64_t ns); /* walking owner: complete bind/selection time, not just driver calls */
+void vk_record_descriptor_primary(uint64_t sets, uint64_t calls, uint64_t resets); /* serialized primary owner */
+void vk_record_primary_pools(int64_t delta); /* primary slots' retained descriptor pools, for the descriptors line */
+/* The one descriptor-pool shape of every recorder context and primary slot (vk_record.c). It declares every type a
+   backend layout uses: the reflected shader types (vk_reflect.py) and those of the post / presentation / frame-generation
+   layouts. A type a pool does not declare has zero capacity, so a layout using it would fail in a fresh pool (DIE);
+   vk_desc_layout_fits refuses such a layout where it is created instead, naming the type. */
+enum { VK_DESC_POOL_TYPES = 8 };
+extern const VkDescriptorPoolSize vk_desc_pool_sizes[VK_DESC_POOL_TYPES];
+int vk_desc_layout_fits(const VkDescriptorSetLayoutBinding *bindings, uint32_t count, char *why, size_t size);
+/* Descriptor-set stock (TOTK_VK_DESC_STOCK=1, read once with the recorder controls). One stock per owner that
+   used to reset its pools each slot generation: take only checks out sets not yet issued this generation (the
+   caller rewrites every one), retire rewinds them at that same retirement point and returns a reason when the owner
+   must reset the pools it used since the last rebuild (the stock is already invalidated).
+   TOTK_VK_DESC_STOCK_MAX_SETS (vk_desc_stock_ceiling, live at the same handoff) is a hard per-owner ceiling: the stock
+   never holds more sets; a checkout past it is allocated outside the stock, and the handoff then resets the owner
+   (set limit). An owner also keeps at most vk_desc_stock_pool_limit pools: one with more resets and destroys the rest
+   (pool limit). Reasons are counted on the descriptors line. */
+enum { VK_DESC_STOCK_BATCH = 32, VK_DESC_PRIMARY_POOL_SETS = 4096 /* a primary slot's pool (nvn_vk.c) */ };
+enum { VK_DESC_STOCK_OFF, VK_DESC_STOCK_PRESSURE, VK_DESC_STOCK_SET_LIMIT, VK_DESC_STOCK_POOL_LIMIT, VK_DESC_STOCK_REASONS };
+typedef struct vk_desc_stock vk_desc_stock;
+typedef uint32_t (*vk_desc_stock_alloc)(void *owner, VkDescriptorSetLayout layout, uint32_t count, VkDescriptorSet *out); /* 1..count */
+int vk_desc_stock_enabled(void);   /* the launch value */
+int vk_desc_stock_want(void);      /* the live value an owner takes at its generation handoff (runtime/live_ctl.h) */
+uint32_t vk_desc_stock_ceiling(void);   /* live sets per owner, 0: no ceiling */
+uint32_t vk_desc_stock_pool_limit(uint32_t ceiling, uint32_t pool_sets);   /* pools an owner keeps; UINT32_MAX without a ceiling */
+VkDescriptorSet vk_desc_stock_take(vk_desc_stock **stock, VkDescriptorSetLayout layout, vk_desc_stock_alloc alloc, void *owner);
+int vk_desc_stock_retire(vk_desc_stock *stock, uint32_t ceiling, uint32_t pools, uint32_t pool_sets); /* 0: keep */
+void vk_desc_stock_free(vk_desc_stock **stock);   /* the owner switched the stock off: its bookkeeping, not its pools */
+void vk_record_descriptor_stock_event(unsigned reason, uint64_t pools_destroyed); /* serialized primary owner */
 int vk_record_counter_timestamp(VkQueryPool pool, uint32_t query, VkPipelineStageFlags2 stage);
 #ifdef TOTK_VK_TESTS
+void vk_record_test_descriptor_retained(uint64_t out[4]); /* recorder pools, primary pools, stock sets, bytes per pool */
+void vk_record_test_descriptors(uint64_t out[8]); /* sets, allocate calls, resets, walk ns, list ns/count, template ns/count */
+void vk_record_test_wakes(uint64_t out[4]); /* TOTK_VK_REC_WAKE_BATCH: walker signals, worker-chained signals, polled hits, parks */
+int vk_record_test_descriptor_stock(void); /* isolated real-driver checkout/recycle/batch/pressure fixture */
+int vk_record_test_descriptor_ceiling(void); /* the stock ceiling on one recorder context, set live at its handoffs */
+void vk_test_descriptor_pools_check(unsigned slot); /* nvn_vk.c: slot's pools may be reset/destroyed now (counted) */
+void vk_test_descriptor_pools_stats(uint64_t *checks, uint64_t *violations);
+void vk_record_test_stock_events(uint64_t out[VK_DESC_STOCK_REASONS + 1]); /* published resets per reason, pools destroyed */
 void vk_record_test_storage(uint64_t values[4]); /* retention budget, reclaimed slots/bytes/secondary CBs */
 void vk_record_test_primary_memory(uint64_t values[2]); /* retained primary CBs, reclaimed primary CBs */
 void vk_record_test_leases(uint64_t values[4]); /* published active leases, summed worker peak, returned leases, cold resets */

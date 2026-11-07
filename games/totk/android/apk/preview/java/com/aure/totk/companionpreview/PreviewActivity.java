@@ -35,6 +35,10 @@ public final class PreviewActivity extends Activity {
         presentations = new PresentationController(this, source, page, this::placeCompanion);
         placeCompanion();
     }
+    @Override public void onTopResumedActivityChanged(boolean top) {
+        super.onTopResumedActivityChanged(top);
+        if (presentations != null) presentations.ownerTopResumed(top);
+    }
     /** The companion appears exactly once and never on this activity's display while a secondary display shows it:
      * this display then stands in for the game. Without a secondary display (a single-screen emulator) it is drawn
      * here so the fixtures stay inspectable. */

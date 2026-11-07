@@ -29,6 +29,12 @@ class AndroidDriverStartup(unittest.TestCase):
         source = (ROOT / 'games/totk/runtime/frontend_android.c').read_text()
         options = source[source.index('/* ---------- options ---------- */'):source.index('/* copy a folder recursively')]
         version = source[source.index('static int game_version('):source.index('/* Minimal arm64 KGSL ABI')]
+        # Execute APK asset parsing, but not JNI, in this filesystem/order fixture.
+        identity_begin = options.index('static void gpu_profile_identity(')
+        identity_jni = options.index('    JNIEnv *env', identity_begin)
+        identity_end = options.index('static int is_dir(', identity_begin)
+        options = (options[:identity_jni] +
+                   '    vk_gpuprof_identity(commit, package, 0, build);\n}\n' + options[identity_end:])
         driver = source[source.index('static int android_native_lib_dir('):source.index('/* ---------- the game ---------- */')]
         native = source[source.index('static void android_native_ui_mode_policy('):source.index('static int start_game(')]
         startup = source[source.index('static int start_game('):source.index('/* ---------- input ----------')]
@@ -62,7 +68,11 @@ typedef struct {
     const char *assetManager;
 } ANativeActivity;
 typedef FILE AAsset; /* Host fixture reads the test APK asset from an ordinary, bounded file. */
-enum { AASSET_MODE_STREAMING = 2 };
+enum { AASSET_MODE_STREAMING = 2, AASSET_MODE_BUFFER = 3 };
+enum { ANDROID_LOG_INFO = 4, ANDROID_LOG_WARN = 5 };
+static int __android_log_print(int level, const char *tag, const char *format, ...) {
+    (void)level; (void)tag; (void)format; return 0;
+}
 static AAsset *AAssetManager_open(const char *root, const char *name, int mode) {
     (void)mode; char path[4096]; snprintf(path, sizeof path, "%s/assets/%s", root, name); return fopen(path, "rb");
 }
@@ -87,6 +97,14 @@ static bool android_kgsl_chip_probe(void *context, uint32_t *chip) {
     *chip = observed_chip; return probe_success;
 }
 static void log_start(void) { assert(phase == 0); phase = 1; }
+static void identity_sink(const char *commit, const char *package, uint64_t version, const char *build) {
+    (void)package; (void)version; (void)build; check_environment(); assert(phase == 1);
+    printf("PROFILE_COMMIT=%s\n", commit);
+}
+static void (*vk_gpuprof_identity)(const char *, const char *, uint64_t, const char *) = identity_sink;
+static void log_mirror_start(void) { assert(phase == 1); }   /* after the log, before any startup boundary */
+static void live_ctl_start(void) { assert(phase == 1); }     /* the live-switch reader: after totk.env, before the game */
+static void thread_sampler_start(void) { assert(phase == 1); }   /* TOTK_THREAD_SAMPLER's launch value: after totk.env */
 static void totk_thread_game_startup(void) { check_environment(); assert(phase == 1); phase = 2; }
 static int copy_tree(const char *src, const char *dst) { (void)src; (void)dst; assert(0); return -1; }
 static int runtime_handheld_mode(void) { return 1; }
@@ -114,6 +132,7 @@ static void driver_setup(const char *private_dir) {
 }
 ''' + native + '''
 static int android_all_files_access(const ANativeActivity *a) { (void)a; return 0; }
+static void android_close_requests_start(const char *private_dir) { (void)private_dir; }
 #define pthread_create create_hook
 #define pthread_detach detach_hook
 ''' + startup + constructors + r'''
@@ -146,7 +165,7 @@ int main(int argc, char **argv) {
 
     def startup(self, lines='', driver='default', chip='43020100', success=True,
                 expected='sysmem', inherited=None, asset=None, stale_asset=False, install='{"format":1,"playable":true}', refused=False,
-                settings=None):
+                settings=None, build_asset=None):
         with tempfile.TemporaryDirectory(prefix='case-', dir=self.directory) as path:
             case = Path(path)
             external, private = case / 'game', case / 'private'
@@ -158,6 +177,9 @@ int main(int argc, char **argv) {
             if asset is not None:
                 (external / 'assets').mkdir()
                 (external / 'assets/pso_keys.bin').write_bytes(asset)
+            if build_asset is not None:
+                (external / 'assets').mkdir(exist_ok=True)
+                (external / 'assets/build.txt').write_text(build_asset)
             if stale_asset:
                 (private / 'state').mkdir()
                 (private / 'state/pso_keys.bin').write_bytes(b'stale list from another APK')
@@ -196,6 +218,17 @@ int main(int argc, char **argv) {
                 self.assertEqual((private / 'state/pso_keys.bin').read_bytes(), asset)
                 self.assertIn('PSO_KEYS=' + str(private / 'state/pso_keys.bin'), result.stdout)
             return result.stdout, result.stderr
+
+    def test_profile_identity_accepts_packaged_short_commit_and_rejects_untrusted_text(self):
+        for commit in ('abcdef012345', 'a' * 40, 'b' * 64):
+            with self.subTest(commit=commit):
+                output, _ = self.startup(lines='TOTK_VK_GPU_PROFILE=1\n', build_asset=f'commit {commit}\n')
+                self.assertIn(f'PROFILE_COMMIT={commit}\n', output)
+        for value in ('commit abcdef012345-dirty\n', 'commit not-a-commit\n', 'commit abcdef012345 extra\n'):
+            output, _ = self.startup(lines='TOTK_VK_GPU_PROFILE=1\n', build_asset=value)
+            self.assertIn('PROFILE_COMMIT=\n', output)
+        output, _ = self.startup(build_asset='commit abcdef012345\n')
+        self.assertNotIn('PROFILE_COMMIT=', output)
 
     def test_optional_pipeline_key_asset(self):
         output, _ = self.startup(stale_asset=True)

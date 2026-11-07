@@ -77,7 +77,6 @@ static inline void fps_block_end(int began) { (void)began; }
 #define R_BAD_HANDLE  0xE401u   // 114
 #define R_BAD_STATE   0xFA01u   // 125
 #define R_OUT_OF_RES  0xCE01u   // 103
-#ifdef GAME_BOTW
 #define R_BAD_CORE    0xE201u   // 113 InvalidCoreId
 #define R_BAD_COMBO   0xE801u   // 116 InvalidCombination
 /* Core ids as Horizon reads them (Atmosphere svc::CreateThread / SetThreadCoreMask, KThread::SetCoreMask): -1 = no ideal
@@ -87,7 +86,8 @@ static inline void fps_block_end(int began) { (void)began; }
    for core -2 (and for the main thread), threads the Switch keeps on core 0 with the main thread ran beside it on cores 1-2. */
 #define PROCESS_IDEAL_CORE 0
 #define PROCESS_CORE_MASK  7u
-#endif
+/* Tears of the Kingdom 1.4.3's main.npdm has the same values (META +0xf default core 0; ACI0 thread info cores 0-2).
+   Its path applies these semantics only with TOTK_IDEAL_CORE_FIX=1 (ideal_core_config). */
 #define WAITERS_BIT   0x40000000u
 #define H_CUR_THREAD  0xFFFF8000u
 
@@ -105,6 +105,9 @@ typedef struct svc_profile {
     wait_stat_t edge_other;
     struct { uint32_t handle; int prio, core; uint64_t ns; } holder[12];
     uint64_t holder_other_ns;
+    /* Short guest timeouts: zero-timeout polls, timed waits asking under 20 us (bins <1, <2, <5, <10, <20 us) and how
+       many of those timed out, and SleepThread under 20 us. Measurement only. */
+    uint64_t polls, tiny[5], tiny_timeouts, tiny_sleeps;
     int walking;
 } svc_profile_t;
 static _Atomic int g_svc_profile = -1;
@@ -161,6 +164,8 @@ static thr_t *g_all;
 static pthread_mutex_t G = PTHREAD_MUTEX_INITIALIZER;
 /* Launch-time kick A/B control and opt-in accounting; scheduler state uses G. */
 static int g_sync_kick = -1;
+/* Also read by the top-level HLE return stub; fixed before workers start. */
+int runtime_core_wait_event;
 static _Atomic int g_sync_stats = -1;
 typedef struct {
     uint64_t wake_issued, block_parks, core_parks;
@@ -175,6 +180,9 @@ static int sync_stats_on(void) {
 static void sync_config(void) { /* holding G; main registration resolves before workers start */
     if (g_sync_kick >= 0) return;
     const char *e = getenv("TOTK_SYNC_KICK"); g_sync_kick = !(e && !strcmp(e, "0"));
+    e = getenv("TOTK_CORE_WAIT_EVENT"); runtime_core_wait_event = e && !strcmp(e, "1");
+    fprintf(stderr, "[totk-core-wait] event=%d safety_retry_us=20000 (TOTK_CORE_WAIT_EVENT, startup-only)\n",
+        runtime_core_wait_event);
     fprintf(stderr, "[threads] sync kick=%d stats=%d (TOTK_SYNC_KICK, TOTK_SYNC_STATS)\n",
         g_sync_kick, sync_stats_on());
 }
@@ -219,6 +227,42 @@ static void vcore_config(void) {
     e = getenv("TOTK_POOL_STATS"); g_host_wait_pool_timing = e && !strcmp(e, "1");
     fprintf(stderr, "[threads] host vcore release=%d stats=%d (TOTK_VCORE_RELEASE, TOTK_VCORE_STATS)\n",
         g_vcore_release, g_vcore_stats);
+}
+#ifndef GAME_BOTW
+/* TOTK_IDEAL_CORE_FIX=1 gives the TotK path the Horizon core-id semantics Breath of the Wild's has (horizon_cores):
+   CreateThread -2 becomes the process's ideal core with a one-core mask and -1/-3 are invalid, SetThreadCoreMask
+   validates and keeps the ideal core inside the new mask, the main thread starts with a one-core mask, and
+   GetCurrentProcessorNumber reports a core inside the mask. Default 0 keeps the old bookkeeping (-2/-3 stored as the
+   ideal core with mask 7): placement changes can shift load. Resolved under G at main-thread registration. */
+static int g_ideal_core_fix = -1;
+static void ideal_core_config(void) {
+    if (g_ideal_core_fix >= 0) return;
+    const char *e = getenv("TOTK_IDEAL_CORE_FIX"); g_ideal_core_fix = e && !strcmp(e, "1");
+    fprintf(stderr, "[threads] ideal core fix=%d (TOTK_IDEAL_CORE_FIX)\n", g_ideal_core_fix);
+}
+static int horizon_cores(void) { return g_ideal_core_fix > 0; }
+#else
+static void ideal_core_config(void) {}
+static int horizon_cores(void) { return 1; }
+#endif
+/* CreateThread's core: only -2 is adjusted (to the process's ideal core); the new thread's mask is that core alone. */
+static uint32_t horizon_create_core(int c, int *core, uint64_t *mask) {
+    if (c == -2) c = PROCESS_IDEAL_CORE;
+    if (c < 0 || c > 2) return R_BAD_CORE;
+    *core = c; *mask = 1ull << c; return 0;
+}
+/* SetThreadCoreMask, holding G: -2 = the process's ideal core alone, -3 = keep the ideal core (it must be in the new
+   mask), -1 = no ideal core; an explicit ideal core must be in the mask, which must be a nonempty process subset. */
+static uint32_t horizon_set_core_mask(int *core, uint64_t *mask, int c, uint64_t m) {
+    uint32_t r = 0;
+    if (c == -2) { c = PROCESS_IDEAL_CORE; m = 1ull << c; }
+    else if ((m | PROCESS_CORE_MASK) != PROCESS_CORE_MASK) r = R_BAD_CORE;
+    else if (!m) r = R_BAD_COMBO;
+    else if (c >= 0 && c <= 2) { if (!((m >> c) & 1)) r = R_BAD_COMBO; }
+    else if (c == -3) { c = *core; if (c >= 0 && !((m >> c) & 1)) r = R_BAD_COMBO; }
+    else if (c != -1) r = R_BAD_CORE;
+    if (!r) { *core = c; *mask = m; }
+    return r;
 }
 static void vcore_stats_frame(uint64_t frame) {
     if (!g_vcore_stats || !frame || frame % 300) return;
@@ -368,6 +412,7 @@ static void profile_holder(svc_profile_t *p, uint32_t handle, int prio, int core
 }
 static void core_wait(thr_t *t, const struct timespec *relative) {
     int fps_wait = fps_block_begin();
+    if (relative) totk_live_slack_tick();   /* a live TOTK_TIMER_SLACK_NS reaches each thread before its next timed wait */
     svc_profile_t *p = t->profile;
     if (!p) {
         sync_park_count(1);
@@ -417,8 +462,13 @@ void runtime_svc_profile_frame(uint64_t frame) {
         }
     }
     fprintf(stderr, "[svc-wait] frame=%llu window=300 units=ms object=until-ready dispatch=ready-to-host core=core-take-wall\n", (unsigned long long)frame);
+    uint64_t tiny_all[8] = {0}, tiny_top_n = 0; uint32_t tiny_top = 0;   /* polls, 5 bins, timeouts, sleeps; busiest thread */
     for (thr_t *t = g_all; t; t = t->all) {
         svc_profile_t *p = t->profile; if (!p) continue;
+        const uint64_t tiny[8] = {p->polls, p->tiny[0], p->tiny[1], p->tiny[2], p->tiny[3], p->tiny[4], p->tiny_timeouts, p->tiny_sleeps};
+        uint64_t n = tiny[0] + tiny[1] + tiny[2] + tiny[3] + tiny[4] + tiny[5] + tiny[7];
+        for (int i = 0; i < 8; i++) tiny_all[i] += tiny[i];
+        if (n > tiny_top_n) { tiny_top_n = n; tiny_top = t->handle; }
         int show = p->walking; for (int i = 0; i < 5; i++) if (top[i] == t) show = 1;
         if (show) {
             fprintf(stderr, "[svc-wait] thread=%#x id=%llu tid=%llu walk=%d prio=%d mask=%#llx dispatch_ms=%.3f\n", t->handle, (unsigned long long)t->id, (unsigned long long)host_thread_id(t->pt, t->mport), p->walking, t->prio, (unsigned long long)t->mask, p->dispatch_ns / 1e6);
@@ -430,10 +480,18 @@ void runtime_svc_profile_frame(uint64_t frame) {
             for (int i = 0; i < 12; i++) if (p->holder[i].handle)
                 fprintf(stderr, "[svc-core] thread=%#x holder=%#x prio=%d core=%d snapshot_ms=%.3f\n", t->handle, p->holder[i].handle, p->holder[i].prio, p->holder[i].core, p->holder[i].ns / 1e6);
             if (p->holder_other_ns) fprintf(stderr, "[svc-core] thread=%#x other_snapshot_ms=%.3f\n", t->handle, p->holder_other_ns / 1e6);
+            if (tiny[0] || tiny[1] + tiny[2] + tiny[3] + tiny[4] + tiny[5] || tiny[7])
+                fprintf(stderr, "[svc-tiny] thread=%#x polls=%llu timed_lt1us=%llu lt2us=%llu lt5us=%llu lt10us=%llu lt20us=%llu timed_out=%llu sleep_lt20us=%llu\n",
+                    t->handle, (unsigned long long)tiny[0], (unsigned long long)tiny[1], (unsigned long long)tiny[2], (unsigned long long)tiny[3],
+                    (unsigned long long)tiny[4], (unsigned long long)tiny[5], (unsigned long long)tiny[6], (unsigned long long)tiny[7]);
         }
         int walking = p->walking; uint64_t ready = p->ready_ns; uint32_t waker = p->waker;
         memset(p, 0, sizeof *p); p->walking = walking; p->ready_ns = ready; p->waker = waker;
     }
+    fprintf(stderr, "[svc-tiny] frame=%llu window=300 all threads: polls=%llu timed_lt1us=%llu lt2us=%llu lt5us=%llu lt10us=%llu lt20us=%llu timed_out=%llu sleep_lt20us=%llu busiest=%#x n=%llu\n",
+        (unsigned long long)frame, (unsigned long long)tiny_all[0], (unsigned long long)tiny_all[1], (unsigned long long)tiny_all[2],
+        (unsigned long long)tiny_all[3], (unsigned long long)tiny_all[4], (unsigned long long)tiny_all[5], (unsigned long long)tiny_all[6],
+        (unsigned long long)tiny_all[7], tiny_top, (unsigned long long)tiny_top_n);
     pthread_mutex_unlock(&G);
 }
 
@@ -725,11 +783,11 @@ static int tk_async_on(void) {   // holding G
     return g_tk_async;
 }
 /* All contenders share the owner's retry clock, not a clock per waiter.
- * A pending/refused signal never disables retries: an eligible contender still
- * polls at 1 ms, and may resend after 1 ms even without an acknowledgment.
+ * A pending/refused signal never disables retries. Event mode relies on the
+ * core_put grant/signal and the top-level HLE return checkpoint, retaining a
+ * 20 ms safety retry for no-SVC spins/refused signals and starvation checks.
  * core_put invalidates the generation and timestamp before a different owner
- * can run. No signal carries permission to preempt: handler/checkpoint always
- * recompute mask, effective priority, starvation and protection under G. */
+ * can run. Handler/checkpoint always revalidate eligibility under G. */
 #define TK_KICK_RETRY_NS 1000000ull
 static int tk_kick_owner(thr_t *o, uint64_t now) { /* holding G, eligibility already checked */
     __atomic_store_n(&o->preempt, 1, __ATOMIC_RELEASE);
@@ -737,7 +795,7 @@ static int tk_kick_owner(thr_t *o, uint64_t now) { /* holding G, eligibility alr
     if (g_sync_kick && (atomic_load_explicit(&o->kick_safe, memory_order_acquire) ||
         (o->kick_generation == o->core_generation && o->kick_last_ns && now - o->kick_last_ns < TK_KICK_RETRY_NS))) {
         if (sync_stats_on()) g_sync_counts.kick_coalesced++;
-        return 1; /* retain the short retry even though this sender did not issue a syscall */
+        return 1;
     }
     if (g_sync_kick) {
         o->kick_generation = o->core_generation; o->kick_last_ns = now;
@@ -791,7 +849,10 @@ static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask
             if (!o || !core_allowed(t, i) || !o->pt) continue;
             int may = (tk_prio(o) > tk_prio(t) && now >= o->tk_protect_until) || (st && now - o->core_since >= TK_STARVE_NS && now >= o->tk_protect_until);
             if (may && tk_kick_owner(o, now)) kicked = 1; }
-        struct timespec again = {0, kicked ? 1000000 : 20000000};
+        /* core_put publishes the grant and signals this CV under G: a release
+         * between queueing and park cannot be lost. The timeout is recovery,
+         * not dispatch, when the HLE-return checkpoint is enabled. */
+        struct timespec again = {0, runtime_core_wait_event ? 20000000 : kicked ? 1000000 : 20000000};
         core_wait(t, &again);
         if (!reported && t->cur_core < 0 && dm_core_diag_enabled() && now_ns() - t->core_stats_since >= CORE_DIAG_NS) {
             core_wait_report(t, t->core_stats_since); reported = 1;
@@ -921,7 +982,7 @@ void runtime_host_wait_end(runtime_host_wait *wait) {
     wait->active = 0;
 }
 // Preemption point at SVC entry: a higher-priority thread waits for this core.
-void runtime_core_checkpoint(void) {
+static void core_checkpoint(int pin_resume) {
     thr_t *t = me_or_null();
 #ifdef GAME_BOTW
     /* Breath of the Wild (botw.md): the preempt flag is set when a waiter queues up, but a waiter's mask or priority can
@@ -940,22 +1001,46 @@ void runtime_core_checkpoint(void) {
 #ifndef GAME_BOTW
     sync_config();
     atomic_store_explicit(&t->kick_pending, 0, memory_order_relaxed);
-    if ((g_sync_kick || ready_cores_on()) && !tk_core_should_yield(t)) {
+    if ((runtime_core_wait_event || g_sync_kick || ready_cores_on()) && !tk_core_should_yield(t)) {
         __atomic_store_n(&t->preempt, 0, __ATOMIC_RELEASE);
         if (sync_stats_on()) g_sync_counts.stale++;
     } else
 #endif
     {
+        int resume = t->host_resume;
+        if (pin_resume && t->cur_core >= 0) t->host_resume = t->cur_core + 1;
         __atomic_store_n(&t->preempt, 0, __ATOMIC_RELEASE); core_put(t); core_take(t);
+        t->host_resume = resume;
         if (sync_stats_on()) g_sync_counts.checkpoint_handoffs++;
     }
     atomic_store_explicit(&t->kick_safe, 0, memory_order_release);
     pthread_mutex_unlock(&G);
 }
-int runtime_current_core(void) { thr_t *t = me_or_null(); return t ? (t->cur_core >= 0 ? t->cur_core : t->core) : -1; }
+void runtime_core_checkpoint(void) { core_checkpoint(0); }
+/* Only the outermost host->guest return calls this, after all host locks are
+ * released but before the host-stack slot admits asynchronous preemption.
+ * HLE is not a guest migration point: reacquire the same virtual core. */
+void runtime_core_hle_return(void) {
+    if (!runtime_core_wait_event) return;
+    int saved = errno;
+    core_checkpoint(1);
+    errno = saved;
+}
+/* The core GetCurrentProcessorNumber reports: the virtual core held, else the ideal core. With TOTK_IDEAL_CORE_FIX a
+   thread holding no core (blocked, or TOTK_FREE_CORES) whose ideal core is outside its mask (-1 = none) reports the
+   highest core of its mask instead, as Horizon moves a thread whose core left its mask there. */
+static int reported_core(const thr_t *t) {
+    if (t->cur_core >= 0) return t->cur_core;
+#ifndef GAME_BOTW
+    if (g_ideal_core_fix > 0 && !(t->core >= 0 && t->core < NCORE && ((t->mask >> t->core) & 1)))
+        for (int c = NCORE - 1; c >= 0; c--) if ((t->mask >> c) & 1) return c;
+#endif
+    return t->core;
+}
+int runtime_current_core(void) { thr_t *t = me_or_null(); return t ? reported_core(t) : -1; }
 
 static int64_t block(thr_t *t,int kind,int64_t ns) {
-    if (ns == 0) return block_inner(t, kind, ns);
+    if (ns == 0) { if (t->profile) t->profile->polls++; return block_inner(t, kind, ns); }
     int fps_wait = fps_block_begin();
     svc_profile_t *p = t->profile;
     uint64_t start = p ? now_ns() : 0, addr = kind == 2 ? t->wkey : kind == 4 ? (t->nwh == 1 ? t->wh[0] : 0) : t->waddr;
@@ -972,6 +1057,10 @@ static int64_t block(thr_t *t,int kind,int64_t ns) {
         int k = profile_kind(t->last_svc); p->object[k].n++; p->object[k].ns += elapsed;
         p->dispatch_ns += end - ready; p->total_ns += end - start;
         profile_edge(p, t->last_svc, addr, owner, p->waker, elapsed);
+        if (ns > 0 && ns < 20000) {
+            p->tiny[ns < 1000 ? 0 : ns < 2000 ? 1 : ns < 5000 ? 2 : ns < 10000 ? 3 : 4]++;
+            if (r == R_TIMEOUT) p->tiny_timeouts++;
+        }
     }
     core_take(t);
     fps_block_end(fps_wait);
@@ -992,6 +1081,7 @@ static int64_t block_inner(thr_t *t, int kind, int64_t ns) {
     struct timespec dl;
     int det_wait = ns > 0 && dm_detclock_enabled();
     uint64_t guest_deadline = det_wait ? guest_ns() + (uint64_t)ns : 0;
+    if (ns > 0) totk_live_slack_tick();
     if (ns > 0 && !det_wait) { clock_gettime(CLOCK_REALTIME, &dl); dl.tv_sec += ns / 1000000000; dl.tv_nsec += ns % 1000000000;
                   if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; } }
     while (!t->woke) {
@@ -1099,15 +1189,13 @@ void dm_thread_returned(void) { die("客体线程入口函数返回（Horizon �
 // 主线程登记，返回其句柄（交给 nnosInitialize 作主线程句柄）
 // Register the main thread and return its handle (passed to nnosInitialize as the main thread handle)
 uint32_t svc_thread_main_init(void) {
-    pthread_mutex_lock(&G); sync_config(); vcore_config(); pthread_mutex_unlock(&G);
+    pthread_mutex_lock(&G); sync_config(); vcore_config(); ideal_core_config(); pthread_mutex_unlock(&G);
     pthread_key_create(&g_keythr, NULL);
     thr_t *t = calloc(1, sizeof *t);
     pthread_cond_init(&t->cv, NULL);
-#ifdef GAME_BOTW
-    t->started = 1; t->prio = 44; t->core = PROCESS_IDEAL_CORE; t->mask = 1u << PROCESS_IDEAL_CORE; t->pt = pthread_self(); t->mport = host_thread_port_self();
-#else
-    t->started = 1; t->prio = 44; t->core = 0; t->mask = 7; t->pt = pthread_self(); t->mport = host_thread_port_self();
-#endif
+    /* Horizon starts the main thread on the process's ideal core with only that core in its mask. */
+    t->started = 1; t->prio = 44; t->core = PROCESS_IDEAL_CORE; t->mask = horizon_cores() ? 1u << PROCESS_IDEAL_CORE : PROCESS_CORE_MASK;
+    t->pt = pthread_self(); t->mport = host_thread_port_self();
     t->cur_core = -1;
     pthread_mutex_lock(&G); profile_get(t); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; core_take(t); pthread_mutex_unlock(&G);
 #ifdef GAME_BOTW
@@ -1314,13 +1402,11 @@ int svc_thread(int num, uint64_t *regs) {
         t->cur_core = -1;
         pthread_cond_init(&t->cv, NULL);
         t->entry = regs[1]; t->arg = regs[2]; t->stack_top = regs[3] & ~0xFull;
-#ifdef GAME_BOTW
-        { int c = (int)regs[5]; if (c == -2) c = PROCESS_IDEAL_CORE;
-          if (c < 0 || c > 2) { free(t); regs[0] = R_BAD_CORE; return 1; }   // Horizon: only -2 is adjusted, other negatives are invalid here
-          t->prio = (int)regs[4]; t->core = c; t->mask = 1ull << c; }
-#else
-        t->prio = (int)regs[4]; t->core = (int)regs[5]; t->mask = t->core >= 0 ? 1ull << t->core : 7;
-#endif
+        if (horizon_cores()) {
+            uint32_t r = horizon_create_core((int)regs[5], &t->core, &t->mask);
+            if (r) { free(t); regs[0] = r; return 1; }
+        } else { t->core = (int)regs[5]; t->mask = t->core >= 0 ? 1ull << t->core : 7; }   // old TotK bookkeeping
+        t->prio = (int)regs[4];
         t->born_ns = now_ns(); t->born_tick = dm_thread_tick_fn ? dm_thread_tick_fn() : 0;
         pthread_mutex_lock(&G); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; pthread_mutex_unlock(&G);
         pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 8 << 20);   // also the host-service stack of this guest thread
@@ -1345,7 +1431,7 @@ int svc_thread(int num, uint64_t *regs) {
         thr_t *self = cur();
         uint64_t profile_start = self->profile ? now_ns() : 0;
         if (self->profile) { pthread_mutex_lock(&G); self->profile_yield = ns <= 0; self->profile_sleep_active = 1; self->profile_sleep_core_ns = 0; pthread_mutex_unlock(&G); }
-        if (ns > 0) { pthread_mutex_lock(&G); core_put(self); pthread_mutex_unlock(&G); }
+        if (ns > 0) { pthread_mutex_lock(&G); core_put(self); pthread_mutex_unlock(&G); totk_live_slack_tick(); }
         if (ns > 0 && dm_detclock_enabled()) {
             uint64_t deadline = guest_ns() + (uint64_t)ns;
             while (guest_ns() < deadline) { struct timespec ts = {0, 1000000}; nanosleep(&ts, 0); }
@@ -1361,7 +1447,7 @@ int svc_thread(int num, uint64_t *regs) {
             pthread_mutex_unlock(&G);
             uint64_t backoff = !give && me ? yield_backoff_ns(y0 - me->yrun_ns) : 0;
             if (backoff) {   // a long poll: sleep with the core given up, as SleepThread(ns) does
-                pthread_mutex_lock(&G); core_put(me); pthread_mutex_unlock(&G);
+                pthread_mutex_lock(&G); core_put(me); pthread_mutex_unlock(&G); totk_live_slack_tick();
                 struct timespec ts = {0, (long)backoff}; nanosleep(&ts, 0);
                 pthread_mutex_lock(&G); core_take(me); pthread_mutex_unlock(&G);
             } else if (!give) sched_yield();
@@ -1376,7 +1462,7 @@ int svc_thread(int num, uint64_t *regs) {
             pthread_mutex_lock(&G);
             uint64_t elapsed = now_ns() - profile_start - self->profile_sleep_core_ns;
             int k = ns > 0 ? SP_SLEEP : SP_YIELD; svc_profile_t *p = self->profile;
-            p->object[k].n++; p->object[k].ns += elapsed; p->total_ns += elapsed;
+            p->object[k].n++; p->object[k].ns += elapsed; p->total_ns += elapsed; p->tiny_sleeps += ns > 0 && ns < 20000;
             self->profile_yield = self->profile_sleep_active = 0;
             pthread_mutex_unlock(&G);
         }
@@ -1388,26 +1474,19 @@ int svc_thread(int num, uint64_t *regs) {
     case 0x0D: { if(regs[1]<28||regs[1]>59){regs[0]=R_BAD_STATE;return 1;}pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[0], O_THREAD); if (t) t->prio = (int)regs[1]; regs[0] = t ? 0 : R_BAD_HANDLE;pthread_mutex_unlock(&G); return 1; }
     case 0x0E: { pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[2], O_THREAD);
                  regs[0] = t ? 0 : R_BAD_HANDLE; regs[1] = t ? (uint64_t)(uint32_t)t->core : 0; regs[2] = t ? t->mask : 0;pthread_mutex_unlock(&G); return 1; }
-    case 0x0F: {  // SetThreadCoreMask(w0, w1 理想核, x2 掩码)：-1 = 用进程缺省、-2/-3 = 不改理想核；宿主只记账 | SetThreadCoreMask(w0, w1 ideal core, x2 mask): -1 = use the process default, -2/-3 = leave the ideal core unchanged; the host only keeps the bookkeeping
+    case 0x0F: {  // SetThreadCoreMask(w0, w1 理想核, x2 掩码)；宿主只记账 | SetThreadCoreMask(w0, w1 ideal core, x2 mask); the host only keeps the bookkeeping
         pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[0], O_THREAD);
-#ifdef GAME_BOTW
-        if (t) { int c = (int)regs[1]; uint64_t m = regs[2]; uint32_t r = 0;
-                 if (c == -2) { c = PROCESS_IDEAL_CORE; m = 1ull << c; }
-                 else if ((m | PROCESS_CORE_MASK) != PROCESS_CORE_MASK) r = R_BAD_CORE;
-                 else if (!m) r = R_BAD_COMBO;
-                 else if (c >= 0 && c <= 2) { if (!((m >> c) & 1)) r = R_BAD_COMBO; }
-                 else if (c == -3) { c = t->core; if (c >= 0 && !((m >> c) & 1)) r = R_BAD_COMBO; }
-                 else if (c != -1) r = R_BAD_CORE;
-                 if (!r) { t->core = c; t->mask = m;
-                           if (t == cur() && t->cur_core >= 0 && !core_allowed(t, t->cur_core)) { core_put(t); core_take(t); } }   // migrate off a core no longer allowed
-                 regs[0] = r; pthread_mutex_unlock(&G); return 1; }
-#else
+        if (t && horizon_cores()) {
+            uint32_t r = horizon_set_core_mask(&t->core, &t->mask, (int)regs[1], regs[2]);
+            if (!r && t == cur() && t->cur_core >= 0 && !core_allowed(t, t->cur_core)) { core_put(t); core_take(t); }   // migrate off a core no longer allowed
+            regs[0] = r; pthread_mutex_unlock(&G); return 1;
+        }
+        // Old TotK bookkeeping: -1 = core 0, -2/-3 = leave the ideal core unchanged, even outside the new mask.
         if (t) { int c = (int)regs[1]; if (c >= 0) t->core = c; else if (c == -1) t->core = 0; if (regs[2]) t->mask = regs[2];
                  if (t == cur() && t->cur_core >= 0 && !core_allowed(t, t->cur_core)) { core_put(t); core_take(t); } }   // migrate off a core no longer allowed
-#endif
         regs[0] = t ? 0 : R_BAD_HANDLE;pthread_mutex_unlock(&G); return 1;
     }
-    case 0x10: { thr_t *t = cur(); regs[0] = (uint64_t)(uint32_t)(t->cur_core >= 0 ? t->cur_core : t->core); return 1; }   // GetCurrentProcessorNumber
+    case 0x10: { thr_t *t = cur(); regs[0] = (uint64_t)(uint32_t)reported_core(t); return 1; }   // GetCurrentProcessorNumber
     case 0x25: { pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[1], O_THREAD); regs[0] = t ? 0 : R_BAD_HANDLE; regs[1] = t ? t->id : 0;pthread_mutex_unlock(&G); return 1; }
 
     case 0x1A: {  // ArbitrateLock(w0 持有者句柄, x1 地址, w2 本线程标签) | ArbitrateLock(w0 owner handle, x1 address, w2 this thread's tag)
@@ -1750,6 +1829,88 @@ static void dump_threads(unsigned secs) {
     }
 }
 void runtime_dump_threads(void) { dump_threads(0); }   // TOTK_INPUT_FILE "threads"
+// ---------- Progress watchdog (progress_watch.h): a thread dump when presented frames stop ----------
+/* TOTK_WATCHDOG (default on; 0 turns it off): after >= 1 s without a presented frame, dump_threads (at most 3 dumps,
+   >= 10 s apart, one per stall; boot, held stages and the background excluded). TOTK_WATCH_STALL=<seconds> (default
+   unset) also ends the process with 128+SIGALRM after a stall that long, for unattended runs. The switches are read once,
+   at the first presented frame, which also starts the thread: a run that never presents (a probe) has none. */
+#include "progress_watch.h"
+/* Only the present thread publishes progress. Keep its shared sample off the writer-local and watchdog state cache
+   lines: the polling thread observes it four times a second, but never writes it. Stages are immutable literals, so
+   publishing their pointer needs neither copying nor reusable string slots that a later frame could overwrite. */
+static struct {
+    _Alignas(64) _Atomic uint64_t ns;
+    _Atomic uint64_t frame;
+    _Atomic(const char *) stage;
+    _Atomic int held, paused;
+} g_progress;
+static struct {
+    _Alignas(64) int state;     /* 0: not started, 1: watching, -1: disabled / could not start */
+    int held;
+    const char *stage;
+} g_progress_writer;
+static progress_watch g_watch;
+static void *progress_watchdog(void *arg) {
+    (void)arg;
+#if defined(__linux__)
+    pthread_setname_np(pthread_self(), "totk-watch");
+#endif
+    for (;;) {
+        usleep((useconds_t)(PROGRESS_WATCH_POLL_NS / 1000));
+        uint64_t stalled;
+        unsigned action = progress_watch_poll(&g_watch, now_ns(), atomic_load_explicit(&g_progress.ns, memory_order_acquire),
+                                              atomic_load_explicit(&g_progress.held, memory_order_relaxed),
+                                              atomic_load_explicit(&g_progress.paused, memory_order_relaxed), &stalled);
+        if (action == PROGRESS_WATCH_NONE) continue;
+        const char *stage = atomic_load_explicit(&g_progress.stage, memory_order_relaxed);
+        unsigned long long frames = (unsigned long long)atomic_load_explicit(&g_progress.frame, memory_order_relaxed);
+        if (action == PROGRESS_WATCH_EXIT) {
+            fprintf(stderr, "[totk-watch] no presented frame for %.1f s at stage \"%s\" (frame %llu): exiting with %d (TOTK_WATCH_STALL)\n",
+                    stalled / 1e9, stage, frames, 128 + SIGALRM);
+            fflush(stdout); _exit(128 + SIGALRM);
+        }
+        fprintf(stderr, "[totk-watch] no presented frame for %.1f s at stage \"%s\" (frame %llu): thread dump %u/%u\n",
+                stalled / 1e9, stage, frames, g_watch.dumps, PROGRESS_WATCH_DUMPS);
+        dump_threads((unsigned)(stalled / 1000000000u));
+    }
+    return NULL;
+}
+static int progress_watch_start(void) {
+    const char *on = getenv("TOTK_WATCHDOG"), *stall = getenv("TOTK_WATCH_STALL");
+    if (on && !strcmp(on, "0")) { fprintf(stderr, "[totk-watch] off (TOTK_WATCHDOG=0)\n"); return 0; }
+    if (stall && *stall) {
+        char *end; double s = strtod(stall, &end);
+        if (*end || !(s > 0) || s > 86400) fprintf(stderr, "[totk-watch] TOTK_WATCH_STALL=%s ignored: seconds > 0 expected\n", stall);
+        else g_watch.exit_ns = (uint64_t)(s * 1e9);
+    }
+    pthread_t th;
+    if (pthread_create(&th, NULL, progress_watchdog, NULL)) { fprintf(stderr, "[totk-watch] off: no thread\n"); return 0; }
+    pthread_detach(th);
+    fprintf(stderr, "[totk-watch] on: thread dump after >= %.0f s without a presented frame (at most %u, >= %.0f s apart; boot, the background and loading screens / host movies / pipeline warm-up up to %.0f s excluded); exit after a stall: %s%s\n",
+            PROGRESS_WATCH_STALL_NS / 1e9, PROGRESS_WATCH_DUMPS, PROGRESS_WATCH_GAP_NS / 1e9, PROGRESS_WATCH_HOLD_NS / 1e9,
+            g_watch.exit_ns ? stall : "off", g_watch.exit_ns ? " s (TOTK_WATCH_STALL)" : "");
+    return 1;
+}
+void runtime_progress_mark(uint64_t at_ns, uint64_t frame, const char *stage, int held) {
+    /* The same single present thread owns startup and all later marks; no once/RMW or clock is needed here. The
+       timestamp and frame are already known by the caller, including a held mark before the first-world warm-up. */
+    if (g_progress_writer.state != 1) {
+        if (g_progress_writer.state < 0) return;
+        g_progress_writer.state = progress_watch_start() ? 1 : -1;
+        if (g_progress_writer.state < 0) return;
+    }
+    if (stage != g_progress_writer.stage) {
+        atomic_store_explicit(&g_progress.stage, stage, memory_order_relaxed);
+        g_progress_writer.stage = stage;
+    }
+    if (held != g_progress_writer.held) {
+        atomic_store_explicit(&g_progress.held, held, memory_order_relaxed);
+        g_progress_writer.held = held;
+    }
+    atomic_store_explicit(&g_progress.frame, frame, memory_order_relaxed);
+    atomic_store_explicit(&g_progress.ns, at_ns, memory_order_release);
+}
+void runtime_progress_pause(int paused) { atomic_store_explicit(&g_progress.paused, paused, memory_order_relaxed); }
 void runtime_thread_diag_start(void) {
     static int list_started, dump_started;
     const char *c = getenv("TOTK_LISTCHECK");

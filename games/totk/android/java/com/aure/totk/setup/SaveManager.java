@@ -1,7 +1,6 @@
 package com.aure.totk.setup;
 
 import java.io.ByteArrayOutputStream;
-import java.io.Closeable;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -11,8 +10,6 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.RandomAccessFile;
 import java.nio.channels.FileChannel;
-import java.nio.channels.FileLock;
-import java.nio.channels.OverlappingFileLockException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
@@ -795,8 +792,8 @@ final class SaveManager {
      * moves staged into place with install(). The game lock is held only for the backup copy and the renames. */
     static Backup replace(File filesDir, File staged, String reason, long now) throws IOException {
         File root = saveRoot(filesDir);
-        try (Closeable hold = holdGame(filesDir)) {
-            if (hold == null) throw new Invalid("game_running", null);
+        try (GameLock.Hold hold = GameLock.hold(filesDir)) {
+            hold.requireFree();
             recover(root);
             Backup backup = backup(root, backupsDir(filesDir), reason, now);
             File incoming = incoming(root);
@@ -1043,24 +1040,4 @@ final class SaveManager {
         return folderChanged ? Decision.CONFLICT : Decision.PUSH;
     }
 
-    // ---------- the game lock ----------
-    /** The game process holds an OFD write lock on <private>/state/game.lock (fcntl F_OFD_SETLKW, whole file) for its
-     * lifetime. FileChannel.tryLock is a POSIX record lock, which conflicts with it, so a null return means the game is
-     * running. The holder blocks the game's start while it is held: keep it under two seconds and never across user
-     * interaction. */
-    static Closeable holdGame(File filesDir) throws IOException {
-        File state = new File(filesDir, "state");
-        if (!state.isDirectory() && !state.mkdirs()) throw new IOException("cannot create " + state);
-        RandomAccessFile file = new RandomAccessFile(new File(state, "game.lock"), "rw");
-        FileLock lock;
-        try { lock = file.getChannel().tryLock(); }
-        catch (OverlappingFileLockException | IOException busy) { lock = null; }
-        if (lock == null) { file.close(); return null; }
-        FileLock held = lock;
-        return () -> { try { held.release(); } finally { file.close(); } };
-    }
-    static boolean gameLocked(File filesDir) {
-        try (Closeable hold = holdGame(filesDir)) { return hold == null; }
-        catch (IOException unavailable) { return false; }
-    }
 }

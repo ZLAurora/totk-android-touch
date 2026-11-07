@@ -24,6 +24,7 @@
    over as soon as it is decoded. */
 #include "runtime.h"
 #include "movie_host.h"
+#include "android_pause.h"
 #include <arm_neon.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -64,6 +65,7 @@ typedef struct {
     Ready ready[OUT_BUFS]; int nready;
     Ready decoded[OUT_BUFS]; int ndecoded;   /* paced: decoded, not due yet */
     uint64_t t0; int64_t pts0;               /* paced: host time and presentation time of the first frame handed over */
+    uint64_t suspended_ns;                  /* pause-gate duration last applied to t0, under mu */
     uint64_t frames, decode_ns, errors, dropped;
     pthread_mutex_t mu;
 } Movie;
@@ -191,7 +193,21 @@ void movie_host_tick(void) {   /* lock order g_lock -> Movie.mu, as in destroy; 
     pthread_mutex_lock(&g_lock);
     for (int i = 0; i < MAX_MOVIES; i++) {
         Movie *m = g_movies[i]; if (!m) continue;
-        pthread_mutex_lock(&m->mu); if (m->started) release_due(m, &s, g_clock()); pthread_mutex_unlock(&m->mu);
+        pthread_mutex_lock(&m->mu);
+        if (m->started) {
+            AndroidGameSuspension suspension = runtime_android_game_suspension();
+            if (m->t0 && suspension.ns != m->suspended_ns) {
+                uint64_t shift = suspension.ns - m->suspended_ns;
+                m->t0 += shift;
+                if (!suspension.paused)
+                    LOG("resume: clock shifted %.3f s, next pts %lld us, %llu dropped",
+                        shift / 1e9, m->ndecoded ? (long long)m->decoded[0].time : -1LL,
+                        (unsigned long long)m->dropped);
+            }
+            m->suspended_ns = suspension.ns;
+            if (!suspension.paused) release_due(m, &s, g_clock());
+        }
+        pthread_mutex_unlock(&m->mu);
     }
     pthread_mutex_unlock(&g_lock);
     fire(&s);

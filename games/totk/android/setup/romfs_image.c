@@ -22,7 +22,8 @@ int romfs_image_open_file(RomfsImage *m, const char *path) {
     struct stat st;
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return -1;
-    if (fstat(fd, &st) || !S_ISREG(st.st_mode)) { close(fd); errno = EINVAL; return -1; }
+    if (fstat(fd, &st)) { int e = errno; close(fd); errno = e; return -1; }
+    if (!S_ISREG(st.st_mode)) { close(fd); errno = EINVAL; return -1; }
     m->fd[0] = fd; m->size = m->part_size = (uint64_t)st.st_size;
     return 0;
 }
@@ -34,11 +35,12 @@ int romfs_image_open(RomfsImage *m, const char *dir) {
     if (errno != ENOENT) return -1;
     for (int i = 0; i < SETUP_MAX_ROMFS_PARTS; i++) {
         struct stat st;
-        if (st_path(path, sizeof path, "%s/romfs.bin.%03d", dir, i)) { romfs_image_close(m); return -1; }
+        if (st_path(path, sizeof path, "%s/romfs.bin.%03d", dir, i)) { int e = errno; romfs_image_close(m); errno = e; return -1; }
         int fd = open(path, O_RDONLY | O_CLOEXEC);
         if (fd < 0) { if (errno == ENOENT) break; int e = errno; romfs_image_close(m); errno = e; return -1; }
         m->fd[i] = fd; m->nparts = i + 1;
-        if (fstat(fd, &st) || !S_ISREG(st.st_mode) || !st.st_size) { romfs_image_close(m); errno = EINVAL; return -1; }
+        if (fstat(fd, &st)) { int e = errno; romfs_image_close(m); errno = e; return -1; }
+        if (!S_ISREG(st.st_mode) || !st.st_size) { romfs_image_close(m); errno = EINVAL; return -1; }
         /* Every part but the last has the first part's size (open_chunks' rule): a part's offset is index * part_size. */
         if (!i) m->part_size = (uint64_t)st.st_size;
         else if (m->size != (uint64_t)i * m->part_size || (uint64_t)st.st_size > m->part_size) { romfs_image_close(m); errno = EINVAL; return -1; }
@@ -46,7 +48,8 @@ int romfs_image_open(RomfsImage *m, const char *dir) {
     }
     if (!m->nparts) { errno = ENOENT; return -1; }
     /* romfs.bin.064 would be a part the runtime never opens: the image is not what it reads. */
-    if (st_path(path, sizeof path, "%s/romfs.bin.%03d", dir, SETUP_MAX_ROMFS_PARTS) || st_exists(path)) { romfs_image_close(m); errno = EINVAL; return -1; }
+    if (st_path(path, sizeof path, "%s/romfs.bin.%03d", dir, SETUP_MAX_ROMFS_PARTS)) { int e = errno; romfs_image_close(m); errno = e; return -1; }
+    if (st_exists(path)) { romfs_image_close(m); errno = EINVAL; return -1; }
     return 0;
 }
 void romfs_image_close(RomfsImage *m) {
@@ -98,10 +101,12 @@ int romfs_remove_stale(const char *dir, int keep_parts) {
         if (!romfs_name(e->d_name, &part)) continue;
         if (keep_parts == 0 && part < 0) continue;
         if (keep_parts > 0 && part >= 0 && part < keep_parts) continue;
-        if (st_path(p, sizeof p, "%s/%s", dir, e->d_name) || (unlink(p) && errno != ENOENT)) rc = -1;
+        if (st_path(p, sizeof p, "%s/%s", dir, e->d_name) || (unlink(p) && errno != ENOENT)) { rc = -1; break; }
     }
+    int e = errno;
     closedir(d);
-    return rc ? -1 : st_fsync_dir(dir);
+    if (rc) { errno = e; return -1; }
+    return st_fsync_dir(dir);
 }
 int romfs_part_name(char *out, size_t cap, const char *dir, int nparts, int part) {
     return nparts ? st_path(out, cap, "%s/romfs.bin.%03d", dir, part) : st_path(out, cap, "%s/romfs.bin", dir);

@@ -73,10 +73,10 @@ class FrameLagPolicy(unittest.TestCase):
             cls.probes[name] = (executable, defines)
 
     @staticmethod
-    def environment(fps60, lag=None, gpu_time=None):
+    def environment(fps60, lag=None, gpu_time=None, median=None):
         env = os.environ.copy()
         for name, value in (('TOTK_FPS60', fps60), ('TOTK_FRAME_LAG', lag),
-                            ('TOTK_GPU_TIME', gpu_time)):
+                            ('TOTK_GPU_TIME', gpu_time), ('TOTK_GPU_TIME_FPS_MEDIAN', median)):
             # None means actual absence, not an empty/false stand-in.
             env.pop(name, None)
             if value is not None:
@@ -111,7 +111,18 @@ class FrameLagPolicy(unittest.TestCase):
                                               self.environment(fps60, gpu_time=gpu_time))
                         self.assertEqual(result.stdout,
                                          f'[fps-policy] GPU report time: {mode} ({reason})\n'
+                                         '[fps-policy] TOTK_GPU_TIME_FPS_MEDIAN=0: FPS END consumer only, median of three unique valid reports; hardware required\n'
                                          f'GPU_TIME={mode}\n', result.stderr)
+
+    def test_gpu_fps_median_requires_exact_one_and_hardware(self):
+        for name, (executable, _) in self.probes.items():
+            for gpu_time in ('hardware', 'latency'):
+                for median in (None, '', '0', '1', '01', 'true', '1 '):
+                    with self.subTest(platform=name, gpu_time=gpu_time, median=median):
+                        enabled = int(gpu_time == 'hardware' and median == '1')
+                        result = self.command([str(executable), '--gpu-time'],
+                            self.environment('1', gpu_time=gpu_time, median=median))
+                        self.assertIn(f'TOTK_GPU_TIME_FPS_MEDIAN={enabled}:', result.stdout)
 
 
 if __name__ == '__main__':

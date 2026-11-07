@@ -16,6 +16,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -468,7 +469,15 @@ class Decrypted(DecryptedFixture):
         # A killed run leaves partial staging behind; the next run discards it and keeps the committed fonts.
         proc = self.run_setup([big], stages=['romfs', 'index', 'fonts'], pins=pins, popen=True)
         self.assertTrue(self.wait_for(proc, '[romfs]'))
-        proc.kill(); proc.communicate(timeout=60)
+        staging = self.game / '.import/romfs/romfs.bin'
+        deadline = time.monotonic() + 10
+        try:
+            # The stage-start progress precedes file creation; kill only after there is staging to recover.
+            while not staging.exists() and proc.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(staging.exists(), 'RomFS staging was not created before the kill deadline')
+        finally:
+            proc.kill(); proc.communicate(timeout=60)
         self.assertTrue((self.game / '.import/romfs/romfs.bin').exists())
         self.assertTrue(self.install()['stages']['fonts']['done'])
         fds = self.open_fds([big])

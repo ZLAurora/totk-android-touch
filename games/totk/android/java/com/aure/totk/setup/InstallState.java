@@ -20,7 +20,7 @@ final class InstallState {
 
     final JSONObject json;
     private final File game;
-    private Boolean artOutdated;   // read once per snapshot (index.json head)
+    private ArtPolicy.State art;   // read once per snapshot (index.json head)
 
     private InstallState(File game, JSONObject json) { this.game = game; this.json = json; }
 
@@ -38,12 +38,17 @@ final class InstallState {
         return stage == null ? new JSONObject() : stage;
     }
     /** Stage done per install.json; the second-screen art also has to be from this app's generator (artOutdated). */
-    boolean done(String name) { return stage(name).optBoolean("done") && !(OPTIONAL.equals(name) && artOutdated()); }
-    /** The companion stage finished once, but its art is from an older generator (an app update changed the names or
-     * icons) or its index is unreadable: the art still works, and Home updates it (SetupActivity.showUi). */
-    boolean artOutdated() {
-        if (artOutdated == null) artOutdated = stage(OPTIONAL).optBoolean("done") && !CompanionArt.current(new File(game, "companion"));
-        return artOutdated;
+    boolean done(String name) { return OPTIONAL.equals(name) ? artState() == ArtPolicy.State.DONE : stage(name).optBoolean("done"); }
+    /** Old-but-present art remains usable until a dual-screen device updates it. Missing art is offered before play. */
+    boolean artOutdated() { return artState() == ArtPolicy.State.OUTDATED; }
+    boolean skipped(String name) { return stage(name).optBoolean("skipped"); }
+    ArtPolicy.State artState() {
+        if (art == null) {
+            File dir = new File(game, "companion");
+            art = ArtPolicy.state(skipped(OPTIONAL), !errorCode(OPTIONAL).isEmpty(),
+                    new File(dir, "index.json").isFile(), CompanionArt.current(dir));
+        }
+        return art;
     }
     String errorCode(String name) { return stage(name).optString("code", ""); }
     String errorText(String name) { return stage(name).optString("error", ""); }
@@ -124,14 +129,31 @@ final class InstallState {
         return total;
     }
 
-    /** The game runs in the app's default process (TotkActivity); setup lives in ":setup". The game also holds
-     * <private>/state/game.lock from start_game until it exits, which covers a process that is still starting. */
-    static boolean gameRunning(Context context) {
+    /** Busy/error decisions are operational warnings, not optional INFO chatter. Include effective levels so a plain
+     * `logcat -s TotkSetup` capture can diagnose a device/property filter rather than silently losing the branch. */
+    static void logGameDecision(String message) {
+        android.util.Log.w("TotkSetup", message + " logInfoEnabled=" + android.util.Log.isLoggable("TotkSetup", android.util.Log.INFO)
+                + " logWarnEnabled=" + android.util.Log.isLoggable("TotkSetup", android.util.Log.WARN));
+    }
+
+    /** Only an acquired game lock or a live start handshake proves the game is running, not a cached default process. */
+    static GameLock.Result gameState(Context context) {
+        GameLock.logger = InstallState::logGameDecision;
         ActivityManager manager = (ActivityManager) context.getSystemService(Context.ACTIVITY_SERVICE);
-        if (manager != null && manager.getRunningAppProcesses() != null)
-            for (ActivityManager.RunningAppProcessInfo process : manager.getRunningAppProcesses())
-                if (context.getPackageName().equals(process.processName)) return true;
-        return SaveManager.gameLocked(context.getFilesDir());
+        boolean alive = false;
+        StringBuilder processes = new StringBuilder();
+        java.util.List<ActivityManager.RunningAppProcessInfo> running = manager == null ? null : manager.getRunningAppProcesses();
+        if (running != null) for (ActivityManager.RunningAppProcessInfo process : running)
+            if (context.getPackageName().equals(process.processName)) {
+                alive = true;
+                processes.append(" pid=").append(process.pid).append(" process=").append(process.processName)
+                        .append(" importance=").append(process.importance);
+            }
+        GameLock.Result result = GameLock.check(context.getFilesDir(), alive);
+        if (result.state != GameLock.State.FREE)
+            logGameDecision("game decision=" + result.state + " checkerPid=" + android.os.Process.myPid()
+                    + (alive ? processes : " defaultProcess=absent") + " " + result.reason);
+        return result;
     }
 
     /** Whether libtotk_setup.so can be loaded (a preview build may lack it). */

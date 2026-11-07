@@ -220,7 +220,10 @@ public final class SaveMirror {
                     return new Result("none");
                 case PUSH: return push(context, s);
                 case PULL:
-                    if (!mayPull || InstallState.gameRunning(context)) return new Result("pull_pending");
+                    if (!mayPull) return new Result("pull_pending");
+                    GameLock.Result game = InstallState.gameState(context);
+                    if (game.state == GameLock.State.GAME) return new Result("pull_pending");
+                    if (game.state == GameLock.State.ERROR) throw new IOException("Game lock: " + game.reason);
                     return pull(context, s);
                 default:
                     status(context, CONFLICT, "");

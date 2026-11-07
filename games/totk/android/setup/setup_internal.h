@@ -65,7 +65,7 @@ typedef struct {
     SetupInput exefs[SETUP_MAX_EXEFS]; int nexefs;
     SetupInput base, update, keys;
     SetupInput fonts[SETUP_MAX_FONTS]; int nfonts;
-    int stage_mask, stages_explicit;
+    int stage_mask, stages_explicit, skip_companion; /* automatic setup on a device without a built-in second screen */
     SetupInput shader_list;                 /* optional; the seed stage reads it through setup_shader_list */
     uint64_t romfs_part_bytes;              /* "romfsPartBytes": RomFS parts of this size in <game>; 0 = one romfs.bin */
 } SetupRequest;
@@ -206,6 +206,7 @@ enum { ST_CODE, ST_ROMFS, ST_INDEX, ST_FONTS, ST_COMPANION, ST_SHADERS, ST_COUNT
 typedef struct {
     char route[16];
     int done[ST_COUNT];
+    int companion_skipped;                 /* intentionally not needed, distinct from an absent or failed stage */
     char rewritten[3][65], tables[65], romfs_sha[65], index_sha[65], font_source[256], font_sha[65];
     uint64_t romfs_size; int romfs_parts; int64_t variants;   /* romfs_parts: 0 = one romfs.bin */
     char opt_code[ST_COUNT][32], opt_error[ST_COUNT][512];

@@ -15,12 +15,16 @@
    Every stage of a translation uses descriptor set 0; the vertex (or compute) stage keeps it and the fragment stage's
    SPIR-V is patched to set 1, so one pipeline layout holds both. */
 #include "vk_int.h"
+#include "vk_alpha_test.h"
 #include "vk_record.h"
 #include "vk_framegen.h"
 #include "vk_earlyz.h"
 #include "nvn_hmap.h"
 #include "vk_shader_xlate.h"
 #include "vk_seed_io.h"
+#include "vk_load_proof.h"
+#include "vk_subgroup.h"
+#include "vk_position.h"
 #include <errno.h>
 #include <inttypes.h>
 #include <sys/stat.h>
@@ -29,6 +33,14 @@
 
 #include "host_os.h"
 int totk_depth_near_minus_w(void) __attribute__((weak));
+
+static pthread_once_t g_position_once = PTHREAD_ONCE_INIT;
+static unsigned g_position_policy;
+static void position_init(void) {
+    g_position_policy = vk_position_policy(getenv("TOTK_VK_POS_INVARIANT"), getenv("TOTK_VK_POS_NOCONTRACT"));
+    LOGV("[nvn-vk] TOTK_VK_POS_INVARIANT=%u (startup-only): vertex Position Invariant", g_position_policy & 1);
+    LOGV("[nvn-vk] TOTK_VK_POS_NOCONTRACT=%u (startup-only): position-feeding float arithmetic NoContraction", g_position_policy >> 1);
+}
 
 /* Folder selection is process-lifetime. Preserve legacy cache paths for the
    canonical game seed; only alternate folders use a folder/content namespace. */
@@ -71,12 +83,14 @@ static void seed_init(void) {
     for (int i = 0; i < 32; i++) snprintf(g_seed_tag + 2 * i, 3, "%02x", digest[i]);
 }
 static const char *seed_dir(void) { pthread_once(&g_seed_once, seed_init); return g_seed_dir; }
-/* Alternate seeds namespace explicit cache/import paths too. The canonical
-   seed retains every legacy path, including explicit overrides. Caller owns out. */
+/* Alternate seeds and position precision arms namespace explicit cache/import
+   paths too. Off/off with the canonical seed retains legacy paths. Caller owns out. */
 const char *vk_shader_cache_path(const char *base, char *out, size_t size) {
     pthread_once(&g_seed_once, seed_init);
+    pthread_once(&g_position_once, position_init);
     if (!base || !strcmp(base, "0")) return NULL;
-    int n = g_seed_default ? snprintf(out, size, "%s", base) : snprintf(out, size, "%s.%s", base, g_seed_tag);
+    const char *suffix = vk_position_cache_suffix(g_position_policy);
+    int n = g_seed_default ? snprintf(out, size, "%s%s", base, suffix) : snprintf(out, size, "%s.%s%s", base, g_seed_tag, suffix);
     return n >= 0 && (size_t)n < size ? out : NULL;
 }
 static void seed_io_start(void) {
@@ -115,6 +129,7 @@ int vk_shaders_ready(void) {
 /* Frontend calls before renderer startup: relative selection must not depend on
    a later process-wide chdir by the guest/runtime. Keep this base process-owned. */
 void vk_shader_seed_startup(const char *game_dir) {
+    pthread_once(&g_position_once, position_init);
     if (!g_seed_dir && !realpath(game_dir, g_seed_base))
         snprintf(g_seed_base, sizeof g_seed_base, "%s", game_dir);
     if (vk_seed_io_enabled()) seed_io_start(); /* index/warming overlaps remaining boot work */
@@ -201,7 +216,7 @@ static int deps_match(const char *deps, const answers_t *a) {
 }
 
 /* ---------- shaders ---------- */
-typedef struct { char variant[80]; uint32_t early_tests; } shader_key;
+typedef struct { char variant[80]; uint32_t early_tests, position_policy; } shader_key;
 static nvn_hmap g_shaders = {.klen = sizeof(shader_key)};
 static int earlyz_on(void) { static int v = -1; if (v < 0) v = vk_earlyz_enabled(getenv("TOTK_VK_EARLYZ")); return v; }
 static inline uint32_t ctl_key_len(const uint8_t *control) { uint32_t n; memcpy(&n, control + 0x20, 4); return n >= 0x7cc && n < 0x880 ? n : 0x880; }
@@ -250,6 +265,38 @@ static int spirv_mark_stores(vk_shader *sh, const uint32_t *w, size_t nw) {
         for (int k = 0; k < sh->nb; k++) if (sh->b[k].binding == (uint16_t)bind[v] && !sh->b[k].rw && (sh->b[k].dtype == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || sh->b[k].dtype == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)) { sh->b[k].rw = 1; marked++; }
     free(bind); free(root); free(isbuf); free(stored);
     return marked;
+}
+/* Colour locations of the fragment shader's Output variables, arrays included: the seed's fout line names each
+   variable's first location only. TOTK_VK_UNWRITTEN_MASK masks attachments outside this set, so it must not miss one. */
+static uint32_t spirv_fout_locations(const uint32_t *w, size_t nw) {
+    if (nw < 5 || w[0] != 0x07230203) return 0;
+    uint32_t bound = w[3]; if (!bound || bound > (1u << 22)) return 0;
+    int32_t *location = malloc(bound * sizeof *location); uint32_t *value = calloc(bound, sizeof *value), *count = calloc(bound, sizeof *count), *pointee = calloc(bound, sizeof *pointee);
+    if (!location || !value || !count || !pointee) { free(location); free(value); free(count); free(pointee); return 0; }
+    for (uint32_t i = 0; i < bound; i++) location[i] = -1;
+    uint32_t mask = 0;
+    #define ID_OK(x) ((x) && (x) < bound)
+    for (size_t i = 5; i < nw; ) {
+        uint32_t op = w[i] & 0xffff, n = w[i] >> 16; if (!n || i + n > nw) break;
+        const uint32_t *a = w + i + 1;
+        switch (op) {
+            case 71: if (n >= 4 && a[1] == 30 && ID_OK(a[0])) location[a[0]] = (int32_t)a[2]; break;   /* OpDecorate Location */
+            case 43: if (n >= 4 && ID_OK(a[1])) value[a[1]] = a[2]; break;                              /* OpConstant (low word) */
+            case 28: if (n >= 4 && ID_OK(a[0]) && ID_OK(a[2]))                                          /* OpTypeArray */
+                         count[a[0]] = value[a[2]] * (ID_OK(a[1]) && count[a[1]] ? count[a[1]] : 1); break;
+            case 32: if (n >= 4 && ID_OK(a[0])) pointee[a[0]] = a[2]; break;                            /* OpTypePointer */
+            case 59:                                                                                    /* OpVariable Output */
+                if (n >= 4 && a[2] == 3 && ID_OK(a[0]) && ID_OK(a[1]) && location[a[1]] >= 0) {
+                    uint32_t t = pointee[a[0]], span = ID_OK(t) && count[t] ? count[t] : 1;
+                    for (uint32_t k = 0; k < span && location[a[1]] + k < 8; k++) mask |= 1u << (location[a[1]] + k);
+                }
+                break;
+        }
+        i += n;
+    }
+    #undef ID_OK
+    free(location); free(value); free(count); free(pointee);
+    return mask;
 }
 /* DEPTH16 nudge for depth the fragment shader writes (TOTK, 2026-10-22; vk_draw.c d16tie_on). Every store to the
    FragDepth built-in becomes value + a float specialization constant (id D16_SPEC_ID, default 0), set to the nudge in
@@ -329,7 +376,9 @@ static int spirv_image_features_ok(const uint32_t *w, size_t nw, int can_read, i
 }
 static int hexval(int c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1; }
 static vk_shader *shader_load(const char *variant, int early_tests) {
-    shader_key key = {0}; snprintf(key.variant, sizeof key.variant, "%s", variant); key.early_tests = early_tests != 0;
+    pthread_once(&g_position_once, position_init);
+    shader_key key = {0}; snprintf(key.variant, sizeof key.variant, "%s", variant);
+    key.early_tests = (uint32_t)early_tests; key.position_policy = g_position_policy;
     vk_shader *sh = nvn_hm_get(&g_shaders, &key);
     if (sh) return sh;
     char path[1024]; size_t spv_len = 0, vk_len = 0;
@@ -340,7 +389,7 @@ static vk_shader *shader_load(const char *variant, int early_tests) {
         RED(16, "shader %s: malformed SPIR-V or unsupported formatless storage image capability", variant);
         free(spv); free(txt); return NULL;
     }
-    sh = calloc(1, sizeof *sh); memcpy(sh->key, key.variant, sizeof sh->key); sh->early_tests = key.early_tests;
+    sh = calloc(1, sizeof *sh); memcpy(sh->key, key.variant, sizeof sh->key); sh->early_tests = key.early_tests & 1; sh->alpha_func = key.early_tests >> 1;
     sh->spv_bytes = spv_len;
     sh->local[0] = sh->local[1] = sh->local[2] = 1;
     int capb = 0;
@@ -364,8 +413,14 @@ static vk_shader *shader_load(const char *variant, int early_tests) {
         }
     }
     free(txt);
+    { vk_load_certificate proof = vk_load_certify((const uint32_t *)spv, spv_len / 4, sh->stage == 1);
+      sh->load_position_attr = proof.position_attr; sh->load_full_outputs = proof.full_outputs; }
     { static uint64_t nmark; int m = spirv_mark_stores(sh, (const uint32_t *)spv, spv_len / 4);
       if (m && ++nmark <= 8) LOGV("shader %s writes %d storage binding(s) (from its SPIR-V)", variant, m); }
+    if (sh->stage == 1) {   /* kept for a live TOTK_VK_UNWRITTEN_MASK; the launch switch also extends fout_mask, as before */
+        sh->fout_span = spirv_fout_locations((const uint32_t *)spv, spv_len / 4);
+        if (vk_unwritten_mask_on()) sh->fout_mask |= sh->fout_span;
+    }
     for (int i = 0; i < sh->nb; i++) if (sh->b[i].rw &&
         (sh->b[i].dtype == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || sh->b[i].dtype == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC ||
          sh->b[i].dtype == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER)) { sh->has_storage_writes = 1; break; }
@@ -389,15 +444,56 @@ static vk_shader *shader_load(const char *variant, int early_tests) {
         if (b->kind == RB_IMG) { if (b->reg >= 0 && b->reg < 32) sh->native_img_mask |= 1u << b->reg; }
         else if (b->reg >= 0 && b->reg < 128) sh->native_tex_mask[b->reg/64] |= 1ull << (b->reg&63);
     }
+    if (sh->stage == 0 && g_position_policy) {
+        size_t nw = spv_len / 4; uint32_t *words = (uint32_t *)spv;
+        if (vk_spirv_position(&words, &nw, g_position_policy) < 0) {
+            RED(16, "shader %s: cannot preserve requested vertex position precision; refused", variant);
+            free(spv); free(sh->b); free(sh->c1); free(sh); return NULL;
+        }
+        spv = (char *)words; spv_len = nw * 4;
+    }
     if (sh->stage == 1) {
         size_t nw = spv_len / 4; uint32_t *words = (uint32_t *)spv;
-        if (vk_spirv_early_tests(&words, &nw, early_tests && earlyz_on()) < 0) {
+        if (vk_spirv_early_tests(&words, &nw, sh->early_tests && earlyz_on() && !sh->alpha_func) < 0) {
             RED(16, "shader %s: invalid fragment execution modes", variant); free(spv); free(sh->b); free(sh->c1); free(sh); return NULL;
         }
         spv = (char *)words; spv_len = nw * 4;
         size_t nnw; uint32_t *pw = spirv_depth_nudge((const uint32_t *)spv, spv_len / 4, &nnw);
         if (pw) { free(spv); spv = (char *)pw; spv_len = nnw * 4; sh->depth_spec = 1; }
         patch_set((uint32_t *)spv, spv_len / 4, 1);
+        if (sh->alpha_func) {
+            unsigned binding=0;
+            for (int i=0;i<sh->nb;i++) if (sh->b[i].binding>=binding) binding=sh->b[i].binding+1;
+            pw=vk_spirv_alpha_test((const uint32_t *)spv,spv_len/4,sh->alpha_func,binding,&nnw);
+            if (!pw || binding>UINT16_MAX) {
+                RED(16,"shader %s: cannot build alpha-test comparison %u",variant,sh->alpha_func);
+                free(pw); free(spv); free(sh->b); free(sh->c1); free(sh); return NULL;
+            }
+            free(spv); spv=(char *)pw; spv_len=nnw*4;
+            sh->b=realloc(sh->b,(size_t)(sh->nb+1)*sizeof *sh->b);
+            sh->b[sh->nb++]=(vk_bind){.binding=binding,.count=1,.kind=RB_ALPHA,
+                .dtype=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,.reg=-1,.sreg=-1,.extent=16};
+            sh->load_full_outputs=0;
+        }
+    }
+    if (V.subgroup_fix) {
+        size_t nw = spv_len / 4; uint32_t *words = (uint32_t *)spv;
+        int fixed = vk_spirv_subgroup32(&words, &nw);
+        spv = (char *)words; spv_len = nw * 4;
+        if (fixed > 0) {
+            sh->required_subgroup_size = vk_subgroup_required(stage_flags(sh->stage), V.subgroup_control,
+                V.subgroup_sizes.requiredSubgroupSizeStages, V.subgroup_sizes.minSubgroupSize, V.subgroup_sizes.maxSubgroupSize);
+            uint32_t physical = sh->required_subgroup_size ? sh->required_subgroup_size : V.subgroup.subgroupSize;
+            if (physical < 32 || physical > 128 || (physical & (physical - 1)) ||
+                !(V.subgroup.supportedStages & stage_flags(sh->stage)) ||
+                !(V.subgroup.supportedOperations & VK_SUBGROUP_FEATURE_BALLOT_BIT)) fixed = -1;
+            else LOGV("subgroup shader %s: logical 32, physical %u%s", variant, physical,
+                sh->required_subgroup_size ? " (pinned)" : " (fixed default)");
+        }
+        if (fixed < 0) {
+            RED(32, "subgroup shader %s: cannot preserve 32-lane semantics on this device/module; refused", variant);
+            free(spv); free(sh->b); free(sh->c1); free(sh); return NULL;
+        }
     }
     VkShaderModuleCreateInfo mci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = spv_len, .pCode = (const uint32_t *)spv};
     VkResult r = vkCreateShaderModule(V.dev, &mci, NULL, &sh->mod);
@@ -406,6 +502,11 @@ static vk_shader *shader_load(const char *variant, int early_tests) {
     VkDescriptorSetLayoutBinding *lb = calloc((size_t)(sh->nb ? sh->nb : 1), sizeof *lb);
     for (int i = 0; i < sh->nb; i++) lb[i] = (VkDescriptorSetLayoutBinding){sh->b[i].binding, (VkDescriptorType)sh->b[i].dtype, sh->b[i].count, stage_flags(sh->stage), NULL};
     VkDescriptorSetLayoutCreateInfo dci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = (uint32_t)sh->nb, .pBindings = lb};
+    char why[128];
+    if (!vk_desc_layout_fits(lb, (uint32_t)sh->nb, why, sizeof why)) {   /* it could never be allocated: refuse it here */
+        RED(16, "descriptor set layout of %s: %s", variant, why);
+        free(lb); vkDestroyShaderModule(V.dev, sh->mod, NULL); free(sh->b); free(sh->c1); free(sh); return NULL;
+    }
     r = vkCreateDescriptorSetLayout(V.dev, &dci, NULL, &sh->dsl);
     free(lb);
     if (r) { RED(16, "descriptor set layout of %s: %d", variant, r); vkDestroyShaderModule(V.dev, sh->mod, NULL); free(sh->b); free(sh->c1); free(sh); return NULL; }
@@ -415,13 +516,19 @@ static vk_shader *shader_load(const char *variant, int early_tests) {
     if (sh->stage == 5) vk_compute_prepare(sh);
     return sh;
 }
+vk_shader *vk_shader_alpha(vk_shader *base, unsigned func) {
+    if (!base || base->stage!=1 || !func || func==NVN_ALPHA_FUNC_ALWAYS) return base;
+    if (func>NVN_ALPHA_FUNC_GEQUAL) return NULL;
+    return shader_load(base->key,base->early_tests | (int)(func<<1));
+}
 /* Startup/replay only: exact persisted or program-known variant; shader/layout maps
    remain single-owner even though compute driver calls run on a worker. */
 vk_shader *vk_shader_seed(const char *variant, int stage, int early_tests) {
     size_t n = strnlen(variant, 80);
     if (n != 64 && n != 77) return NULL;
     for (size_t i = 0; i < n; i++) if (i == 64 ? variant[i] != '-' : hexval(variant[i]) < 0) return NULL;
-    vk_shader *s = shader_load(variant, stage == 1 && early_tests);
+    if (early_tests<0 || early_tests>15 || (stage!=1 && early_tests)) return NULL;
+    vk_shader *s = shader_load(variant,stage==1 ? early_tests : 0);
     return s && s->stage == stage ? s : NULL;
 }
 

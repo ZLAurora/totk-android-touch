@@ -77,7 +77,7 @@ int keys_load_fd(SetupCtx *c, const SetupInput *in, SetupKeys *k) {
     if (in->size == 0 || in->size > (1u << 20)) { setup_fail(c, "bad_keys", "prod.keys must be a small text file (got %llu bytes)", (unsigned long long)in->size); return -1; }
     char *text = malloc((size_t)in->size);
     if (!text) { setup_fail(c, "internal", "Out of memory"); return -1; }
-    if (st_pread(in->fd, text, (size_t)in->size, in->offset)) { free(text); return st_io_fail(c, "read", "prod.keys"); }
+    if (st_pread(in->fd, text, (size_t)in->size, in->offset)) { int r = st_io_fail(c, "read", "prod.keys"); free(text); return r; }
     int r = keys_parse(c, text, (size_t)in->size, k);
     memset(text, 0, (size_t)in->size);
     free(text);
@@ -105,9 +105,12 @@ int keys_write_hactool(SetupCtx *c, const SetupKeys *k, const char *path) {
     if (b.oom) { setup_fail(c, "internal", "Out of memory"); r = -1; }
     else {
         int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-        int bad = fd < 0 || st_write(fd, b.p, b.n);
-        if (fd >= 0 && close(fd)) bad = 1;
-        if (bad) { r = st_io_fail(c, "write the temporary key file", path); unlink(path); }
+        if (fd < 0) r = st_io_fail(c, "open the temporary key file", path);
+        else {
+            if (st_write(fd, b.p, b.n)) r = st_io_fail(c, "write the temporary key file", path);
+            if (close(fd) && !r) r = st_io_fail(c, "close the temporary key file", path);
+        }
+        if (r) unlink(path);
     }
     if (b.p) memset(b.p, 0, b.n);
     buf_free(&b);

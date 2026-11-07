@@ -21,9 +21,113 @@ only the companion art is optional, and *Play without second-screen art* may ski
 with `.spv` modules (`InstallState.seedUsable`). Otherwise Home shows *Shaders not built* and offers *Build shaders*
 (the shader stage alone) in place of *Start game*. Second-screen art from an older generator (its `companion/index.json`
 `"generator"` below `CompanionArt.GENERATOR`, which equals `stage_companion.c` / `make_companion_assets.py`'s
-`GENERATOR_VERSION`), or with an unreadable index, counts as not prepared: when Home opens (once per launch) it starts the
-companion stage alone as *Updating second-screen art*; the old art stays in use until the new tree replaces it, *Play
-now* stops the update and starts the game, and Game data shows *Out of date · Update* (`tests/test_android_companion_art.py`).
+`GENERATOR_VERSION`), or with an unreadable but present index, counts as not prepared: on devices with a built-in second
+screen, Home opens the companion stage alone (once per launch) as *Updating second-screen art*; the old art stays in use
+until the new tree replaces it, *Play now* stops the update and starts the game, and Game data shows *Out of date · Update*
+(`tests/test_android_companion_art.py`). On other devices setup sends `skipCompanion: true`: native setup records
+`stages.companion: {done:false, skipped:true}` (without a failure code) and runs shaders alone. Explicit Game data builds
+still run on any device; automatic art updates and Home's art rebuild reminders are restricted to built-in second screens.
+At every game start, including skip-menu launches, `ArtPolicy` uses the current display classification and actual
+`companion/index.json` presence/currentness, not just the manifest's done flag. Missing art on a dual-screen device opens
+the styled *Prepare second-screen art* / *Play without it* choice. Preparing runs the stage with progress and starts only
+after success with usable art; cancellation/failure returns Home. `artDeclined` persists a skip across launches for this
+install; a Game data build or deleting imported data clears it. `startAfterArt` preserves the requested build-then-play
+through activity/process recreation. Pure-Java decisions are covered by `tests/test_android_art_policy.py`.
+
+**App updates:** `TotkActivity` starts one background `Updates.check` per native game process, including skip-menu
+launches. It requires active-network INTERNET + VALIDATED capabilities, a stable `X.Y.Z` versionName and the
+default-On update switch. It performs exactly one HEAD to GitHub `releases/latest`, redirects disabled, no body read;
+connect/read timeouts plus a five-second delivery deadline bound the check. Only an exact HTTPS github.com
+`/AurelioB/totk-android/releases/tag/vX.Y.Z` Location newer by semantic version triggers a prompt. No telemetry, retry,
+prerelease tags or automatic download. A private root-written source override enables test-package checks
+([developer settings](../../../docs/developer-settings.md#private-update-source-for-device-tests)).
+`UpdatePrompt` reuses menu fonts, panels and controller-focusable rows over the game. It explicitly holds
+`nativeGameFocus(false, true)` while open, including on dual-screen devices; focus callbacks cannot release it.
+The version is stored atomically in private `pending-update.txt`. Next time leaves it for a menu prompt before Home
+on a later launch, without another request. An offer is suppressed if persistence fails. Update now enters a
+non-exported `:setup` UpdateEntryActivity, which issues a short-lived one-use capability for the menu's immediate
+update path. An external UPDATE intent to the exported menu can only show Update / Not now, never authorize closing
+the game or downloading. `SetupActivity` reuses `needGameClosed` / `closeGame`, save-busy, GameControlService thaw and
+close-request before `UpdateInstaller`.
+The Updates setup step precedes Prepare; About has the same switch (`update-checks.txt`; absent means On).
+The cancellable progress screen downloads APK + checksum into cache. Every redirect requires HTTPS github.com or
+`*.githubusercontent.com`; the root-only test origin is the sole HTTP exception. One ten-minute deadline covers both
+assets and every redirect. A separate progress watchdog disconnects blocked reads when an asset transfers less than
+64 KiB in 30 seconds; redirects cannot restart either deadline. Failure removes partial downloads and keeps the
+pending version. SHA-256, own package, strictly newer versionCode and the installed current signing certificate's
+SHA-256 are checked. The exact bytes written to the PackageInstaller session are hashed again and must match before
+commit. Unknown-sources permission is
+explained and rechecked on return from Settings. Denial or installer failure keeps the pending version with a clear
+note. A PackageInstaller session and explicit non-exported `:setup` UpdateReceiver handle Android's confirmation,
+not a FileProvider. Temporary downloads are removed on completion/cancel/error or next menu startup after interruption.
+Saves/game data are untouched. New permissions: INTERNET, ACCESS_NETWORK_STATE, REQUEST_INSTALL_PACKAGES.
+Host coverage: `tests/test_android_updates.py`, `tests/test_android_update_security.py`.
+
+
+All play paths converge on `SetupActivity.launchGame`: Start game/Play now, the launcher's direct-game preference,
+the Settings `ACTION_VIEW` shortcut followed by Start game, and success after Prepare second-screen art.
+`GameLaunch.start` uses the same `DisplayClass` built-in-panel classification as the companion, relative to
+`Display.DEFAULT_DISPLAY`, not the menu's current panel. This also keeps art preparation and the Second screen
+setting available when the menu is on the bottom screen. Only devices with a built-in second panel get
+`FLAG_ACTIVITY_NEW_TASK` and `ActivityOptions.setLaunchDisplayId(DEFAULT_DISPLAY)`; single-screen devices and
+external/cast/overlay-only configurations keep Android's ordinary launch behavior. The companion's enabled setting
+does not change where the game runs.
+SetupActivity declares `android:relinquishTaskIdentity="true"`: when the menu finishes, its existing same-affinity
+task adopts the game's base Intent instead of permanently retaining the launcher/menu Intent. Without this,
+Android 16 can fail to find the game across displays and create a second `TotkActivity`; neither
+`moveTaskToFront` display options nor an explicit `AppTask.startActivity` fixes that stale identity. The native runtime
+is process-global and must have exactly one NativeActivity. Game start does not replay/recreate the menu or change
+its pending close/retry actions. `singleTask`, affinity, permissions, app label/icon and launcher/recents
+declarations are otherwise unchanged; there is still one app card after the menu hands over to play.
+On dual-screen devices a normal MAIN/LAUNCHER entry returns directly to a live game without another save sync or
+startup marker; the explicit Settings VIEW shortcut always opens the menu. With no live game the normal menu/direct
+game preference still applies. A pending save-safe Close game action is not cancelled by that launcher shortcut path.
+An explicit Settings shortcut opened from the bottom panel binds its `SINGLE_TOP` launch to its own `AppTask`
+before drawing on the main display: a normal cross-display task search cannot find a menu above the game-rooted
+task. Existing menu content and gated retry actions stay on that activity; a pending Close game is not redirected
+or replaced. A cold redirect initializes its recovery screen once, retaining Setup stopped / interrupted and Resume
+instead of applying the already-open Settings-to-Home reset. Host coverage: `tests/test_android_settings_display.py`.
+A newly created cross-display menu entry launches from the live menu's own activity token, explicitly moves its
+cached `AppTask` to front, and finishes only the undrawn newcomer. A weak activity reference owns this routing, not
+another persistent menu instance: Android 16 removes the old same-affinity task from `getAppTasks()` when it creates
+the new launcher entry, so rediscovering it then is too late. The owner-bound `REORDER_TO_FRONT` launch has no
+`NEW_TASK` flag, so it also reuses a menu below its file picker rather than matching the task's root Intent.
+This includes launcher entry after native exit and preserves the existing menu's safe-close guard and retry.
+If no menu exists and the game is live, Settings first returns through that singleTask game on display 0, then the
+game opens the menu using its own caller token (no new-task flag). This keeps even a bottom-launcher Settings entry
+above the game in the same task: after save-safe native exit there is no separate stale game task to reveal/restart.
+Task-bound starts can report the new display configuration without delivering a new Intent; resume/configuration
+callbacks therefore finish cold UI initialization, and the handoff Intent marks cold initialization to preserve
+recovery regardless of callback order.
+`TotkActivity` also checks resume, new-intent and configuration callbacks: a launcher can move an existing task
+without opening the menu again. If it is on the second panel, the activity relaunches its own singleTask on the main
+display, without finishing/restarting the native game; a pending-move guard prevents recursive launches. A display
+move refreshes companion selection, which still excludes the game's current display. Host decision/callback
+coverage: `tests/test_android_game_display.py`; Android task-manager behavior is checked separately on devices.
+Configuration recovery runs only while the game is resumed: moving a shared task with the menu on top must not
+bring the background game over that menu. The next Start game still targets the main display.
+
+Device acceptance (2026-11-04, release-key TEST build `ad834eab3d20`): Retroid Pocket Duo / Android 16 (secondary
+display 2) and AYN Thor / Android 13 (secondary display 4). Cold bottom-menu launches, top launches, Home + launcher
+from either panel, a live game task moved to the bottom panel, and a shared menu/game task moved there all returned
+the game to display 0 and the companion to the built-in second panel. The shared-task returns retained the same task,
+ActivityRecord and native PID (Duo task 629 / PID 8549; Thor task 28543 / PID 22586); every scenario's activity dump had
+at most one TotkActivity. The Settings VIEW shortcut from the bottom opened one visible menu on display 0; normal
+launcher taps returned to the running game without a menu. Recents retained one TEST app card with the app icon.
+Home logged game/audio pause at a guest frame boundary. A gated graphics-driver action survived Close the game,
+logged the native pipeline-cache flush/exit, and continued into the file picker; cancelling it changed no driver.
+After game exit, the next normal launcher tap showed the menu. Both devices' existing SELinux mode was Permissive
+and was left unchanged; these are display/task/lifecycle checks, not new enforcing-mode compatibility evidence.
+
+Follow-up Settings/task acceptance (2026-11-04, release-key TEST build `bcd059d`): the same Duo / Android 16 and
+Thor / Android 13 completed 42 scenario captures with at most one game and one menu ActivityRecord each. A shared
+game/menu task moved from display 2/4 back to 0 retained both records and the native PID (Duo task 690 / PID 27784;
+Thor task 28587 / PID 20559), including a gated graphics-driver retry. Close flushed/exited the native runtime and
+continued that retry into the file picker. Cold bottom Settings retained Setup stopped / interrupted with Resume.
+Both launchers returned a live game without a menu; after native exit they reopened the menu without restarting
+the runtime. Settings also foregrounded that same menu above its file picker. Dumps checked the menu's RESUMED state,
+not just its existence. Recents retained one TEST task; affinity and the singleTask game remained unchanged.
+
 The menu keeps its options in SharedPreferences and writes them, on every
 change and again right before the game starts, to `<private>/settings.env` (`Settings.java` is the option → variable
 mapping; `tests/test_android_settings.py`). The native side refuses to start without a playable install too and
@@ -33,6 +137,35 @@ ones (`assets/expected-v1.4.3.json`). Vulkan driver: `<game>/driver.so` (copied 
 `TOTK_VK_DRIVER`, else the bundled `libtotk_turnip.so` used in place from the native library folder, else the system
 driver. A `shaders/v143/seed.vkpack` selects the indexed seed IO (`TOTK_VK_SEED_IO=1`). Developer builds fill the same
 folder over USB with `install_app.sh data` (install.json goes last). The rest of this file is the development history.
+
+*Game data → Graphics driver* accepts a bare ELF64 AArch64 `.so` or an AdrenoTools Turnip `.zip`, detected by content.
+`DriverImport.java` stages a bounded archive privately, reads `meta.json` (up to 64 KiB) and selects its exact
+`libraryName` entry (including nested paths); without metadata exactly one `.so` is required. Other entries are
+never extracted. Archives are limited to 160 MiB / 256 entries, libraries to 128 MiB; the library's ELF header,
+uncompressed length and CRC are checked before `driver.so.tmp` replaces `driver.so` under `GameLock`.
+The directory is bounded before `ZipFile` opens it; multiple EOCD signatures in the scanned footer are refused so a
+platform parser cannot select a different, unchecked directory hidden in a zip comment.
+Failed reads leave the previous driver and `driverName` preference intact and remove staging files.
+The row uses metadata `name` plus `driverVersion`, or the picked filename; *Use the bundled driver* removes the override.
+Host coverage: `tests/test_android_drivers.py`.
+
+### Setup stopped: Share details
+
+The controller-focusable **Share details** row leaves **Resume** primary. It builds a plain-text report on the
+setup worker, then opens Android's `ACTION_SEND` chooser (`text/plain`, no FileProvider or attachments).
+No game files or keys are included; nothing is sent until you choose an app.
+Share details **before Resume**: `setup.c` clears `.import` when the next run starts and removes it on success.
+Failure cleanup keeps the top-level logs, even for private Internal storage that a file picker cannot browse.
+
+`SetupDetails.java` is the pure, host-tested builder (`tests/test_android_setup_details.py`). Its only file reads
+are `.import/hactool-romfs.log`, `.import/hactool-exefs.log`, and, for a shader failure, `.import/shaders.log`.
+Missing/unreadable files are marked; symlinks and non-regular files are excluded. The UTF-8 report is capped at
+64 KiB, retaining each oversized log's beginning and end with a byte-omission marker. Partial records at byte cuts
+are dropped; an oversized edge line is scrubbed whole before it is truncated, so filename/URI/path fragments cannot
+escape redaction. Hex runs of 32 or more characters are redacted again across the whole report; input names,
+URIs and absolute paths are scrubbed.
+Metadata includes the result JSON, app version/code/commit, device/Android/SoC, route, destination kind and free
+bytes, plus each input's direct-path/provider-authority access, extension and size only.
 
 ### Supplying your own launcher image
 
@@ -1751,10 +1884,103 @@ needs `su`). The folder holds what the adb-shell folder holds:
 | `rewritten/<version>/` | the game's code (one version folder) |
 | `extracted/` | RomFS, shared fonts |
 | `shaders/<version>/` | the Vulkan shader seed |
-| `driver.so` | the Vulkan driver (a Turnip build). It's copied into the app's private folder at each start, because files on shared storage cannot be loaded as code. Without it, the system driver is used. |
+| `driver.so` | the custom Vulkan driver (a Turnip build), picked as an AdrenoTools `.zip` or a 64-bit ARM `.so`. It's copied into the app's private folder at each start, because files on shared storage cannot be loaded as code. Without it, the bundled Turnip driver is used. |
 | `user-data/` | saves to import: on the first start (no private saves yet) they're copied into the app's private storage, where the game keeps its saves from then on. `install_app.sh saves` copies those to the computer. |
 | `totk.env` | options, one `NAME=value` per line (`#` comments), e.g. `TOTK_VK_SHOT=300` or `TOTK_FACE_BUTTONS=position`. Read after the launcher menu's `settings.env` (app-private `files/settings.env`, written by the menu; only the menu's own option keys are accepted there, others are logged and ignored), so a line here overrides the menu. |
 | `totk.log` | the log of the last start (`install_app.sh log`) |
+| `totk.ctl` | live switches for in-session A/B runs (below), atomically replaced with each new batch by `tools/bench/live.sh`; startup contents are skipped |
+
+### Diagnostics: logcat copy, crash reports and the stall watchdog
+
+- **`TOTK_LOGCAT`** (default off; only `1` opts in). `totk.log` stays the primary log (written directly, so a sudden end
+  loses nothing). Normally there is no mirror thread, watch, polling or logcat write. When opted in, a thread at nice 10
+  (on the slower CPUs when sysfs shows them) copies its complete lines to logcat with
+  tag `totk`: FATAL, CRASH or "device lost" as errors, red messages (`【红】`, `[RED]`) as warnings, the rest as info;
+  lines over 1000 bytes are cut and marked ` [...]`. It sleeps on an inotify watch of the file (20 ms polling only
+  without inotify), so an idle log costs no wakeup (`tests/test_log_mirror.py` measures it). The log's
+  `[totk-logcat] on (TOTK_LOGCAT=1): ... wake=inotify nice=10` or `[totk-logcat] off` line shows the arm;
+  `adb logcat -s totk` reads it. Active mirroring is diagnostic overhead even though an idle log costs no wakeups.
+  Compare long-frame tails with `TOTK_LOGCAT=1` versus unset; the default avoids duplicating frame logs through logd.
+- **Crash reports** (always on). The runtime's SIGSEGV/SIGBUS/SIGILL/SIGTRAP/SIGABRT report (`[totk] signal=` …, `[totk]
+  host abort`) is written by the first crashing thread only; another crashing thread waits for it at most 5 s, then
+  ends the process with `_exit(128+signal)`. After the report the handler that was there before is called once,
+  directly, with the original siginfo (`runtime/crash_chain.h`): Android's debuggerd writes a tombstone and a logcat
+  backtrace (`adb logcat -b crash`, `/data/tombstones`). Then the signal's default action ends the process (tgkill
+  to the crashing thread, `_exit(128+signal)` as the last fallback), whatever that handler did.
+- **`TOTK_WATCHDOG`** (default on; `0` turns it off) and **`TOTK_WATCH_STALL=<seconds>`** (default unset). From the first
+  presented frame a thread polls every 250 ms; after >= 1 s without a new frame it logs `[totk-watch] no presented frame
+  for … s at stage "…" (frame …): thread dump n/3` and the `TOTK_DUMP_AFTER` thread dump (one per stall, at most 3,
+  >= 10 s apart). Boot, the background (paused or no window) and held stages (host movies, the first-world pipeline
+  warm-up, loading screens where the backend knows them) do not count, unless a held stage lasts 60 s. With
+  `TOTK_WATCH_STALL` a stall that long ends the process with status 142 (128+SIGALRM), for unattended runs. The
+  `[totk-watch] on: …` / `off` line shows the arm (`tests/test_progress_watch.py`).
+  Each mark reuses the present path's existing monotonic timestamp and actual graphics frame number; it adds no
+  clock read, atomic read-modify-write, or stage-string copy. Disabled marks publish nothing.
+- **`TOTK_THREAD_SAMPLER=1`** (default off; live through `totk.ctl`). Names the threads behind long frames without root
+  or logcat (the Duo's logd drops our lines): a thread at nice 10 (slower CPUs) reads `/proc/self/task/*/schedstat`
+  4 times a second; each frame over 50 ms and every 300 presents log `[totk-threads] long frame F 87.3 ms, window W ms:
+  <name>(tid) run R wait Q, …` to `totk.log`: the 3 threads that ran most in the window (the frame plus at most 250 ms
+  before it) and their run-queue wait. Off, its thread never starts and the frame hook is one compare
+  (`runtime/thread_sampler.h`, `tests/test_thread_sampler.py`). Confirm a named thread with simpleperf (DEBUGGING.md).
+
+### Live switches (`totk.ctl`)
+
+A/B measurements change experiment switches inside one running session, so both arms share one loaded scene
+(`tools/bench/ab.sh`, the `totk-benchmark` skill). A thread at nice 10 (on the slower CPUs, like the logcat copy)
+follows `<game folder>/totk.ctl` with inotify (on the file only once readable; 250 ms polling without inotify).
+While the file is absent it retains one create/move-only directory watch: unrelated log/cache writes, closes and
+attribute changes cause no reader wakeups. Unrelated creates/moves are ignored without reopening or rearming.
+If a target open fails for a reason other than a missing file, a 250 ms retry handles later chown/chmod/context
+repair without subscribing to all files' close/attribute events. Failed reads use the same retry; it stops when
+the file opens successfully or disappears. Explicit watch removals' `IN_IGNORED` cannot feed a retry loop.
+It stages each complete line appended after the start; the lines of one write are staged together. `tools/bench/live.sh`
+publishes only its new batch via a same-directory temp file, with owner/mode/context set before atomic rename;
+replacement is read from the beginning, so it must not copy old commands (which would replay them).
+
+- `set KEY=VALUE` sets a live switch to a decimal inside its range; `unset KEY` returns it to its launch value
+  (`totk.env`, else the switch's default); `mark <text>` only writes a marker (the A/B arm).
+- Empty lines and `#` comments are ignored. Anything else logs `[totk-ctl] refused "<line>": <reason>` and changes
+  nothing: a malformed line, a value out of range, a key that is not live, or a startup-only key
+  (`TOTK_IDEAL_CORE_FIX`: set it in `totk.env` and restart).
+- The present path applies everything staged at the next presented frame, in file order, and advances one generation:
+  `[totk-ctl] gen=N frame=F applied KEY=VALUE unset KEY ...` and `[totk-ctl] gen=N frame=F mark <text>`. F is the
+  timing frame of `计时 至帧 F` lines: frames after F run with generation N. Each switch takes effect at its own safe
+  point after that; a busy staging lock is retried at the next frame, never waited for.
+- Cost without a control file: one relaxed load per presented frame (and per call site of a live switch); reads
+  re-look up a switch only when the generation changed (`runtime/live_ctl.h`, `totk_live_cached`).
+  `tests/test_live_ctl.py` covers the parser, the frame-boundary application, generation order, the cache, the control
+  thread on a real file and a writer / frame thread / readers race under ThreadSanitizer.
+
+| Live switch | Range | Takes effect | Notes |
+| --- | --- | --- | --- |
+| `TOTK_VK_PIPE_BOOST` | 0–1 | the next join on a worker build | a loan already made is still restored |
+| `TOTK_VK_UPLOAD_THREADS` | 0–3 | the next texture upload | helpers start with the first parallel upload; at 0 they sleep without work |
+| `TOTK_PRIO_RENDER` | −20…19 | at the application, by tid on every registered render thread | unset returns each to the nice it inherited; the walker keeps `TOTK_PRIO_WALK` when that is set; render threads started later take the live value |
+| `TOTK_TIMER_SLACK_NS` | 1…50000 | each game / frame thread before its next timed wait (the presenting thread at once) | unset returns to the launch value, else the thread's default (50 µs) |
+| `TOTK_VK_DESC_STOCK` | 0–1 | each recorder context and primary slot at its next slot generation | switched off, an owner frees its stock and destroys its descriptor pools, so the retained memory goes back |
+| `TOTK_VK_DESC_STOCK_MAX_SETS` | 0…1048576 | each recorder context and primary slot at its next slot generation | 0 = no ceiling; lowered below an owner's stock, that owner resets its pools and destroys those past the limit at once |
+| `TOTK_VK_UNWRITTEN_MASK` | 0–1 | pipelines and output libraries built afterwards | pipelines already built keep their masks (the key does not carry the switch): compare it with a restart, or read the per-300 count of masked new pipelines |
+| `TOTK_VK_SPLIT_PASS_DRAWS` | 0…1000000 | the next render pass opened | |
+| `TOTK_VK_LOAD_ELIDE` | 0–1 | the next render pass opened | default off; only certified full-coverage first draws discard color loads; `[load-elide]` counts proofs and elided passes per 300 presents |
+| `TOTK_VK_FEEDBACK_NARROW` | 0–1 | the next render pass opened | default off; retain read-only attachment feedback across texture-only invalidates; `[feedback-narrow]` counts avoided ends per 300 presents |
+| `TOTK_VK_ALPHA_TEST` | 0–1 | the next draw | default off; alpha comparison fragment variant plus immutable reference UBO; `[alpha-test]` counts enabled/ignored draws even while off |
+| `TOTK_VK_CLEAR_ON_READ` | 0–1 | the next sampled/storage image read | default off; materialize overlapping pending attachment clears before returning a cached/new view; `[clear-on-read]` counts first-read resolutions |
+| `TOTK_VK_STAGING_RETAIN_MB` | 8…4096 | each slot arena at its next open, after its fence | unset returns to the launch value (no cap when unset at launch) |
+| `TOTK_VK_FEEDBACK_CUT` | 0–1 | the next descriptor build | the freeze memo key carries the pass serial while it is on |
+| `TOTK_VK_PREPARE_MASK` | 0–1 | the next draw's uniform preparation | a change marks every register dirty, so that draw prepares in full; `TOTK_VK_OFF=prepare` keeps it off |
+| `TOTK_THREAD_SAMPLER` | 0–1 | the next presented frame | the first switch-on starts the sampler thread; switched off it sleeps until switched on again |
+| `TOTK_VK_REC_WAKE_BATCH` | 0…2000 | the next chunk enqueue, and the next time a recorder worker finds no work | a worker already polling finishes its current poll; mixed old/new reads during the change only cost a wake or a moment of parallelism, never a queued batch |
+| `TOTK_VK_TEX_MEMO` | 0–1 | the next texture ID lookup and texture registration | memo entries stay keyed by the registry/identity/submission state, so switching back on never reuses a stale one |
+| `TOTK_NVN_CALL_NOCOPY` | 0–1 | the next CallCommands / CopyCommands | a recording already holding call markers still expands them at its EndRecording |
+| `TOTK_ADPF_GPU` | 0–1 | the next presented frame | that frame is not reported; the session's target switches with it; no effect with `TOTK_ADPF=0` |
+| `TOTK_ADPF_LOAD_HINT` | 0–1 | the next span report | clears consecutive-frame history, retains the 500 ms rate limit; needs `TOTK_ADPF_GPU=1` |
+| `TOTK_ADPF_CPU_SPLIT` | 0–1 | the next presented frame | queue waits are measured for subsequent frames; total span/GPU unchanged; needs `TOTK_ADPF_GPU=1` and API 35 |
+| `TOTK_ADPF_TARGET_PCT` | 50…100 | the next presented frame | default 90 (unchanged); updates the session target before reporting; needs `TOTK_ADPF_GPU=1` |
+| `TOTK_RATE_HINT_HOLD` | 0…60000 | the next guest present | ms; a change clears the held rates; no effect without `TOTK_FRAME_RATE_HINT=1` |
+
+`TOTK_IDEAL_CORE_FIX` and `TOTK_THERMAL_STEP` are startup-only and refused. Another launch-time switch becomes live by adding it, with its
+range, to `totk_live_switches` in `runtime/live_ctl.h`, reading it through `totk_live_cached` at a point where a change
+is safe, and adding its row here. Each switch's per-300 report shows the value in use.
 
 ### Game data location, game lock and save signals (release app)
 
@@ -1813,8 +2039,66 @@ needs `su`). The folder holds what the adb-shell folder holds:
 - **Backup.** `allowBackup=false` (no cloud backup, unchanged) plus `dataExtractionRules`/`fullBackupContent`
   (`build_apk.backup_rules`, res/xml) excluding `file:game`, `file:state` and `external:.` from cloud backup and
   device-to-device transfer; the rest of the private files (saves, settings) keep Android's D2D behaviour.
-- **Game lock.** The game holds an OFD write lock on `<private>/state/game.lock` for its lifetime; the move holds it
-  too. Java's `FileChannel.tryLock` (POSIX lock) conflicts with it, so `SaveManager.holdGame` = "game not running".
+- **Setup estimates.** Welcome, route cards and the Prepare rail use the route's measured approximate duration:
+  decrypted dumps about 2–3 minutes, containers about 15 minutes, plus SD-card copy time (device/storage dependent),
+  not the former blanket half-hour estimate.
+- **Game lock.** The game holds an OFD write lock on `<private>/state/game.lock` for its lifetime (up to four seconds'
+  wait for a setup operation). `GameLock` owns the setup JVM's single POSIX-lock descriptor behind a mutex/refcount:
+  concurrent menu probes, save swaps, sync and service work share that owner instead of conflicting with themselves.
+  Results are `FREE`, `GAME` (external contention) or `ERROR` with the exception/cause; open/lock errors never mean free
+  or game-running. SetupService holds a lease across setup/move; `gameLockHeld=true` makes native move skip opening
+  **or closing** that inode (any same-process descriptor close would release a POSIX lock). Standalone moves still
+  acquire their own OFD lock. The file itself is never unlinked.
+  Before `startActivity`, the menu writes `state/game-starting` with wall-clock time and setup pid under the same
+  mutex. The game removes it immediately after acquiring the lock, and on refused start. A live default process plus
+  marker counts as `GAME`; a cached process alone does not. A local launch bridges the pre-process gap for up to four
+  seconds; abandoned markers without a default process are removed. `TotkSetup` logs the decision branch, process
+  pid/name/importance, lock outcome/exception/cause and marker state. Busy/error decisions and native close outcomes
+  use WARN so plain `logcat -s TotkSetup` includes them even when INFO is filtered; Java lines include effective
+  INFO/WARN loggability flags.
+- **Close the game.** Installing, moving/deleting game data, changing the driver and replacing saves are gated
+  while `GAME` (errors display their reason instead). Dimmed controls remain focusable for handheld navigation;
+  activating one records that exact operation and explains the gate, without mutating data. The menu re-checks every
+  second and on resume, so controls clear without a restart. The refresh registers once even when the UI appears
+  asynchronously after `onStart`, and unregisters on stop. *Close the game* binds to the non-exported default-process
+  `GameControlService` with `BIND_AUTO_CREATE` only while the lock says `GAME`. The foreground menu's ordinary binding
+  lifts the game out of Android's cached-app freezer **before** waiting for a save, allowing both the save and the
+  native poller to progress. The service returns an inert Binder and never initializes the runtime, starts an activity,
+  or posts a notification. A disconnect/death merely triggers another lock check: the lock, not the existence of a
+  bound default process, decides whether the game is running. The binding is released on success, failure/timeout,
+  and activity stop/destruction; a recreated menu never retains the old connection or its pending action.
+  It waits up to 30 seconds for `state/save-busy` to disappear, then atomically writes
+  `state/close-request` with a unique pid/time id. A non-render native thread checks it every 500 ms (one stat when
+  absent), consumes it and calls the existing native close path. A saving race is refused with a correlated atomic
+  `close-response`; I/O refusal includes errno/reason. The menu waits/retries within its bounded close deadline.
+  This deliberately does **not** start non-exported, `singleTask` `TotkActivity`: that would pop/destroy the menu and
+  lose the pending operation. Neither task affinity nor launcher/recents behavior changes.
+  `runtime_fs_begin_close` refuses an active/uncommitted save and atomically gates any later save before its first
+  change until process exit. The accepted close flushes the Vulkan pipeline cache and exits, never kills the process.
+  Diagnostic close input receives an explicit accepted/refused result; refusing during a save keeps reading commands.
+  The menu waits for the game lock/start marker to clear (bounded), then retries the selected operation. Once the
+  game is gone, a stale `save-busy` left by a crash does not block completion. A timeout explains why the game was left
+  running.
+- **Background pause (default).** `TotkActivity`'s actual `onPause`/`onStop` pauses gameplay at the next
+  `nvnWindowAcquireTexture`, after releasing the guest virtual core and before taking graphics locks. `onResume`
+  wakes it. On a single display, losing window focus also pauses (including live recent-apps tiles which Android can
+  leave `RESUMED`), and regaining focus wakes it without requiring another `onResume`. On multi-display devices,
+  focus changes alone never suspend the game: using the companion Presentation or another display while Android
+  keeps the game resumed continues playing. Callbacks only publish state; they never wait for a frame or an audio
+  stream. Input is cleared on each transition and ignored while paused,
+  including synthetic button presses and new companion requests. Rumble and motion retain GameFeedback's lifecycle.
+  A pending save is allowed the guest frames it needs through `Commit`, not merely the three-second busy heuristic;
+  save I/O, the save-generation watcher and Java's `SaveMirror` stop flush are never gated. The independent close-request
+  poller still admits `runtime_fs_begin_close`, flushes the pipeline cache and exits while the frame thread is asleep.
+  The AAudio callback mutes immediately and discards pre-pause samples. Its device worker requests pause then flush,
+  and restarts only after flush completes, with fresh prefill; no queued background audio plays on return. The renderer
+  keeps signalling its frame event at the normal 5-ms cadence, without advancing voices or holding its lock across a
+  pause wait. The pause gate accumulates monotonic suspension time (including an ongoing pause); VP9 movies
+  shift their first-frame deadline by each new suspended interval under the decoder lock and release no video
+  during save-completion frames while audio is frozen. Resume therefore preserves the next movie PTS instead
+  of dropping queued video as late. `[movie] resume` reports the applied shift, next PTS and cumulative dropped
+  frames. Guest/host monotonic clocks themselves continue; the existing realtime frame-step producer rejects
+  intervals over 250 ms and resets its five-frame history rather than feeding the background interval into physics.
 - **Save signals.** `fs_host.c` creates `<private>/state/save-busy` on the first change to save data and, on the
   `Commit` that completes it with every fsync successful, removes it and rewrites `state/save-generation` (counter,
   tmp+rename). The game-process `SaveMirror.Watcher` polls it (1 s), waits 3 s and for `save-busy` to be gone, then
@@ -3563,15 +3847,97 @@ Mac build uses lets the controller drop to one display tick whenever a frame's w
 | Frame-rate option | Android default | Effect |
 | --- | --- | --- |
 | `TOTK_FPS60` | `0` | `1` permits the game's 60-fps controller; `0` retains the shipping 30-fps minimum interval. |
+| `TOTK_FPS60_HYSTERESIS` | `0` (native) when unset; menu writes `1` only for Snapdragon 8 Elite-class native 60 fps | Startup-only, FPS60/v143: raise after seven consecutive over-budget decisions instead of three, then reload cooldown 2 instead of 6. `<game>/totk.env` `=0` overrides the menu. Compare interval-2 share/episode length and missed-refresh tails; details below. |
 | `TOTK_FPS_AUTO` | `0` (off) | `1`, only with `TOTK_FPS60=1`, selects effective 60/30 presentation intervals from measured sustainability; guest code is not repatched. |
 | `TOTK_GPU_TIME` | `hardware` when `TOTK_FPS60` is unset/`0`; `latency` when `TOTK_FPS60=1` | Android shipping-30 mode defaults to replay-free hardware-equivalent GPU reports. Explicit `hardware` or `latency` overrides either mode; unknown values log and retain latency. DRS also consumes these reports; they are not physical busy-time measurements. |
 | `TOTK_FRAME_LAG` | `0` on every platform and in every FPS mode | Only explicit `TOTK_FRAME_LAG=1` enables protected lag; unset, `0` and every other value leave it off. |
 | `TOTK_VK_CHUNK_DRAWS` | `75` by default; `600` when resolved lag is on and native VMA pressure is absent | Explicit positive value or `0` wins (`0` disables automatic chunking). The resolved startup policy is logged once. |
-| `TOTK_VK_REC_THREADS` | `2` on Android; `0` on other platforms | Explicit `0` keeps the synchronous recorder for A/B; positive overrides select up to four workers. Existing diagnostic guards still force inline recording. |
+| `TOTK_VK_SPLIT_PASS_DRAWS` | `0` (off) | `n > 0` ends a still-open pass after `n` draws, submits that part through the chunk path and reopens the same targets with `loadOp=LOAD`. Each split adds a store and load of every attachment on tiled GPUs; try 512 or 256 and read `[split-pass]` every 300 presents (VULKAN.md). |
+| `TOTK_VK_REC_THREADS` | `2` on Android; `0` on other platforms | Explicit `0` keeps the synchronous recorder for A/B; positive overrides select up to four workers. `TOTK_VK_GPU_PROFILE` retains workers, including when pass sampling is enabled; other diagnostic guards still force inline recording. Keep profiler and sample/statistics settings fixed when comparing worker counts (VULKAN.md). |
+| `TOTK_VK_GPU_PROFILE` | `0` (off) | `1` collects pass-part timings with recorder workers; `2` also logs every split; `3` also retains a per-frame ring and dumps every over-threshold frame's observed passes. Every 300-frame window writes schema-3 aggregates by exact key + scene reference + scene role; ordinal `0` means all frame ordinals. Without `GPU_PROFILE_SAMPLE`, every pass is timed as before. Absolute areas remain available for driver joins and DRS-aware families (VULKAN.md). Compare profiling-off/on separately before interpreting performance. |
+| `TOTK_VK_GPU_PROFILE_SAMPLE` | `0` (full profiling unchanged) | With `GPU_PROFILE=1/2/3`, a strict positive integer `1`–`16` limits timestamped/statistics-enabled pass parts per frame; recommended **`2`**, initially with stats off. Deterministic ordinal rotation retains all observed keys, draws and scene metadata. Each frame also has one completion-accurate whole-main-frame timestamp pair; actual profiler-owned `vkCmdWriteTimestamp2` `timestamp_count` (including deferred assembly ends, excluding independent game reports) is at most `2k+2`, without pre/slot envelopes. If Android has already submitted the final command buffer before CPU present, SAMPLE adds **one small marker-only main submission** for the real end timestamp; the query-count bound still holds, but that extra submission has explicit cost. Pass `gpu_ms` is sampled-only, never an extrapolated total. Use the analyzer's whole-interval coverage, sampled mean and histogram percentiles; absent/`0` keeps the old full mode. |
+| `TOTK_VK_GPU_PROFILE_STATS` | `0` (off) | `1` adds six pipeline counters when supported: IA vertices/primitives, VS invocations, clipping invocations/primitives and fragment invocations. Secondary-chunk queries sum into their pass; missing counters are absent, not fabricated zeros. In sampled mode only selected passes get queries; those queries still perturb sampled passes, so sampled durations are representative only if instrumentation does not serialize/change the GPU workload. Device A/Bs must compare GPU clock time-in-state against an unprofiled control, not only instantaneous MHz. |
+| `TOTK_VK_GPU_PROFILE_ORDINALS` | `0` (off) | `1` restores per-ordinal window aggregates; every other value uses compact ordinal-`0` aggregates. Read once at launch and logged as `[gpu-profile] window ordinals=0/1`. Raw mode-2 split logs and mode-3 `long_frame` rows always keep their actual positive frame ordinals. Compare row counts/JSONL bytes with the same route and profile/stats settings; not a measured device-cost reduction. |
+| `TOTK_VK_GPU_PROFILE_MAX_BYTES` | `134217728` (128 MiB) | Maximum bytes per JSONL file (4096–1073741824); rotate complete rows through `.1`, `.2`, `.3`, retaining at most four bounded files per launch. Each file repeats launch/build/package/config/driver metadata. Window sequences and rotation indices expose missing/evicted coverage; normal app close writes writer success and independent query-retirement accounting in `session_end`. |
+| `TOTK_VK_GPU_PROFILE_LONG_MS` | `50` | Mode `3` dumps every frame with a valid Vulkan GPU span strictly above this threshold (0–60000 ms; decimal values allowed). Each `long_frame` pass row names its frame and positive ordinal. Invalid frame spans/gaps are null with reasons/counters, not usable timing; measured pass sums remain separate. |
+| `TOTK_VK_GPU_PROFILE_LONG_FRAMES` | `8` | Mode `3` retains 1–64 frames of raw pass timings, bounded at 16,384 records per retained frame. This controls history memory, not a dump quota: every threshold crossing is emitted, subject only to explicit drops and JSONL rotation. |
+| `TOTK_VK_REC_WAKE_BATCH` | `0` (off) | `1`: the walker wakes a parked recorder worker only when none is already on its way; a worker that leaves work queued wakes the next. `n ≥ 2`: also an idle worker polls the queue for up to `n` µs before parking (try 50 and 200). Startup logs the value; `recorder wakes/frame: walker … worker-chained … polled hits … parks …` every 300 presents counts the futex wakes. Live (see Live switches). |
+| `TOTK_VK_TEX_MEMO` | `0` (off) | `1` memoizes texture ID → view lookups per thread until the registry, any texture/image identity or the submission changes, and keeps the registry revision on an unchanged re-registration (VULKAN.md, "Texture ID memo"). `[tex-memo]` every 300 presents gives hits, misses, hit rate, retirements and (unchanged) registrations per frame. Live (see Live switches). |
+| `TOTK_NVN_CALL_NOCOPY` | `0` (off) | `1`: CallCommands/CopyCommands record a marker holding a reference to the called copy, and the caller's EndRecording copies each body once, straight into its own copy (the default copies it at the call and again at EndRecording, on the game's recording threads). Same copy bytes and reported command memory use; the reference keeps a released called copy alive until then. Not referencing at replay: a shared body would be rewritten by every submit's deferred-bind read and needs lifetimes past the replay. Startup logs `[nvn] TOTK_NVN_CALL_NOCOPY=…`; the `[cmd] recording copies` line counts markers and bytes not copied at the call. `vkdrawtest --nvn-call` runs the probes, a race and a bench. Live. |
 | `TOTK_VK_REC_ASYNC_SUBMIT` | On when recorder workers are enabled | Explicit `0` keeps walking-thread assembly/submit. Existing diagnostic and software-protection exclusions are unchanged. |
 | `TOTK_ADPF` | Existing render-only session (unset/`legacy`) | `0` disables all CPU hints; `full` opts into the bounded critical-thread group, profile-derived targets and wait-stripped work reporting. |
 | `TOTK_ADPF_TARGET_MS` | `33.3` | Existing render-only target override; nonpositive disables the legacy session. Retained for existing profiles; ignored by `TOTK_ADPF=full`. |
 | `TOTK_FRAME_RATE_HINT` | `0` | `1` requests FIXED_SOURCE content cadence through the window and zero-copy SurfaceControl. It is only a request, never evidence of a panel-mode change. |
+| `TOTK_RATE_HINT_HOLD` | unset (`0`) | With `TOTK_FRAME_RATE_HINT=1`: `N` ms requests the window's output rate (game interval, frame generation) held at the highest of the last N ms; 0 keeps the configured rate. Live through `totk.ctl`. See below. |
+| `TOTK_ADPF_GPU` | `0` (off) | `1` reports each frame's span (the game's frame origin, else its first submit, to its present, less acquire pacing) against 90 % of the configured period (15 ms native60, else 30 ms), plus on API 35+ the GPU time of the newest completed frame once. Live through `totk.ctl`. See below. |
+
+The timing profiler has no speculative LOAD-before-clear/STORE-without-observed-read audit.
+It retains static attachment load/store operations and logical byte estimates from pass keys.
+Its walking-thread draw hook does fixed work: count each draw and hash the bounded shader identities
+only on the first draw; pass begin copies at most ten attachments. Neither path scans bindings or
+earlier passes, locks/copies the texture registry, allocates or logs. A dedicated `totk-gpuprof`
+worker owns result reads, aggregation, JSONL/log output and query resets. Sixteen prepared leases
+bound its backlog; exhaustion drops profiling coverage, never waits for output on the game path.
+Preparation can wait once at opt-in startup, not per frame.
+
+CPU present publishes an ordered `{frame, end_sequence}` closure independently of an open command buffer.
+The private bounded 256-entry closure FIFO lets `totk-gpuprof` finish a sealed-then-present frame only after
+all fenced profiler leases through that submission sequence have been processed, including when the worker
+consumed them before CPU present. Full mode uses the final slot's real envelope end with no extra GPU query
+or submission. SAMPLE needs the marker-only submission described above when no command buffer remains;
+an open command buffer retains its in-buffer marker. Closure overflow is explicit cumulative
+`background_dropped_closures`, separate from dropped leases; neither is silently repaired.
+
+Orderly close stops admission of new renderer work, flushes/drains renderer GPU work, then drains the
+profiler reporter before closing its writer. New `session_end` rows carry boolean `all_queries_retired`
+and a `query_retirement` object with acquired/submitted/retired/cancelled/outstanding lease counts and
+submitted/retired/cancelled/outstanding query counts. Queries count activated timestamp/statistics query
+instances, not reserved pools or the six statistics counters. A retired lease has had its fenced results
+read/attempted; only available query results (successful statistics reads) retire queries. Cancelled
+recordings were never submitted. `all_queries_retired` is true exactly when both outstanding counts are
+zero; `clean_end` records writer success independently. Historical footers without accounting retain
+`all_queries_retired: null` as unknown, not assumed retirement.
+The enabled GPU drain has one two-second budget; `query_drain_timed_out: true` records expiry and
+outstanding counts retain unretired work rather than claiming completion. Profiling-off shutdown is
+a no-op: it does not flush renderer work or wait for the GPU.
+
+`gpuprof.py --frame-close-replay` is an opt-in **counterfactual-only** analysis of header-attributed d003f2d
+full-mode captures, not device correction: it preserves original invalidity and rejects missing authority,
+corrupt/unavailable timestamps, actual drops/failures, gaps and inconsistent sums (tools/bench/README.md).
+
+**Odin overhead evidence:** `.scratch/bench/rpmode/odin-overhead/report.md` records the old
+`716c122ff09b` timestamps-only arm at 21.55 fps versus 57.96 fps control: recording rose
+10.789 → 43.750 ms/frame while GPU busy fell 80.2 → 36.6%. This is a large CPU-side
+instrumentation/feeding perturbation, not evidence that GPU timestamp WFI dominated the FPS loss.
+The Turnip timestamp WFI still exists; the benchmark does not isolate its cost from the old CPU
+audit/reporting costs. This source cutover is not a new device speedup measurement.
+Force-stop normally omits `session_end`; the existing analyzer reports that incomplete closure
+without inventing a footer or discarding retained complete-window timing (DEBUGGING.md).
+
+**Keep the GPU busy** (Graphics → Performance) turns on `TOTK_VK_SPLIT_PASS_DRAWS=512` and `TOTK_ADPF_GPU=1`
+together. It feeds smaller batches earlier and requests clocks that keep up; a little more GPU and CPU clock costs
+power and heat. On by default only on **Snapdragon 8 Elite-class** chips (Odin 3), independently of the preset.
+Other chips, including Thor and Duo, default off even when selecting **60 fps**. Off writes neither line, so Thor
+and Duo retain 1.0.1's settings.env bytes for every preset. With frame generation both lines are omitted because
+extraction cannot split passes. Presets neither change this option nor use it to decide preset identity; resetting
+the Performance tab restores its chip default.
+
+A 1.0.0 or 1.0.1 store without this option adopts the chip default, including custom mixes. An explicit stored choice
+is never replaced. Unrelated preference metadata is ignored; 1.0.1's update-check setting and pending offer live
+in separate private files and are unchanged by this migration.
+Restart-based Odin 3 tests raised Hateno 46.5 → 57.3 fps and Lookout 52.2 → 57.1 fps (4/4 pairs);
+Rotsumamu was neutral at the 60 fps cap. At the 60 fps preset, the Duo (~27 fps) worsened p95 by 4–5 ms
+(4/4 pairs), while Thor (~30 fps) was neutral. These gates limit the default to the measured beneficial chip family.
+Compare off/on on the same warmed route after restarting: fps, p95, GPU-clock residency, power and temperature;
+retain `[split-pass]` and `[totk-perf] ADPF span` logs.
+
+The **60 fps** preset on Snapdragon 8 Elite-class chips (`CQ8725S`/`SM8750`, the same exact chip-class check as
+GPU busy) also writes `TOTK_FPS60_HYSTERESIS=1`. This is internal profile policy, not another visible option:
+it follows any 60-fps custom mix, independently of GPU busy, and is omitted at 30 fps or with frame generation.
+Existing stores adopt it when loaded without adding or replacing a preference; the menu already rewrites
+`settings.env` at game start. Light, Balanced and Smooth retain their previous bytes on every chip, as do all
+Thor/Duo/unknown-chip presets. The runtime remains native when the switch is unset, and developer
+`<game>/totk.env` `TOTK_FPS60_HYSTERESIS=0` still wins. This branch's default awaits device validation before merging.
 
 ### Android performance hints (experimental full mode)
 
@@ -3604,10 +3970,47 @@ set. Panel offerings, request acceptance and actual per-layer SurfaceFlinger cad
 be measured separately on each handheld. A successful window return/void transaction or
 our fence diagnostics does not prove 60Hz physical scanout.
 
+`TOTK_RATE_HINT_HOLD=<ms>` (default unset/0 = the configured rate above; 5000 is the design value; live through
+`totk.ctl` at the next guest present; needs `TOTK_FRAME_RATE_HINT=1`) requests the window's output rate instead: the
+game's own interval in 60-Hz units (60/30/20), doubled while frame generation queues generated frames (real frames at
+most 30, so 20 real + generated asks for 40, not a forced 60), at least 60 on the present lattice, and the highest such
+rate of the last `<ms>`: up at once, down only after the lower rate held that long. Never the measured present period,
+which follows a panel that took a lower request. Logs `[totk-perf] TOTK_RATE_HINT_HOLD=N ms (launch|live)`; each
+change still logs `window frame-rate hint=`. Measure the number of those lines and fps dips after 60→30→60 per arm.
+
 Device comparison arms are unchanged default / `TOTK_ADPF=0` /
 `TOTK_ADPF=full` / `TOTK_ADPF=full TOTK_FRAME_RATE_HINT=1`, interleaved on the same
 profile, save, shader seed and cache state. Do not flip the full-mode default without
 per-layer SurfaceFlinger cadence plus performance, power and temperature evidence.
+
+`TOTK_ADPF_GPU=1` (default off; live through `totk.ctl`, applied at the next presented frame, which is not reported)
+changes what the existing session (legacy or full) reports. The span runs from the game's own CPU frame origin, read at
+the frame's first submit (the first submit itself when the origin is unusable), to its present, less the acquire pacing
+inside it, so a frame reads short or long whatever the present interval was. The target defaults to 90 % of the configured
+period and never the controller's current one, so a drop to 30 or 20fps cannot ask for the clocks that keep it there.
+On API 35+ `APerformanceHint_reportActualWorkDuration2` and `AWorkDuration_*` are looked up at run time (the build's
+API level has none of them) and carry start, total, CPU (= span unless CPU splitting is enabled) and the GPU time of the newest frame whose slots all
+completed, each frame once (0 otherwise); below 35 the span alone goes through `reportActualWorkDuration`. Logs:
+`[totk-perf] TOTK_ADPF_GPU=N (launch|live): ...; target T` and every 300 frames `[totk-perf] ADPF span: ...`
+(reported spans, GPU durations, target). Measure on the Odin 3 with in-session ABBA: fps and the sampler's GPU clock
+residency per arm (the GPU sits at its 660 MHz floor 95 % of the time with it off).
+
+`TOTK_ADPF_LOAD_HINT=1` (default 0, live at the next span report) sends an API 36 workload-increase hint before
+the duration report after three consecutive frames exceed 105 % of target, at most every 500 ms. CPU is flagged;
+GPU is flagged only when the newest measured GPU duration exceeds 70 % of target. Missing API is a logged no-op.
+Startup/live mode logs and each 300-frame span summary include hints sent/errors. A/B against gpu_feed alone:
+compare fps/p95 and GPU clock residency, with temperature/power held in view.
+
+`TOTK_ADPF_CPU_SPLIT=1` (default 0, live at the next presented frame) reports CPU as the existing span minus
+native present/texture queue wait clipped to that span; acquire/vsync pacing already excluded from the span is
+never subtracted again. Total and GPU are unchanged. API 35 report2 is required; older APIs log a no-op.
+Mode logs identify the arm. Compare CPU clocks/power and p95 against gpu_feed alone; this is wall work minus
+known native waits, not the sum of all hint threads' CPU time.
+
+`TOTK_ADPF_TARGET_PCT=50..100` (default 90, unchanged) sets the span-mode target to that percentage of the
+configured period; `80` gives 13.333 ms at native60 or 26.667 ms at real30. It never follows a controller slowdown.
+Live changes apply at the next presented frame, before reporting, and clear the load-hint streak. Invalid launch
+values log and retain 90. Compare fps/p95, GPU clocks and sustained temperature/power against the 90-percent control.
 
 ### FPS60 controller, fallback and diagnostics (1.4.3)
 
@@ -3636,6 +4039,78 @@ Over-budget work, a freeze/explicit policy change, or a listener veto can theref
 Stored `min/max=2/3` with FPS60 enabled is **expected**: the patch changes comparison/select
 instructions, not those configuration words. Native emulation explicitly checks that interval 1 is
 selected while the stored words remain 2/3; seeing 2/3 is not evidence that the patch is absent.
+
+**Odin dip policies (both startup-only; runtime defaults off, with hysteresis enabled by the Odin native-60 menu profile):**
+`TOTK_FPS60_HYSTERESIS=1` requires FPS60/v143 and changes three guarded controller loads:
+over-limit 6 (raise on the seventh consecutive over-budget decision, versus native limit 2/third),
+cooldown reload 2 versus native 6. Work/bias math, min/max, freeze, listener veto and interval setter
+remain native; fixed experiment limits replace configuration overrides, while logged `limits` remain stored words.
+Compare interval-2 frame/time share and episode length, not only mean fps; shorter cooldown can increase chatter,
+and tolerating late work can produce missed-display judder. No 60 interval is forced under sustained overload.
+
+`TOTK_GPU_TIME_FPS_MEDIAN=1` requires `TOTK_GPU_TIME=hardware` and filters only the two known FPS END
+consumers with a three-unique-report median (no synthetic warmup zeros; duplicate reads do not advance it).
+Invalid reports hold the last filtered work; DRS/absolute timestamps/raw GPU profiling are unchanged.
+Startup logs the effective mode and `[fps-policy] GPU FPS median frame` reports raw/filtered means and changed reads.
+An isolated spike is rejected, but a sustained rise passes on its second sample; recovery also needs two samples.
+This is a controller-noise experiment, **not** evidence that hardware timings are wrong, and cannot fix CPU-triggered dips.
+
+The existing `[fps-policy]` decision logs distinguish these causes: on Odin shadow A2,
+frame 7302 drops with CPU/GPU 14.063/18.584 ms and recovers at 7470 (168 interval-2 frames);
+frame 8555 drops with 19.587/12.875 ms and recovers at 8694 (139 frames).
+At frame 7500 the hardware producer means are 14.403/11.561 ms before/after removal,
+with zero fallback/clamps/invalid/withheld samples; the mean cannot disprove a transient over-budget input.
+The ~33-ms cadence is a game policy result, not a shader-compile count or raw GPU busy duration.
+Setters and 300-frame summaries do not retain all preceding inputs, so the native three-late rule comes from
+instruction emulation, not an invented per-frame trace. Boot/scripted-camera floors must be excluded from pans.
+
+The pacing-aware analyzer classifies a 60-target window as a dip when at least 60/300 measured intervals
+are 29..37.5 ms (otherwise it uses a clearly labelled incomplete-coverage fps fallback). Its Odin shadow
+re-analysis retains 31 windows per arm: A/B each have seven dip windows, taking 29.31/29.45% of measured
+window time, with 1,348/1,331 near-33-ms frames. Steady fps is 57.35/57.52 versus time-weighted
+52.29/52.36 overall: avoiding those windows could recover about 5 fps, not evidence of faster steady rendering.
+That **dip-window time fraction** is distinct from interval-2 frame share/time and extra-refresh tax.
+Near-33 cadence can also include missed refreshes at interval 1; do not identify every such frame as a controller drop.
+
+Device qualification: use the same release APK, Recommended60 preset, 60-Hz panel, GPU busy On,
+Hateno save/view, warmed seed, fixed resolution/DRS and recording threads. Fresh launch each arm:
+control `TOTK_FPS60_HYSTERESIS=0 TOTK_GPU_TIME_FPS_MEDIAN=0`; then hysteresis-only `1/0`;
+then median-only `0/1`, each interleaved ABBA. For every fresh launch run the existing
+`tools/bench/pan.sh -s <odin-serial> --device odin --scene hateno --out <arm-dir> --target-fps 60 --repeat 3`;
+retain all three pans, with the script's target-aware duration and settle, then analyze with the pacing-aware
+`tools/bench/analyze.py`. Compare `dip_time_fraction` and `fps_steady` separately; mean fps is informational.
+Keep `TOTK_GPU_TIME=hardware`, `TOTK_FPS_AUTO=0`, `TOTK_FRAMEGEN=0` and thermal/ADPF settings identical.
+Require the switch startup logs, controller=sys+0x200, zero hardware fallback/invalid/withheld, and no cutscene floor.
+Join every drop/recovery decision to immutable interval-1/2 cadence, CPU/GPU scores and GPU FPS median summaries;
+report the analyzer's dip-window fraction/steady fps alongside interval-2 frame/time share and extra-refresh tax, plus p95/p99/>50ms,
+physical GPU ms/DRS, CPU/GPU clocks, power and temperature. Reject apparent fps gains with worse missed-refresh
+tails, altered time/physics, freeze/veto violations, sustained report withholding or rising thermal cost.
+Only test `1/1` after each independent arm qualifies; no device result is claimed by these host experiments.
+
+**Thermal frame step (Android, opt-in):** `TOTK_THERMAL_STEP=1` (default `0`, startup-only)
+raises the v143 FPS60 controller's minimum result to two 60-Hz ticks when the running interval is one
+and thermal status reaches SEVERE (3), or the 10-second headroom forecast reaches 1.0.
+A nice-10 sampler calls the optional NDK status/headroom APIs via `dlsym` at most once per second,
+only when enabled. Off/unset installs no thermal veneers and starts no sampler; the original FPS60
+controller bytes stay unchanged. API30 status-only devices can cap; unavailable/NaN headroom cannot
+prove recovery. No platform thermal settings are written.
+Recovery releases our floor only after 30 continuous seconds of samples below MODERATE (2) and
+headroom below 0.8; missing/stale samples restart that evidence. Change the switch only between launches.
+The existing game controller still owns cooldown, vetoes, simulation step, and window interval:
+no present delay, forced-60 recovery, or shortening of game-requested slower intervals is introduced.
+The three FPS60 select veneers are installed only at enabled launches, with an aligned floor word;
+shipping 30 (`TOTK_FPS60=0`) and other game versions have no thermal guest-floor hook.
+
+Host-side device check (when devices are free): keep the 60fps preset and one loaded scene, collect
+separate sustained five-minute off/on launches with the existing bench sampler (its thermal-zone
+temperatures), and join the enabled arm's `totk.log` `[totk-thermal] last300 status=... headroom=...
+floor=... guest_interval=... transitions=...` lines to `[fps-policy]` game/window decisions.
+The off arm has no thermal sampler/last300 lines. Status uses NDK values (-1 unavailable,
+0 none, 1 light, 2 moderate, 3 severe, 4 critical, 5 emergency, 6 shutdown); headroom is the forecast,
+not a temperature. Expect a 60→30 game interval at the hot threshold, no extra presenter hold, and
+no release before 30 seconds of qualifying cool readings. Count transition chatter and compare
+temperature slope, p95, >50ms frames and sustained cadence; lower peak fps is intentional, not a win
+in mean fps. Do not infer thermal status from thermal-zone temperatures alone.
 
 **Fade increments and cutscene pacing:** whenever FPS60 is enabled, four guarded fade-increment
 hooks keep a positive fractional increment from truncating to zero. They are default-on in FPS60 mode,
@@ -4494,7 +4969,9 @@ Set launch overrides in `totk.env` and restart:
 | `TOTK_AFFINITY_RECW` | Affinity of every recorder chunk worker at startup; the same mask applies to each. |
 | `TOTK_AFFINITY_GAME` | Android main/created guest affinity: unset or `auto` selects the capacity policy below; `all` makes no affinity request; a CPU list/mask overrides auto. WALK still overrides it on an actual submission thread. |
 | `TOTK_PRIO_WALK` | Linux per-tid nice value, decimal **−20…19**, on first submission. Unset leaves the inherited/current nice untouched. |
+| `TOTK_PRIO_RENDER` | Linux per-tid nice value, decimal **−20…19**, at the start of each frame-critical host thread: the walker (`totk-walk`, applied before `TOTK_PRIO_WALK`, which wins), `totk-recw*`, `totk-submit`, `totk-gpufence`, `totk-post`, `totk-present`, `totk-vsync`. Never compile/seed/cache/translator workers (they keep +10) or guests (−8). Unset leaves the inherited nice untouched. Live through `totk.ctl` (*Live switches*): set by tid on every registered render thread at once, `[totk-ctl] gen=N TOTK_PRIO_RENDER=…: n render threads set …`. |
 | `TOTK_UCLAMP_WALK` | Linux utilization-clamp minimum, decimal **0…1024**, on first submission. Zero clears that minimum; this is not a frequency in MHz or a percentage. |
+| `TOTK_TIMER_SLACK_NS` | Linux per-thread timer slack, decimal **1…50000** ns, at the start of every guest thread (`g-*`) and frame-critical host thread (`totk-walk`, `totk-recw*`, `totk-submit`, `totk-gpufence`, `totk-post`, `totk-present`, `totk-vsync`). Unset keeps the kernel's inherited 50 µs; `0`/out-of-range log `EINVAL`. Logs the first application once (`TOTK_TIMER_SLACK_NS=1 result=1`). Live through `totk.ctl`: each of those threads applies it itself before its next timed wait (guest sleeps / timed waits / yield back-off, the frame threads' loops), the presenting thread at the application. |
 
 CPU values are lists/ranges such as `7`, `3-6` or `3-6,7`, or explicitly `0x`-prefixed hexadecimal masks:
 `0x80` means CPU 7 and `0x78` means CPUs 3–6. A bare `7` is **CPU 7**, not mask 7; `0` is CPU 0, not disabled.
@@ -4503,6 +4980,20 @@ Each name/setting logs `[totk-thread] tid=… name=… <setting>=… result=… 
 **resulting kernel affinity**, not merely the requested value. Nice/clamp `result` is the queried current value.
 Permission errors, including `EPERM`, are visible and do not silently enable a substitute policy. Settings are
 attempted once; correct the env and restart after an error.
+
+Timer slack only moves **timed** sleeps/timeouts of the thread that sleeps: guest `SleepThread`, timed guest waits
+and core rechecks, the opt-in yield back-off, the predicted-acquire, adaptive-commit and present-retire deadline
+waits. The display/acquire/slot pacing waits are untimed condition waits released by the `totk-vsync` callback and
+do not change. `sh tests/timer_slack/run.sh <absolute .scratch>` checks the switch and prints host `nanosleep`
+lateness (x86 host: 10/100/1000 µs sleeps woke ~52/52/54 µs late at p50 with 50 µs slack, ~1.6/1.9/3.8 µs with 1).
+On device, compare `[svc-wait]` `SleepThread` time and frame-time p95 / >50 ms counts with it unset and `=1`.
+
+Without `TOTK_PRIO_RENDER`, host threads keep the nice of the thread that created them (Linux inherits it).
+Guests start at −8 (`host_thread_boost_self`), but `g-main` is never boosted and keeps the boot thread's nice.
+So the walker (a guest), and the recorder workers and `totk-submit` it creates, run at −8, as does the
+presenter when a guest presents, while `totk-post` and `totk-gpufence`, created by `g-main` in
+`nv::InitializeGraphics`, stay at the boot thread's nice (normally 0) behind the −8 guests. Measure with
+`TOTK_PRIO_RENDER=-8` / `-10` against unset: frame-time p95, >50 ms counts and `[svc-wait]`/present-stage times.
 
 Android snapshots the startup thread's current allowed set once, after reading `totk.env` and before launching
 the game. It reads `cpuN/cpu_capacity` for **every allowed CPU**. If any capacity is absent/unreadable/invalid,
@@ -4576,6 +5067,11 @@ they are **not** an exact additive ownership timeline. Windows charge completed 
 can span windows, and closed/exited thread records can disappear before the next report.
 Profiling is off by default; allocations, clocks and per-wait tables are avoided while disabled.
 Reports take the scheduler lock, so compare instrumented cases to each other, then repeat without profiling.
+
+`[svc-tiny]` (same switch, measurement only) counts short guest timeouts per window: zero-timeout polls,
+timed waits asking under 20 µs in bins `<1/<2/<5/<10/<20 µs` with how many timed out, and `SleepThread` under
+20 µs. Shown threads get a row; one `all threads` row sums every guest and names the busiest handle. Large
+counts mean the game polls with tiny timeouts, which timer slack (`TOTK_TIMER_SLACK_NS`) and wake latency inflate.
 
 `TOTK_READY_CORES=1` opts into ready-at-wake virtual-core competition. A signaled guest queues immediately
 under the scheduler lock and can reserve a free core before Android schedules its host thread. Otherwise
@@ -4666,14 +5162,30 @@ was not measured by these counters. Retry work includes the timed park/wakeup,
 relocking `G`, scanning masks/effective priorities/starvation, signal send and
 delivery, and the handler's admission check.
 
-Do not infer a near voluntary checkpoint from a host-context refusal. TOTK's
-`runtime_svc` checks at entry, not return; `hle_stack.S` and `gate.S` restore the
-host slot and return directly, with no mandatory post-host checkpoint. A host
-call can reenter guest code or return into a no-SVC spin. Suppressing until the
-next voluntary checkpoint would therefore lack a progress bound and could
-reintroduce the known starvation hangs. The 1-ms retry threshold remains
-unchanged, including after refusal; pending/acknowledged coalescing is not
-extended to a new host-call permission class.
+By default a host-context refusal still has no near voluntary checkpoint:
+`runtime_svc` checks at entry and `gate.S` returns directly. Calls may reenter
+guest code or return into no-SVC spins, so pending/acknowledged coalescing
+alone must not suppress progress retries.
+
+`TOTK_CORE_WAIT_EVENT=1` (startup-only, default `0`) instead parks core waiters
+on the existing owner-release grant/signal, with a 20-ms safety retry rather
+than the kicked owner's 1-ms retry. Top-level HLE return checks pending handoffs
+after host locks are dropped, before restoring the guest stack; nested HLE calls
+do not park, return registers/errno survive, and opaque HLE resumes on the same core.
+The startup `[totk-core-wait] event=...` log proves the arm; compare core parks,
+kick counts and core-wait tails with `TOTK_SYNC_STATS=1` / `TOTK_CORE_DIAG=1`.
+Masks, inherited priorities, protection and starvation remain authoritative;
+refused signals and no-SVC guest/SDK spins retain the bounded 20-ms fallback.
+T7 bounded the old park's Odin critical-path contribution at 0.64–0.87 ms/cycle:
+this is an opt-in latency/CPU experiment, not a claim of a large FPS gain.
+
+The sync-fastpath suite covers both event arms and includes a production-CV
+probe measuring release-to-waiter-running latency (1,024 samples, p50/p95/max
+reported, p95 <200 µs—not a worst-case bound) while asserting that a host-blocked
+owner does not produce millisecond retries. It races owner release against the
+waiter's ownership-check/atomic-park boundary and requires zero safety-timeout
+expiries. It also covers same-core HLE return and stale mask,
+priority-inheritance and protection revalidation. Host scheduling is not realtime.
 
 The same single-run device comparison was 29.82 FPS and 41 controller decisions
 (20 over 32.5 ms) versus texel1's 29.74 FPS and 55 decisions (29 over 32.5 ms),
@@ -4789,6 +5301,17 @@ an on-device FPS improvement or guest pointer-lifetime assumptions.
 `70d3e68`, the kick-off control and the default with identical code/compiler
 workloads and counters disabled. It reports wall/process-CPU time for
 wake/block ping-pong and 24-worker fan-out under three-core contention.
+
+### Horizon ideal-core semantics (`TOTK_IDEAL_CORE_FIX`)
+
+Default unset/`0` keeps the old TotK bookkeeping: CreateThread stores ideal core −2/−3 verbatim with mask 7,
+SetThreadCoreMask may leave the ideal core outside the new mask, and GetCurrentProcessorNumber of a thread holding
+no virtual core can report a core outside its mask (or −2). `=1` uses the Horizon rules Breath of the Wild already
+follows (1.4.3 `main.npdm`: ideal core 0, cores 0–2): −2 becomes core 0 with a one-core mask, −1/−3 are invalid at
+creation, mask changes are validated, the main thread starts with mask 1, and a core of the mask is reported. This
+moves −2 threads onto virtual core 0 beside the main thread. Startup logs `[threads] ideal core fix=N
+(TOTK_IDEAL_CORE_FIX)`; `sh tests/ideal_core/run.sh <absolute .scratch>` pins both arms. A/B frame-time p95 and
+`[core-table]` held/wait times on Odin 3 (CPU-bound) before considering it.
 
 ### Synchronous memory-pool finalization without a retained virtual core
 

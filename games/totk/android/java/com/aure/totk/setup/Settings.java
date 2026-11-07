@@ -37,6 +37,7 @@ final class Settings {
         new Option("frame_gen", PERFORMANCE, "off", "off", "on"),
         new Option("render_res", PERFORMANCE, "game", "game", "1280x720", "1152x648", "960x540"),
         new Option("latency", PERFORMANCE, "balanced", "responsive", "balanced", "smoothest"),
+        new Option("gpu_feed", PERFORMANCE, "off", "off", "on"),
         new Option("upscaler", PICTURE, "off", "off", "fsr", "sgsr"),
         new Option("sharpness_fsr", PICTURE, "20"),
         new Option("sharpness_sgsr", PICTURE, "50"),
@@ -72,19 +73,25 @@ final class Settings {
             + "# Do not edit: the menu overwrites it. Developer overrides belong in <game>/totk.env, which is read after this file.\n";
 
     private final Map<String, String> values = new LinkedHashMap<>();
+    private final boolean fps60Hysteresis;
 
     /** Stored values (any map: SharedPreferences.getAll()); unknown keys and invalid values fall back to the defaults. */
-    Settings(Map<String, ?> stored) {
+    Settings(Map<String, ?> stored, String soc) {
+        // Internal 60 fps profile policy, using the same chip class as gpu_feed. Recomputed for old stores too:
+        // no preference key or menu option to migrate, and an explicit totk.env value still wins.
+        fps60Hysteresis = "Snapdragon 8 Elite class".equals(socClass(soc));
         for (Option option : OPTIONS) {
             Object value = stored == null ? null : stored.get(option.key);
             values.put(option.key, value instanceof String && option.valid((String) value) ? (String) value : option.fallback);
         }
         // A hand-edited store must not hold a combination the menu cannot produce.
         if ("on".equals(get("frame_gen"))) values.put("frame_rate", "30");
+        // 1.0.0/1.0.1 had no gpu_feed key. Only a missing key adopts the chip default; explicit choices win.
+        if (stored == null || !stored.containsKey("gpu_feed")) values.put("gpu_feed", gpuFeedDefault(soc));
     }
     /** The first launch: shipping defaults with the profile for this chip (profile(soc)). */
     static Settings firstRun(String soc) {
-        Settings settings = new Settings(null);
+        Settings settings = new Settings(null, soc);
         settings.applyPreset(profile(soc));
         return settings;
     }
@@ -176,6 +183,11 @@ final class Settings {
             default: return "light";   // the Eliza family (CQ7790S/M, SM7750) and every untested chip
         }
     }
+    /** Restart-based Odin 3 pairs: Hateno 46.5 -> 57.3 fps, Lookout 52.2 -> 57.1 (4/4 pairs).
+     * Duo at 60 fps worsened p95 by 4-5 ms; Thor was neutral. Keep this independent of the selected preset. */
+    static String gpuFeedDefault(String soc) {
+        return "Snapdragon 8 Elite class".equals(socClass(soc)) ? "on" : "off";
+    }
     /** Whether profile(soc) is backed by a device test (the "Recommended for this device" badge). */
     static boolean profileKnown(String soc) { return socClass(soc) != null; }
     /** Y on a tab: the device's default values for that tab (the profile's preset for Performance and Picture). */
@@ -187,6 +199,7 @@ final class Settings {
                 if (PRESET_VALUES[p][k] != null && option(PRESET_KEYS[k]).tab.equals(tab)) values.put(PRESET_KEYS[k], PRESET_VALUES[p][k]);
         }
         if ("on".equals(get("frame_gen"))) values.put("frame_rate", "30");
+        if (tab.equals(PERFORMANCE)) values.put("gpu_feed", gpuFeedDefault(soc));
     }
 
     /** settings.env: NAME=value lines in the totk.env format. locale = the device's first language as a BCP 47 tag
@@ -205,6 +218,12 @@ final class Settings {
             line(out, "TOTK_FPS60=" + (sixty ? "1" : "0"));
             // The device-tested 60 fps profile reports hardware GPU time (the FPS60 default, latency, overstates it).
             if (sixty) line(out, "TOTK_GPU_TIME=hardware");
+            if (sixty && fps60Hysteresis) line(out, "TOTK_FPS60_HYSTERESIS=1");
+            // Extraction cannot split passes. Leave both hints out with frame generation, retaining its timing block.
+            if ("on".equals(get("gpu_feed"))) {
+                line(out, "TOTK_VK_SPLIT_PASS_DRAWS=512");
+                line(out, "TOTK_ADPF_GPU=1");
+            }
         }
         if (!get("render_res").equals("game")) line(out, "TOTK_RENDER_RES=" + get("render_res"));
         if (!framegen) line(out, "TOTK_ACQUIRE_SLACK=" + Arrays.asList("responsive", "balanced", "smoothest").indexOf(get("latency")));

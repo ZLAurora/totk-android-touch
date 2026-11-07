@@ -32,7 +32,7 @@ static void pso_encode(const pipe_key *k, pso_record *r) {
     memset(r, 0, sizeof *r);
     memcpy(r->key, ((vk_shader *)k->vs)->key, strnlen(((vk_shader *)k->vs)->key, 79));
     if (k->fs) memcpy(r->key+80, ((vk_shader *)k->fs)->key, strnlen(((vk_shader *)k->fs)->key, 79));
-    pso_put(r->key+160, k->fs ? ((vk_shader *)k->fs)->early_tests : 0);
+    pso_put(r->key+160, k->fs ? (uint32_t)((vk_shader *)k->fs)->early_tests | ((vk_shader *)k->fs)->alpha_func<<1 : 0);
     uint8_t *p = r->key+164;
 #define PW(x) do { pso_put(p, (uint32_t)(x)); p += 4; } while (0)
     for (unsigned i = 0; i < 8; i++) PW(k->cfmt[i]);

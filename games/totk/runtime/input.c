@@ -12,6 +12,7 @@
 #include <stdatomic.h>
 typedef struct{int64_t sampling;uint64_t buttons;int32_t lx,ly,rx,ry;uint32_t attributes,pad;} NpadState;
 _Static_assert(sizeof(NpadState)==40,"Npad full-key ABI");
+#include "android_pause.h"
 static pthread_mutex_t inputLock=PTHREAD_MUTEX_INITIALIZER;
 static unsigned char keys[128];static uint64_t pending;
 static uint32_t styles=1;static bool enabled,allowed=true;static int holdType;
@@ -35,7 +36,7 @@ static void user_input(const char *what){
    off -> 30+30 -> half the refresh rate -> uncapped (totk_mfx.m). Key 3 (key code 20) cycles 2K modes:
    MetalFX 2K -> native 2K -> off (runtime_output_mode_cycle). Held-key repeats do not cycle. */
 enum { KEY_INTERP_TOGGLE = 19, KEY_OUTPUT_MODE_CYCLE = 20, KEY_ASPECT_TOGGLE = 21, KEY_TAA_TOGGLE = 23 };   /* 21: key 4, ultrawide on / off (aspect_patch.h); 23: key 5, MetalFX temporal anti-aliasing (totk_taa.m) */
-void runtime_input_key_synthetic(unsigned code,int down){if(code>=128)return;pthread_mutex_lock(&inputLock);int press=down&&!keys[code];if(down&&!keys[code])pending|=button(code);keys[code]=(unsigned char)!!down;pthread_mutex_unlock(&inputLock);
+void runtime_input_key_synthetic(unsigned code,int down){if(code>=128)return;pthread_mutex_lock(&inputLock);if(down&&runtime_android_game_paused()){pthread_mutex_unlock(&inputLock);return;}int press=down&&!keys[code];if(down&&!keys[code])pending|=button(code);keys[code]=(unsigned char)!!down;pthread_mutex_unlock(&inputLock);
  if(press&&code==18){extern void runtime_shortcut_help_toggle(void);runtime_shortcut_help_toggle();}
  if(press&&code==KEY_INTERP_TOGGLE){extern void dm_gfx_set_flag(const char *name,int v);dm_gfx_set_flag("mfx_interp",-1);}
  if(press&&code==KEY_OUTPUT_MODE_CYCLE)runtime_output_mode_cycle();
@@ -67,6 +68,7 @@ static int pad_states(NpadState *out,int max,const uint32_t *id,uint32_t want_st
  if(pad.buttons&~padSeen||abs(pad.lx)>16384||abs(pad.ly)>16384||abs(pad.rx)>16384||abs(pad.ry)>16384)user_input("controller");padSeen=pad.buttons;
  if(abs(pad.lx)>abs(state.lx))state.lx=pad.lx;if(abs(pad.ly)>abs(state.ly))state.ly=pad.ly;
  if(abs(pad.rx)>abs(state.rx))state.rx=pad.rx;if(abs(pad.ry)>abs(state.ry))state.ry=pad.ry;
+ if(runtime_android_game_paused()){state.buttons=0;state.lx=state.ly=state.rx=state.ry=0;memset(keys,0,sizeof keys);pending=0;}
  }*out=state;
  /* Android already snapshots the UI Looper's mutex-protected pad here, on
     every connected read. Timestamp the fully formed state, without changing
@@ -163,7 +165,6 @@ static void input_script_start(void) {
    Commands: key <Mac keycode> <milliseconds>, down/up <Mac keycode>, shot <path>, wshot <path>, passdump <frames>, querylog <frames>, anomdump,
    kbtest / kbtype <text> / kbenter / kbesc / kbshot <path> (the text entry bar), threads (dump every guest thread's wait), hletrace <0|1|2> (host calls the game makes), framestep <ms> (pin the frame step), close. */
 extern void dm_gfx_shot_at(long frames, const char *path);
-extern void runtime_front_request_close(void);
 static void *input_file(void *arg) {
     totk_thread_start("totk-inputfile", NULL);
     FILE *f = fopen((const char *)arg, "r"); if (!f) runtime_fail("cannot open TOTK_INPUT_FILE");
@@ -236,7 +237,7 @@ static void *input_file(void *arg) {
 #endif
         } else if (!strcmp(line, "threads\n")) {   /* every guest thread's wait state and guest return chain, now (a hang: what is each thread waiting for) */
             runtime_dump_threads();
-        } else if (!strcmp(line, "close\n")) { runtime_front_request_close(); break; }
+        } else if (!strcmp(line, "close\n")) { if (runtime_front_request_close()) break; }
         else runtime_fail("invalid diagnostic input command");
     }
     fclose(f); return NULL;

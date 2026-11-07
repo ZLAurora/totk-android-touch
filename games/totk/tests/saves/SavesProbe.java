@@ -187,7 +187,7 @@ public final class SavesProbe {
                         answer = m == null ? "unstable" + (new File(w[2]).exists() ? " leftover" : "") : "ok " + m.files.size();
                         break;
                     }
-                    case "locked": answer = String.valueOf(SaveManager.gameLocked(new File(w[1]))); break;
+                    case "game-state": answer = GameLock.check(new File(w[1]), false).state.name(); break;
                     default: answer = "unknown command " + w[0];
                 }
             } catch (SaveManager.Invalid invalid) {

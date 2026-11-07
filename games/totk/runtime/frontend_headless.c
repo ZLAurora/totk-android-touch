@@ -43,7 +43,7 @@ uint64_t front_game_res(int docked) { (void)docked; return (720ULL << 32) | 1280
 
 int runtime_front_focus(void) { return 1; }
 #ifndef TOTK_ANDROID_APP   /* the app frontend (frontend_android.c) includes this file and provides these itself */
-void runtime_front_request_close(void) { fprintf(stderr, "[totk] close requested: exiting\n"); exit(0); }
+int runtime_front_request_close(void) { fprintf(stderr, "[totk] close requested: exiting\n"); exit(0); }
 /* No window: the game's software keyboard is cancelled (runtime/swkbd_host.c). */
 int runtime_front_text_input(const RuntimeTextRequest *req, char *out, size_t out_size) { (void)req; if (out_size) out[0] = 0; return 0; }
 #endif

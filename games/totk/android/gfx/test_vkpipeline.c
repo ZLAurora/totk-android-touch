@@ -6,7 +6,12 @@
    without --gpl runs the original failure/backoff/compute/takeover suite with the backend enabled.
    --screen-classify covers aligned scene misses and a persistent 64x64 color/depth capture.
    --screen-classify-pure (or TOTK_SCREEN_CLASSIFY_ONLY) runs just the dependency-free helper cases.
-   --target-life checks current-frame and retained 480x268 color/depth contents through real sampled draws. */
+   --target-life checks current-frame and retained 480x268 color/depth contents through real sampled draws.
+   TOTK_VK_PIPE_BOOST=1 checks that the bounded graphics join and the compute dispatch join lend their waiter's nice
+   to the building worker exactly for that build (through a priority hook: hosts may not lower nice); unset checks
+   that joins never touch worker priority.
+   TOTK_VK_UNWRITTEN_MASK=1 checks that a fragment shader writing location 0 only leaves the second of two colour
+   targets at its clear through colorWriteMask 0; unset checks that the game's write mask is kept. */
 #include "vk_screen_classify.h"
 #include <stdio.h>
 
@@ -109,7 +114,9 @@ static void screen_classify_cases(void) {
 #include "vk_record.h"
 #include "../../third_party/d2r_gfx/gfx/tex/nvn_deswizzle.h"
 #include "dm_wait_stats.h"
+#include "vk_upload_pool.h"
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -117,11 +124,34 @@ static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
 static pthread_t walk;
 static unsigned held_mask = 15, entered, release_build, failures_left, attempts[16], main_builds[16], completed[16], compute_calls;
+static unsigned two_target_builds, second_write_mask;   /* monolithic builds with two attachments; attachment 1's mask */
 static unsigned compute_hold, compute_entered, compute_recording;
 extern void vk_compute_test_counts(uint64_t out[4]);
 static unsigned failure_mask = 7;
 static PFN_vkCreateGraphicsPipelines real_graphics;
 static PFN_vkCreateComputePipelines real_compute;
+/* Priority hook: every lend (worker tid, waiter nice) and restore (0 = the worker itself, VK_WORKER_NICE) in order. */
+extern void vk_pipe_boost_test_hooks(int (*self_nice)(void), int (*set)(int tid, int nice));
+extern void vk_pipe_boost_test_stats(uint64_t out[4]);
+enum { WAITER_NICE = -8 };
+static struct { int tid, nice, caller; } boost_calls[16];
+static unsigned nboost, held_tid, compute_tid;
+static int waiter_nice(void) { return WAITER_NICE; }
+static int boost_hook(int tid, int nice) {
+    pthread_mutex_lock(&mu);
+    if (nboost < 16) boost_calls[nboost] = (typeof(boost_calls[0])){tid, nice, (int)syscall(SYS_gettid)};
+    nboost++; pthread_cond_broadcast(&cv); pthread_mutex_unlock(&mu);
+    return 0;
+}
+/* The loan to worker `tid` and that worker's own restore, both recorded after `from`. */
+static int boost_loan_seen(unsigned from, unsigned tid) {
+    pthread_mutex_lock(&mu); int lent = -1, restored = 0;
+    for (unsigned i = from; i < nboost && i < 16; i++) {
+        if (lent < 0 && boost_calls[i].tid == (int)tid && boost_calls[i].nice == WAITER_NICE) lent = (int)i;
+        else if (lent >= 0 && !boost_calls[i].tid && boost_calls[i].nice == VK_WORKER_NICE && boost_calls[i].caller == (int)tid) restored = 1;
+    }
+    pthread_mutex_unlock(&mu); return tid && lent >= 0 && restored;
+}
 static unsigned graphics_count(const unsigned *counter) {
     pthread_mutex_lock(&mu); unsigned n = *counter; pthread_mutex_unlock(&mu); return n;
 }
@@ -156,8 +186,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL graphics(VkDevice dev, VkPipelineCache cac
     pthread_mutex_lock(&mu);
     attempts[mask]++;
     main_builds[mask] += pthread_equal(pthread_self(), walk) != 0;
+    if (ci->pColorBlendState->attachmentCount >= 2) { two_target_builds++; second_write_mask = ci->pColorBlendState->pAttachments[1].colorWriteMask; }
     if (mask == held_mask && !pthread_equal(pthread_self(), walk)) {
-        entered = 1; pthread_cond_broadcast(&cv);
+        entered = 1; held_tid = (unsigned)syscall(SYS_gettid); pthread_cond_broadcast(&cv);
         while (!release_build) pthread_cond_wait(&cv, &mu);
     }
     int fail = mask == failure_mask && failures_left;
@@ -173,6 +204,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL compute(VkDevice dev, VkPipelineCache cach
         const VkComputePipelineCreateInfo *ci, const VkAllocationCallbacks *alloc, VkPipeline *out) {
     pthread_mutex_lock(&mu);
     compute_calls++; compute_recording += pthread_equal(pthread_self(), walk) != 0;
+    if (!pthread_equal(pthread_self(), walk)) compute_tid = (unsigned)syscall(SYS_gettid);
     compute_entered = 1; pthread_cond_broadcast(&cv);
     while (compute_hold) pthread_cond_wait(&cv, &mu);
     pthread_mutex_unlock(&mu);
@@ -622,6 +654,77 @@ static void pipeline_library_probe(uint8_t *pixel) {
           atomic_load(&g_hk.pipe_bounds) == bounds && atomic_load(&g_hk.pipes_sync) == sync,
           "library recombination and replacement require no submission-bound join, takeover or duplicate build");
 }
+/* A mirrored block-linear texture large enough for the parallel deswizzle (TOTK_VK_UPLOAD_THREADS=1..3) reads back
+   through CopyTextureToBuffer exactly as the serial decoder lays it out, at every level, with the switch on or off. */
+static void upload_probe(pool_t *pool, uint8_t *mem) {
+    tex_t big = {.d = {.target = 1, .format = 0x25, .width = 1024, .height = 256, .depth = 1, .levels = 3}};
+    nvn_tex_layout(&big.d, &big.L); big.mem = mem + 0x800000; big.pool = pool; big.serial = 900;
+    uint32_t s = 0x9e3779b9; for (uint64_t i = 0; i < big.L.size; i++) { s ^= s << 13; s ^= s >> 17; s ^= s << 5; big.mem[i] = (uint8_t)s; }
+    upload_pool_stats stats; upload_pool_stats_take(&stats);
+    uint8_t *out = mem + 0xc00000, *expected = malloc(1024 * 256 * 4);
+    for (unsigned level = 0; level < big.d.levels; level++) {
+        uint32_t w = big.d.width >> level, h = big.d.height >> level; memset(out, 0, (size_t)w * h * 4);
+        p_copy_b2t copy = {.src = (uintptr_t)out, .tex = &big, .has_view = 1, .view = {.set_levels = 1, .base_level = (uint8_t)level, .nlevels = 1},
+                           .r = {0, 0, 0, (int)w, (int)h, 1}};
+        op(OP_COPY_T2B, &copy, sizeof copy);
+        CHECK(mtl_wait(submit(), 5000000000ull), "upload readback level %u completed", level);
+        CHECK(!nvn_deswizzle(&big.d, level, 0, big.mem, expected, (size_t)w * 4) && !memcmp(out, expected, (size_t)w * h * 4),
+              "level %u of a 1.3 MiB block-linear upload reads back byte-identical to the serial decoder", level);
+    }
+    free(expected);
+    upload_pool_stats_take(&stats);
+    /* Untracked pool bytes re-upload at every submission: one parallel job per readback. */
+    CHECK(upload_pool_helpers() ? stats.jobs == big.d.levels && stats.runs >= 2 * stats.jobs : !stats.jobs,
+          "every upload deswizzled %s (jobs %llu, runs %llu)", upload_pool_helpers() ? "in parallel" : "serially",
+          (unsigned long long)stats.jobs, (unsigned long long)stats.runs);
+}
+/* One draw into two RGBA8 colour targets cleared blue and green; returns whether a new two-attachment pipeline was
+   built and attachment 1's write mask, with both targets read back to out. */
+static int two_target_draw(const p_bind_program *bind, tex_t color[2], uint8_t *out[2], unsigned *mask) {
+    p_set_rt rt = {.n = 2, .color = {&color[0], &color[1]}};
+    p_viewports square = viewport; square.v[0][2] = square.v[0][3] = 64;
+    p_clear_color blue = {0, 15, {0, 0, 1, 1}}, green = {1, 15, {0, 1, 0, 1}};
+    chmask_st channels = {0xff}; p_bind_state state = {.kind = 2}; memcpy(state.bytes, &channels, sizeof channels);
+    p_draw d = {4, 0, 3, 0, 0};
+    unsigned builds = graphics_count(&two_target_builds);
+    op(OP_SET_RT, &rt, sizeof rt); op(OP_CLEAR_COLOR, &blue, sizeof blue); op(OP_CLEAR_COLOR, &green, sizeof green);
+    op(OP_BIND_PROGRAM, bind, sizeof *bind); op(OP_BIND_VATTR, &attrs, sizeof attrs); op(OP_BIND_VSTREAM, &streams, sizeof streams);
+    op(OP_BIND_VBUF, &vertices, sizeof vertices); op(OP_BIND_UBO, &uniforms[0], sizeof uniforms[0]); op(OP_BIND_UBO, &uniforms[1], sizeof uniforms[1]);
+    op(OP_BIND_TEX, &texture, sizeof texture); op(OP_VIEWPORTS, &square, sizeof square); op(OP_BIND_STATE, &state, sizeof state);
+    op(OP_DRAW, &d, sizeof d);
+    for (int i = 0; i < 2; i++) {
+        memset(out[i], 0x5c, 64 * 64 * 4);
+        p_copy_b2t back = {.src = (uintptr_t)out[i], .tex = &color[i], .r = {0, 0, 0, 64, 64, 1}}; op(OP_COPY_T2B, &back, sizeof back);
+    }
+    CHECK(mtl_wait(submit(), 5000000000ull), "two-target draw submission completed");
+    pthread_mutex_lock(&mu); int built = two_target_builds > builds; *mask = second_write_mask; pthread_mutex_unlock(&mu);
+    return built;
+}
+/* The fragment shader (salt 2) outputs location 0 only. NVN leaves target 1 untouched: TOTK_VK_UNWRITTEN_MASK=1
+   builds colorWriteMask 0 for it, so it keeps its clear; unset keeps the game's mask 0xf. An array output covering
+   locations 0..1 (salt 46; the seed's fout names location 0 only) is never masked. */
+static void unwritten_probe(const tex_t *base, uint8_t *mem) {
+    const char *env = getenv("TOTK_VK_UNWRITTEN_MASK"); int on = env && atoi(env) == 1;
+    tex_t color[2] = {*base, *base};
+    for (int i = 0; i < 2; i++) { color[i].mem = mem + 0xa00000 + i * 0x10000; color[i].serial = 910 + (uint64_t)i; }
+    uint8_t *out[2] = {mem + 0xa20000, mem + 0xa30000};
+    const uint8_t *p0 = out[0] + (10 * 64 + 10) * 4, *p1 = out[1] + (10 * 64 + 10) * 4;
+    unsigned mask;
+    int built = two_target_draw(&program, color, out, &mask);
+    CHECK(built && p0[0] == 255 && p0[1] == 255 && p0[2] == 255, "location 0 draws the textured result into target 0 (%u,%u,%u)", p0[0], p0[1], p0[2]);
+    if (on) CHECK(!mask && p1[0] == 0 && p1[1] == 255 && p1[2] == 0 && p1[3] == 255,
+                  "unwritten target 1 gets colorWriteMask 0 (%#x) and keeps its green clear (%u,%u,%u,%u)", mask, p1[0], p1[1], p1[2], p1[3]);
+    else CHECK(mask == 0xf, "switch off: target 1 keeps the game's write mask (%#x; Vulkan leaves it undefined, here %u,%u,%u,%u)",
+               mask, p1[0], p1[1], p1[2], p1[3]);
+    static uint8_t control[0x880]; static prog_t arrays;
+    arrays = *program.prog; arrays.serial = 102;
+    uint8_t *code = mem + 0xa40000; shader_binary(1, 46, control, code);
+    arrays.sd[1].data = (uintptr_t)code; arrays.sd[1].control = control;
+    p_bind_program bind = {&arrays, 3};
+    built = two_target_draw(&bind, color, out, &mask);
+    CHECK(built && mask == 0xf && p0[0] == 255 && p0[1] == 255 && p0[2] == 255 && p1[0] == 255 && !p1[1] && p1[2] == 255,
+          "an array output spanning locations 0..1 writes both targets (mask %#x, target 1 %u,%u,%u)", mask, p1[0], p1[1], p1[2]);
+}
 static int finish_tests(void) {
     uint64_t lib_ns, pso_ns, lib_wait_ns, pso_wait_ns, shader_scan_ns, pso_scan_ns;
     mtl_create_ns(&lib_ns, &pso_ns); mtl_wait_stats(&lib_wait_ns, &pso_wait_ns); mtl_scan_stats(&shader_scan_ns, &pso_scan_ns);
@@ -749,6 +852,8 @@ int main(int argc, char **argv) {
         CHECK(vk_compute_pipe_cum_ns() == before && !graphics_count(&compute_calls), "learned key incurs zero recording creation/blocking");
         return finish_tests();
     }
+    const char *boost_env = getenv("TOTK_VK_PIPE_BOOST"); int boost_on = boost_env && atoi(boost_env) == 1;
+    vk_pipe_boost_test_hooks(waiter_nice, boost_hook);
     draw(15, 1);
     pthread_mutex_lock(&mu); while (!entered) pthread_cond_wait(&cv, &mu); pthread_mutex_unlock(&mu);
     CHECK(pixel[0] == 0 && pixel[2] == 255, "cold miss skipped the draw (clear remains)");
@@ -762,6 +867,11 @@ int main(int argc, char **argv) {
     draw_current(1); pthread_join(helper, NULL);
     CHECK(pixel[0] == 255 && pixel[1] == 255, "bounded in-flight build joined; later draw has real pixels");
     CHECK(graphics_count(&attempts[15]) == 1 && atomic_load(&g_hk.pipe_bounds) == 1, "bound never duplicates or overwrites a worker build");
+    uint64_t boost[4]; vk_pipe_boost_test_stats(boost);
+    CHECK(boost[0] >= 1 && boost[1] > 0, "the bounded join is counted with its wall time");
+    if (boost_on) CHECK(wait_graphics(&nboost, 2) && boost_loan_seen(0, held_tid) && !boost[3],
+                        "the join lent the waiter's nice to the held worker, which restored nice %d after publishing", VK_WORKER_NICE);
+    else CHECK(!graphics_count(&nboost) && !boost[2], "switch off: a join never changes worker priority");
     if (V.has_pipeline_library) CHECK(graphics_count(&attempts[7]) == 1, "bounded unavailable-part key is built exactly once");
     vk_pipeline_test_stats credit;
     vk_pipeline_test_stats_get(&credit);
@@ -789,6 +899,7 @@ int main(int argc, char **argv) {
     vk_shader *resolved[6]; CHECK(!vk_prog_resolve(&cs_prog, resolved) && resolved[5], "compute seed resolved");
     uint32_t *result = (uint32_t *)(mem + 0x60000); memset(result, 0, 256);
     p_bind_buf output = {5, 0, (uintptr_t)result, 256}; p_dispatch dispatch = {1, 1, 1};
+    unsigned boost_before = graphics_count(&nboost);
     pthread_create(&helper, NULL, release_compute_waiter, NULL);
     op(OP_BIND_UBO, &output, sizeof output); op(OP_DISPATCH, &dispatch, sizeof dispatch);
     CHECK(mtl_wait(submit(), 5000000000ull), "dispatch waits for held compute creation and completes");
@@ -798,6 +909,9 @@ int main(int argc, char **argv) {
     for (uint32_t i = 0; i < 64; i++) if (result[i] != (i ^ 0x12345678u)) correct = 0;
     CHECK(correct, "joined dispatch writes every expected output word");
     CHECK(graphics_count(&compute_calls) == 1, "bind/resolve/dispatch share exactly one in-flight compute creation");
+    if (boost_on) CHECK(wait_graphics(&nboost, boost_before + 2) && boost_loan_seen(boost_before, compute_tid),
+                        "the dispatch join lent the waiter's nice to the compute worker until its build published");
+    else CHECK(!graphics_count(&nboost), "switch off: the dispatch join never changes compute worker priority");
     pthread_mutex_lock(&mu); int graphics_still_held = !release_build; release_build = 1; pthread_cond_broadcast(&cv); pthread_mutex_unlock(&mu);
     CHECK(graphics_still_held, "compute dispatch completes while graphics compilation is still held");
     CHECK(wait_graphics(&completed[3], 1), "released graphics driver call drains before reusing the hold gate");
@@ -831,7 +945,9 @@ int main(int argc, char **argv) {
     CHECK(graphics_count(&attempts[failure_mask]) == before, "repeated failure backs off instead of retrying per draw/submission");
     for (unsigned i = 0; i < 20 && graphics_count(&attempts[failure_mask]) == before; i++) draw(failure_mask, 1);
     CHECK(graphics_count(&attempts[failure_mask]) == 3 && pixel[0] == 255 && pixel[1] == 255, "retry eventually recovers real geometry");
+    upload_probe(&pool, mem);
     if (prediction_test) prediction_probe(&tex, pixel);
+    unwritten_probe(&tex, mem);
     return finish_tests();
 }
 #else

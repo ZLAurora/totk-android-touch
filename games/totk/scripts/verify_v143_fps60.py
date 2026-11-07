@@ -42,7 +42,7 @@ def main():
     env = os.environ | {'TOTK_FPS60': '1', 'TOTK_REALTIME': '0', 'TOTK_OUTPUT_RES': '0',
         'TOTK_ASPECT': '0', 'TOTK_RENDER_RES': '0', 'TOTK_NATIVE_UI': '0',
         'TOTK_HIGHFPS_FIX': '0', 'TOTK_DRS60': '0', 'TOTK_SHADOW_RES': '0',
-        'TOTK_FAR_CLAMP': '0', 'TOTK_FXAA': '0'}
+        'TOTK_FAR_CLAMP': '0', 'TOTK_FXAA': '0', 'TOTK_FPS60_HYSTERESIS': '0'}
     raw = args.image.read_bytes()
     run = subprocess.run([str(fixture), str(args.image), str(patched_path), hex(args.text_end)],
         env=env, capture_output=True, text=True, check=True)
@@ -187,6 +187,34 @@ def main():
     assert 1 in biased[:200] and biased[-1] == 2
     for work in ((8., 40.), (40., 8.)):
         assert execute(patched, threshold=3, cd_init=30, plan=[(work, 120)])[-1] == 3
+    # Patch through the real production fixture, not a test-only byte table.
+    hysteresis_path = out / 'main-fps60-hysteresis.bin'
+    hysteresis_env = env | {'TOTK_FPS60_HYSTERESIS': '1'}
+    hysteresis_run = subprocess.run([str(fixture), str(args.image), str(hysteresis_path),
+        hex(args.text_end)], env=hysteresis_env, capture_output=True, text=True, check=True)
+    (out / 'hysteresis-fixture.log').write_text(hysteresis_run.stdout + hysteresis_run.stderr)
+    hysteresis = hysteresis_path.read_bytes()
+    hysteresis_sites = (0x2db2b8, 0x2db354, 0x2db3f0)
+    for site, word in zip(hysteresis_sites, (0x528000cc, 0x5280004c, 0x52800049)):
+        assert struct.unpack_from('<I', hysteresis, site)[0] == word
+    native_over = execute(patched, current=1, candidate=1, threshold=2, cd_init=6,
+        plan=[((18.,), 12), ((8.,), 12)])
+    experiment_over = execute(hysteresis, current=1, candidate=1, threshold=2, cd_init=6,
+        plan=[((18.,), 12), ((8.,), 12)])
+    assert native_over[:3] == [1, 1, 2], native_over
+    assert experiment_over[:7] == [1, 1, 1, 1, 1, 1, 2], experiment_over
+    assert native_over[12:19] == [2, 2, 2, 2, 2, 2, 1], native_over
+    assert experiment_over[12:15] == [2, 2, 1], experiment_over
+    assert execute(hysteresis, current=2, candidate=2, frozen=1, plan=[((8.,), 12)]) == [2] * 12
+    assert execute(hysteresis, 'veto', current=2, candidate=1, plan=[((8.,), 12)]) == [2] * 12
+    assert execute(hysteresis, current=1, candidate=1, plan=[((40.,), 30)])[-1] == 3
+    # Shipping-30 ignores the experiment entirely.
+    shipping_path = out / 'main-shipping-hysteresis.bin'
+    subprocess.run([str(fixture), str(args.image), str(shipping_path), hex(args.text_end)],
+        env=hysteresis_env | {'TOTK_FPS60': '0'}, capture_output=True, text=True, check=True)
+    shipping = shipping_path.read_bytes()
+    for site in SITES + hysteresis_sites:
+        assert shipping[site:site + 4] == raw[site:site + 4]
     # Verify every FPS site still refuses a mismatched source before patching.
     bad = out / 'invalid-main.bin'
     try:
@@ -197,6 +225,13 @@ def main():
             rejected = subprocess.run([str(fixture), str(bad), str(out / 'rejected.bin'),
                 hex(args.text_end)], env=env, capture_output=True, text=True)
             assert rejected.returncode and 'FPS patch original instruction mismatch' in rejected.stderr
+        for site in hysteresis_sites:
+            image = bytearray(raw)
+            image[site] ^= 1
+            bad.write_bytes(image)
+            rejected = subprocess.run([str(fixture), str(bad), str(out / 'rejected.bin'),
+                hex(args.text_end)], env=hysteresis_env, capture_output=True, text=True)
+            assert rejected.returncode and 'hysteresis original instruction mismatch' in rejected.stderr
     finally:
         bad.unlink(missing_ok=True)
     report = {'status': 'pass', 'source_sha256': hashlib.sha256(raw).hexdigest(),
@@ -207,7 +242,9 @@ def main():
         'stored_min_max_2_3_with_interval_1_verified': True,
         'native_constructor_defaults': {'bias': bias_a, 'one_tick_work_limit_ms': (1 - bias_a) * 1000 / 60,
             'over_threshold': over, 'cooldown': cooldown},
-        'saved_x20_negative_control': 'caller sys, not live controller'}
+        'saved_x20_negative_control': 'caller sys, not live controller',
+        'hysteresis': {'native_sequence': native_over, 'experiment_sequence': experiment_over,
+            'guard_refusals': len(hysteresis_sites), 'shipping_frozen_veto_overload_controls': 4}}
     (out / 'fps60-validation.json').write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps(report))
 

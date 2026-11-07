@@ -16,6 +16,17 @@ final class Strings {
     static final String UPSTREAM_URL = "https://github.com/ly05010419/MacNativeGames";
     static final String ANDROID_PORT_URL = "https://github.com/kitcatkode/MacNativeGames";
 
+    static final String UPDATES = "Updates";
+    static final String UPDATE_CHECK = "Check for updates when the game starts";
+    static final String UPDATE_PRIVACY = "Only asks GitHub for the latest version number. Nothing about you or your game is sent. You choose when to install.";
+    static final String UPDATE_NOW = "Update now", UPDATE_NEXT_TIME = "Next time";
+    static final String UPDATE_CLOSE_HINT = "Close the game safely, then download and install";
+    static final String UPDATE_NEXT_HINT = "Ask in the menu next launch, even offline";
+    static final String UPDATE_GAME_BODY = "The game is paused. Your saves and game data stay on this device.";
+    static final String UPDATE_MENU_BODY = "Download and install the new version? Your saves and game data will be kept. A network connection is needed to download.";
+    static final String UPDATE_ALLOW = "Allow app updates";
+    static final String UPDATE_ALLOW_BODY = "Android needs permission for TotK Native to install its own update. Enable “Allow from this source”, then return here to continue. You will still confirm the installation.";
+    static String updateAvailable(String version) { return "TotK Native " + version + " is available"; }
     // Button prompts
     static final String P_SELECT = "Select", P_QUIT = "Quit", P_START = "Start game", P_DEFAULTS = "Defaults", P_CHANGE = "Change";
     static final String P_ADJUST = "Adjust", P_BACK = "Back", P_CHOOSE = "Choose", P_INSTALL = "Install", P_CANCEL = "Cancel";
@@ -45,9 +56,9 @@ final class Strings {
     static final String DRIVER_BUNDLED_SHORT = "Bundled Turnip driver";
     static final String DRIVER_CUSTOM_SHORT = "Custom driver · ";
     static String shadersReady(int count) { return String.format(Locale.US, "%,d shaders ready", count); }
-    static String dataSummary(String size, boolean companion, boolean artOutdated, boolean shaders) {
-        return size + " · verified · " + (!shaders ? "shaders not built" : companion ? "rebuild shaders or companion art"
-                : artOutdated ? "second-screen art out of date" : "second-screen art not prepared");
+    static String dataSummary(String size, boolean secondScreen, boolean companion, boolean artOutdated, boolean shaders) {
+        return size + " · verified · " + (!shaders ? "shaders not built" : !secondScreen ? "rebuild shaders"
+                : companion ? "rebuild shaders or companion art" : artOutdated ? "second-screen art out of date" : "second-screen art not prepared");
     }
 
     // Graphics
@@ -67,7 +78,7 @@ final class Strings {
     }
     static final String DETECTED = "Detected";
     static final String CHOOSE_GRAPHICS = "Choose graphics";
-    static final String SETUP_COMPLETE = "Setup complete · step 4 of 4";
+    static final String SETUP_COMPLETE = "Setup complete · step 6 of 6";
     static final String TAKES_EFFECT = "Takes effect when you start the game. Change it any time from this menu.";
     static final String GPU_COST = "GPU cost", ADDED_LATENCY = "Added latency", WORKS_WITH = "Works with", APPLIES = "Applies";
     static final String WHILE_PLAYING = "Change while playing", SOUND_BUFFER = "Sound buffer", GAME_RESOLUTION = "Game targets";
@@ -104,7 +115,8 @@ final class Strings {
             case "balanced": return "The game as it was made: 30 fps at the game's own resolution with full shadows.";
             case "smooth": return "The game runs at 30 fps and frame generation adds an in-between picture, so the screen shows 60. "
                     + "The 3D scene is drawn at 1152 × 648 to leave room for it.";
-            case "60fps": return "The game itself runs at 60 fps at its own resolution. Needs a fast GPU; busy areas can dip below 60.";
+            case "60fps": return "The game itself runs at 60 fps at its own resolution. "
+                    + "Needs a fast GPU; busy areas can dip below 60.";
             default: return "Your own combination of the options below. Pick a preset to start from one of the tested mixes.";
         }
     }
@@ -115,6 +127,7 @@ final class Strings {
             case "frame_gen": return "Frame generation";
             case "render_res": return "Render resolution";
             case "latency": return "Latency";
+            case "gpu_feed": return "Keep the GPU busy";
             case "upscaler": return "Upscaler";
             case "sharpness_fsr": case "sharpness_sgsr": return "Sharpness";
             case "aa": return "Anti-aliasing";
@@ -138,6 +151,7 @@ final class Strings {
             case "frame_gen": return "Shows an extra picture between two real ones";
             case "render_res": return "Size of the 3D scene before upscaling";
             case "latency": return "Responsive · Balanced · Smoothest";
+            case "gpu_feed": return "Feeds work earlier · more power and heat";
             case "upscaler": return "Off · FSR 1 · Snapdragon GSR";
             case "sharpness_fsr": case "sharpness_sgsr": return "Applies to the upscaler";
             case "aa": return "Smooths jagged edges";
@@ -165,6 +179,9 @@ final class Strings {
                     + "and softer. Game default lets the game choose, as on the console.";
             case "latency": return "How many finished pictures may wait for the screen. Responsive shows each one as soon as possible; "
                     + "Smoothest keeps one more in reserve to hide uneven frames, at up to one more frame of input delay.";
+            case "gpu_feed": return "Sends smaller batches of work to the GPU earlier and asks Android for clocks that keep up. "
+                    + "A little more GPU and CPU clock means more power and heat. On by default on devices where it was "
+                    + "measured to help (Snapdragon 8 Elite class); has no effect with frame generation.";
             case "upscaler": return "How the picture is enlarged to the screen. FSR 1 is AMD's edge-aware upscaler; Snapdragon GSR is "
                     + "Qualcomm's, made for Adreno GPUs. Off uses plain filtering.";
             case "sharpness_fsr": case "sharpness_sgsr": return "How much detail the upscaler restores after enlarging the picture. Too high "
@@ -199,6 +216,7 @@ final class Strings {
         switch (key) {
             case "frame_rate": return value + " fps";
             case "frame_gen": return value.equals("on") ? "Interpolation" : "Off";
+            case "gpu_feed": return value.equals("on") ? "On" : "Off";
             case "render_res": return value.equals("game") ? "Game default" : value.replace("x", " × ");
             case "upscaler": return upscalerName(value);
             case "aa": return value.equals("fxaa") ? "Game (FXAA)" : value.equals("smaa") ? "SMAA" : "Off";
@@ -262,14 +280,26 @@ final class Strings {
     static final String VERIFIED = "verified";
     static final String COMPANION_ROW = "Second-screen art";
     static final String COMPANION_HINT = "Map, inventory and shortcut pictures for the lower display";
+    static final String ART_NOT_NEEDED = "Not needed on this device";
+    static final String ART_NOT_NEEDED_HINT = "No built-in second screen · you can still prepare the art";
+    static final String PREPARE_ART = "Prepare second-screen art";
+    static final String ART_OFFER_TITLE = "Prepare your second screen?";
+    static final String ART_OFFER_BODY = "This device has a built-in second screen, but its map, inventory and shortcut pictures "
+            + "aren't prepared. Building took about 15 seconds on a Pocket Duo; other devices may take longer. The game starts when it's ready.";
+    static final String ART_PREPARE_HINT = "Build from your imported game data, then play";
+    static final String PLAY_WITHOUT_ART = "Play without it";
+    static final String ART_DECLINE_HINT = "Start now · don't ask again for this install";
+    static final String ART_OFFER_FAILED = "The second-screen art wasn't prepared. Start game offers to try again or play without it.";
     static final String SHADERS_ROW = "Shaders";
     static final String SHADERS_HINT = "Required: the game's GPU shaders, prepared from your game data";
     static final String DRIVER = "Graphics driver";
-    static final String DRIVER_HINT = "The bundled Turnip build, or one you choose";
+    static final String DRIVER_HINT = "The bundled Turnip build, or a Turnip .zip / .so you choose";
     static final String DRIVER_RESET_ROW = "Use the bundled driver";
     static final String DRIVER_RESET_HINT = "Removes the custom driver file";
     static final String DRIVER_BUNDLED = "Bundled";
-    static final String DRIVER_BAD = "That file is not a 64-bit ARM Vulkan driver (.so).";
+    static final String DRIVER_BAD = "That file is not a Vulkan driver: pick a Turnip .zip (AdrenoTools) or its .so (64-bit ARM).";
+    static final String DRIVER_ZIP_BAD = "That zip has no usable driver. Its meta.json must name an existing libraryName, or it must "
+            + "contain exactly one .so (64-bit ARM, up to 128 MiB; at most 256 entries).";
     static final String RERUN = "Run setup again";
     static final String RERUN_HINT = "Choose your files again; finished steps are kept";
     static final String DELETE_ROW = "Delete imported data";
@@ -282,13 +312,13 @@ final class Strings {
     static final String NEEDS_SETUP = "Finish setup first";
     static final String MEASURING = "measuring…", SIZE_UNKNOWN = "size unknown";
     static final String DATA_TEXT = "The game data imported from your own files: rewritten game code, the game's data image and its "
-            + "index, fonts, the shader seed and the second-screen art. Everything was checked against the pinned digests of version 1.4.3.";
+            + "index, fonts and the shader seed, plus optional second-screen art. The import was checked against the pinned digests of version 1.4.3.";
     static final String COMPANION_TEXT = "Pictures for the second-screen companion (map, inventory, shortcuts), generated on this device "
-            + "from your game data. Optional: the game runs without them. Rebuilding takes a few minutes.";
+            + "from your game data. Optional: the game runs without them. Setup skips them without a built-in second screen; you can build them here.";
     static final String SHADERS_TEXT = "The seed of translated GPU shaders generated from your game data. The game needs it: without "
             + "it nothing is drawn. Building takes a few minutes.";
-    static final String DRIVER_TEXT = "The Vulkan driver the game uses. The bundled Mesa Turnip build is tested with this app; a custom "
-            + "build you pick is copied into the game folder and used instead.";
+    static final String DRIVER_TEXT = "The Vulkan driver the game uses. The bundled Mesa Turnip build is tested with this app. Pick a "
+            + "Turnip .zip (AdrenoTools format) or a 64-bit ARM .so; only the driver library is copied into the game folder and used instead.";
     static final String RERUN_TEXT = "Opens setup again to pick different files. Steps that are already finished and still match "
             + "are kept.";
     static final String DELETE_TEXT = "Removes the imported game data from this device. Saves, menu settings and a custom driver stay. "
@@ -505,14 +535,19 @@ final class Strings {
     static final String STEP_ROUTE = "What you have", STEP_FILES = "Choose your files", STEP_PREPARE = "Prepare", STEP_GRAPHICS = "Choose graphics";
     static final String STEP_ROUTE_NONE = "A decrypted dump, or game files and keys";
     static final String STEP_FILES_TEXT = "From this device or an SD card";
-    static final String STEP_PREPARE_TEXT = "About half an hour · you can play before it ends";
+    static String prepareEstimate(String route) {
+        return Inputs.DECRYPTED.equals(route) ? "About 2–3 min · longer when copying from an SD card"
+                : Inputs.CONTAINERS.equals(route) ? "About 15 min, plus SD-card copy time"
+                : "About 2–3 min decrypted, or 15 min XCI/NSP, plus SD-card copy time";
+    }
     static final String STEP_GRAPHICS_TEXT = "Pick a preset, start playing";
     static String routeName(String route) { return Inputs.CONTAINERS.equals(route) ? "Game files and keys" : Inputs.DECRYPTED.equals(route) ? "Decrypted dump" : STEP_ROUTE_NONE; }
 
     // Welcome
     static final String WELCOME_TITLE = "Prepare your game";
     static final String WELCOME_BODY = "This app contains no game data. Point it at your own dump of the game and it builds "
-            + "everything it needs here on the device. Plan for about 19 GB of free space and half an hour.";
+            + "everything it needs here on the device. Plan for about 19 GB of free space. Preparing a decrypted dump takes "
+            + "roughly 2–3 minutes; XCI/NSP around 15 minutes, plus time copying from an SD card. Times vary by device and storage.";
     static final String BEGIN = "Begin setup";
     static final String BEGIN_HINT = "Pick what you have, then choose your files";
     static final String CONTINUE_SETUP = "Continue setup";
@@ -523,10 +558,11 @@ final class Strings {
     static final String ROUTE_BODY = "Both routes need version 1.4.3. Pick the one that matches your files.";
     static final String ROUTE_DECRYPTED = "RomFS + ExeFS dump";
     static final String ROUTE_DECRYPTED_BODY = "Decrypted files, e.g. from nxdumptool or hactool: the 1.4.3 RomFS "
-            + "(one file or its split parts) and the ExeFS files main, sdk, subsdk0. No keys needed.";
+            + "(one file or its split parts) and the ExeFS files main, sdk, subsdk0. No keys needed. "
+            + "About 2–3 minutes to prepare; copying from an SD card can take longer.";
     static final String ROUTE_CONTAINERS = "XCI / NSP + update + keys";
     static final String ROUTE_CONTAINERS_BODY = "The base game 1.0.0 as XCI or NSP, the 1.4.3 update NSP, and the "
-            + "prod.keys from your own console. Decryption happens on the device.";
+            + "prod.keys from your own console. Decryption happens on the device. About 15 minutes to prepare, plus SD-card copy time.";
     static final String BACK = "Back";
 
     // Files
@@ -585,6 +621,7 @@ final class Strings {
     static final String WAITING = "waiting";
     static final String DONE = "done";
     static final String SKIPPED = "not prepared";
+    static final String ART_SKIPPED = "skipped";
     static final String FAILED = "Failed";
     static final String STARTING = "Starting…";
     // A single stage of the last two, started from Game data (or Home's Build shaders); again: its output exists already
@@ -644,6 +681,18 @@ final class Strings {
     static final String CHANGE_FILES = "Change files";
     static final String CHANGE_FILES_HINT = "Pick other files or the other route";
     static final String DETAILS = "Details: ";
+    static final String SHARE_DETAILS = "Share details";
+    static final String SHARE_DETAILS_HINT = "Share details before Resume to include the logs";
+    static final String SHARE_DETAILS_BUSY = "Preparing details…";
+    static final String SHARE_DETAILS_MISSING = "No app is available to share text.";
+
+    static final String CLOSE_GAME = "Close the game";
+    static final String WAITING_SAVE = "Waiting for the game to finish saving…";
+    static final String CLOSING_GAME = "Closing the game…";
+    static final String SAVE_WAIT_TIMEOUT = "The game is still saving after 30 seconds. It was not closed. Let it finish saving, then try again.";
+    static final String CLOSE_GAME_TIMEOUT = "The game did not finish closing. Return to the game and close it, then try again.";
+    static String gameRunning(String action) { return "TotK Native's game is still running in the background. " + action + " needs it closed."; }
+    static String gameLockError(String reason) { return "Could not check or close the game: " + reason; }
 
     static String error(String code) {
         switch (code == null ? "" : code) {
@@ -661,7 +710,8 @@ final class Strings {
             case "permission": return "This app can no longer open some of your chosen files (access was removed, or "
                     + "they were moved, renamed or are on a removed card). Choose them again below.";
             case "library": return NO_LIBRARY;
-            case "game_running": return "The game is running. Close it first, then try again.";
+            case "game_running": return gameRunning("Installing");
+            case "game_lock": return "Could not check the game's lock. The error details below explain why; nothing was changed.";
             case "not_available": return "Not available on this device.";
             default: return "Something unexpected went wrong. Resume to retry; if it keeps failing, report it with the details below.";
         }

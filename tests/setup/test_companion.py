@@ -14,9 +14,9 @@ runtime-index.bin) and its tree is compared with the Python generator's output (
     TOLERANCE. On the reference host (and on the AYN Thor) every file is byte-identical.
   - cancelling (SIGINT) a run exits with the cancelled code;
   - a second run writes a byte-identical tree (the image phase runs in any thread order);
-  - every item in the pouch of every progress.sav under TOTK_COMPANION_SAVES (os.pathsep-separated folders, searched
-    recursively; skipped when unset) has its game name in every language, so the companion shows no humanized actor
-    name ("Weapon Sword 077"); the items without an icon are printed.
+  - every item and Combined fuse attachment in every progress.sav under TOTK_COMPANION_SAVES (os.pathsep-separated
+    folders or save ZIPs; skipped when unset) has its game name in every language, so the companion shows no
+    humanized actor name ("Weapon Sword 077"); pouch items without an icon are printed.
 Pillow (requirements.txt) decodes the images; without it only byte equality is checked. The host CLI is built from
 android/setup/setup.mk with capstone, zstd and libwebp from the stage deps helpers into TOTK_COMPANION_WORK (default
 games/totk/build/setup-companion). Outputs go to a temporary folder; nothing is written into the reference folders."""
@@ -26,10 +26,13 @@ import json
 import os
 import shutil
 import signal
+import struct
+import sys
 import subprocess
 import tempfile
 import time
 import unittest
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -106,12 +109,13 @@ def mm3(text):
 
 POUCH = {mm3(f'Pouch.{c}.Content.Name'): c for c in ('Weapon', 'Bow', 'Arrow', 'Shield', 'Armor', 'Material', 'Food',
                                                     'SpecialParts', 'KeyItem', 'SpecialPower')}
+POUCH.update({mm3(f'Pouch.{c}.Content.Combined.Name'): c + '.Combined' for c in ('Weapon', 'Bow', 'Arrow', 'Shield')})
 
 
-def save_pouch(path):
-    """{category: [actor, ...]} from progress.sav: Pouch.<cat>.Content.Name are String64 arrays ({u32 count, 64-byte
-    names}) that the header's (key hash, offset) table points to; key 0xa3db7114 ends the table (save_position.py)."""
-    data, out = path.read_bytes(), {}
+def save_pouch(path, data=None):
+    """{category: [actor, ...]} from progress.sav: pouch names and Combined attachment names are String64 arrays
+    ({u32 count, 64-byte names}) addressed by the header's (key hash, offset) table; 0xa3db7114 ends the table."""
+    data, out = path.read_bytes() if data is None else data, {}
     if data[:4] != b'\x04\x03\x02\x01':
         raise ValueError(f'{path} is not a progress.sav')
     for at in range(0x28, len(data) - 8, 8):
@@ -121,8 +125,61 @@ def save_pouch(path):
         if key in POUCH:
             count = int.from_bytes(data[value:value + 4], 'little')
             names = (data[value + 4 + 64 * i:value + 68 + 64 * i].split(b'\0')[0].decode() for i in range(count))
-            out[POUCH[key]] = [name for name in names if name]
+            out[POUCH[key]] = [name for name in names if name and name != 'None']
     return out
+
+
+def save_blobs(root):
+    if root.is_file() and root.suffix.lower() == '.zip':
+        with zipfile.ZipFile(root) as archive:
+            for name in sorted(archive.namelist()):
+                if name.endswith('/progress.sav') or name == 'progress.sav':
+                    yield f'{root}!{name}', archive.read(name)
+    else:
+        for path in sorted(root.rglob('progress.sav')):
+            yield path, path.read_bytes()
+
+
+class CompanionSaveNames(unittest.TestCase):
+    @unittest.skipUnless(sys.version_info >= (3, 14), 'reference MSBT reader requires Python 3.14')
+    def test_msbt_keeps_standalone_declension_form(self):
+        sys.path.insert(0, str(GAME / 'scripts'))
+        try:
+            generator = _module('make_companion_assets', GAME / 'scripts/make_companion_assets.py')
+        finally:
+            sys.path.pop(0)
+        for endian, encoding, bom in (('<', 'utf-16-le', b'\xff\xfe'), ('>', 'utf-16-be', b'\xfe\xff')):
+            with self.subTest(endian=endian):
+                first, other = 'Example имя'.encode(encoding), 'Other form'.encode(encoding)
+                payload = struct.pack(endian + 'H', len(first)) + first + struct.pack(endian + 'H', len(other)) + other
+                message = struct.pack(endian + '4H', 0xe, 201, 10, len(payload)) + payload + b'\0\0'
+                labels = struct.pack(endian + '3I', 1, 1, 12) + b'\x04Name' + struct.pack(endian + 'I', 0)
+                texts = struct.pack(endian + '2I', 1, 8) + message
+                data = bytearray(32)
+                data[:8], data[8:10], data[12] = b'MsgStdBn', bom, 1
+                struct.pack_into(endian + 'H', data, 14, 2)
+                for name, section in ((b'LBL1', labels), (b'TXT2', texts)):
+                    data += name + struct.pack(endian + 'I', len(section)) + b'\0' * 8 + section
+                    data += b'\0' * (-len(data) % 16)
+                self.assertEqual(generator.msbt(bytes(data)), {'Name': 'Example имя'})
+
+    def test_pouch_and_all_combined_arrays_in_save_zip(self):
+        # Synthetic save structure only: no game files or text in the test fixture.
+        arrays = {key: ['TestActor', '', 'None'] for key in POUCH}
+        table_end = 0x28 + 8 * (len(arrays) + 1)
+        data = bytearray(table_end)
+        data[:4] = b'\x04\x03\x02\x01'
+        for i, (key, names) in enumerate(arrays.items()):
+            struct.pack_into('<II', data, 0x28 + 8 * i, key, len(data))
+            data += struct.pack('<I', len(names)) + b''.join(name.encode().ljust(64, b'\0') for name in names)
+        struct.pack_into('<II', data, table_end - 8, 0xa3db7114, 0)
+        with tempfile.TemporaryDirectory() as d:
+            archive = Path(d) / 'saves.zip'
+            with zipfile.ZipFile(archive, 'w') as z:
+                z.writestr('Export/slot_00/progress.sav', data)
+            blobs = list(save_blobs(archive))
+            self.assertEqual(len(blobs), 1)
+            self.assertEqual(save_pouch(*blobs[0]), {cat: ['TestActor'] for cat in POUCH.values()})
 
 
 tools = shutil.which('cc') and shutil.which('cmake') and shutil.which('git') and shutil.which('make')
@@ -171,7 +228,7 @@ class CompanionOracle(unittest.TestCase):
         for name in names:
             self.assertEqual((self.out / name).read_bytes(), (ORACLE / name).read_bytes(), name)
         index = json.loads((self.out / 'index.json').read_text())
-        self.assertEqual((index['schema'], index['generator']), (1, 4))
+        self.assertEqual((index['schema'], index['generator']), (1, 5))
 
     def test_images(self):
         report, failures = {}, []
@@ -224,25 +281,51 @@ class CompanionOracle(unittest.TestCase):
         self.assertEqual(p.returncode, 3, stdout)
         self.assertEqual(json.loads(stdout)['code'], 'cancelled')
 
+    @unittest.skipUnless(sys.version_info >= (3, 14), 'reference BYML reader requires Python 3.14')
+    def test_every_fusible_reference_actor_has_its_name(self):
+        sys.path.insert(0, str(GAME / 'scripts'))
+        try:
+            generator = _module('make_companion_assets', GAME / 'scripts/make_companion_assets.py')
+        finally:
+            sys.path.pop(0)
+        reader = generator.RomFS(ROMFS)
+        try:
+            rows = generator.rsdb(reader, 'AttachmentActorInfo')
+        finally:
+            os.close(reader.fd)
+        # Chemical-only entries also describe non-fusible constructions. Damage/multiplier entries are fuse materials.
+        actors = {row['__RowId'] for row in rows if 'AttachmentAdditionalDamage' in row or 'AttachmentMulValueArrow' in row}
+        self.assertTrue(actors)
+        for lang in json.loads((self.out / 'index.json').read_text())['languages']:
+            items = json.loads((self.out / 'text' / f'{lang}.json').read_text())['items']
+            missing = [actor for actor in sorted(actors) if not items.get(actor, {}).get('name')
+                       or ('_' in actor and items[actor]['name'] == actor)]
+            self.assertFalse(missing, f'{lang}: {missing}')
+        print(f'\n{len(rows)} attachment metadata rows, {len(actors)} fusible actors named in every language')
+
     @unittest.skipUnless(SAVES, 'TOTK_COMPANION_SAVES not set')
     def test_every_save_pouch_item_has_its_name(self):
-        actors, saves = {}, set()
+        actors, fused, saves = {}, set(), set()
         for root in SAVES:
-            for path in sorted(root.rglob('progress.sav')):
-                digest = hashlib.sha256(path.read_bytes()).digest()
+            for path, data in save_blobs(root):
+                digest = hashlib.sha256(data).digest()
                 if digest in saves: continue
                 saves.add(digest)
-                for cat, names in save_pouch(path).items():
-                    for name in names: actors.setdefault(name, (cat, path))
+                for cat, names in save_pouch(path, data).items():
+                    for name in names:
+                        actors.setdefault(name, (cat, path))
+                        if cat.endswith('.Combined'): fused.add(name)
         self.assertTrue(actors, f'no progress.sav under {SAVES}')
         index = json.loads((self.out / 'index.json').read_text())
         missing = []
         for lang in index['languages']:
             items = json.loads((self.out / 'text' / f'{lang}.json').read_text())['items']
-            missing += [f'{lang} {cat} {actor} ({path})' for actor, (cat, path) in sorted(actors.items()) if 'name' not in items.get(actor, {})]
+            missing += [f'{lang} {cat} {actor} ({path})' for actor, (cat, path) in sorted(actors.items())
+                        if not items.get(actor, {}).get('name') or ('_' in actor and items[actor]['name'] == actor)]
         icons, aliases = set(index['icons']), index['iconAliases']
-        no_icon = [actor for actor in sorted(actors) if actor not in icons and aliases.get(actor) not in icons]
-        print(f'\n{len(saves)} saves, {len(actors)} pouch actors, {len(missing)} names missing; without an icon: {no_icon}')
+        no_icon = [actor for actor in sorted(actors) if actor not in fused and actor not in icons and aliases.get(actor) not in icons]
+        print(f'\n{len(saves)} saves, {len(actors)} pouch/fuse actors ({len(fused)} fuse actors), '
+              f'{len(missing)} names missing; pouch items without an icon: {no_icon}')
         self.assertFalse(missing, '\n'.join(missing[:20]))
 
 

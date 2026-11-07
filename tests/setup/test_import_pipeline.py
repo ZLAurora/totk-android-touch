@@ -218,9 +218,13 @@ class CompanionAndShaders(DecryptedFixture):
                                      'runtime_tables_sha256': '0' * 64}
         (self.game / 'install.json').write_text(json.dumps(install))
 
-    def popen(self, fakes, stages=('companion', 'shaders')):
+    def popen(self, fakes, stages=('companion', 'shaders'), skip_companion=False):
         fds = self.open_fds([self.dir / 'romfs.bin'])
         req = self.request(fds, list(stages) if stages else None, romfs=[{'fd': fds['parts'][0], 'size': 1, 'name': 'romfs.bin'}])
+        if skip_companion:
+            data = json.loads(req.read_text())
+            data['skipCompanion'] = True
+            req.write_text(json.dumps(data))
         args = [a for f in fakes for a in ('--fake', f)]
         env = dict(os.environ, ASAN_OPTIONS='detect_leaks=1:abort_on_error=0', UBSAN_OPTIONS='print_stacktrace=1')
         return subprocess.Popen([str(self.cli), 'run', '--request', str(req), '--pins', str(self.pins), *args], stdout=subprocess.PIPE,
@@ -244,6 +248,23 @@ class CompanionAndShaders(DecryptedFixture):
         self.assertIn('companion', lines[first:last])
         self.assertIn('[companion] 1/1 done', err); self.assertIn('[shaders] 1/1 done', err)
         self.assertFalse((self.game / '.import').exists())
+
+    def test_single_screen_skips_art_but_explicit_build_still_runs(self):
+        code, out, err = self.finish(self.popen(['companion=fail:10', 'shaders=ok:100'], stages=None, skip_companion=True))
+        self.assertEqual(code, 0, out)
+        self.assertTrue(out['ok'] and out['install']['playable'], out)
+        self.assertEqual(out['install']['stages']['companion'], {'done': False, 'skipped': True})
+        self.assertEqual(out['install'], self.install())
+        self.assertFalse((self.game / 'companion').exists())
+        self.assertIn('[companion] 0/0 skipped', err)
+        # A later automatic setup keeps the distinct skipped state and does not invoke the generator.
+        code, out, err = self.finish(self.popen(['companion=fail:10'], stages=None, skip_companion=True))
+        self.assertEqual(out['install']['stages']['companion'], {'done': False, 'skipped': True})
+        self.assertFalse((self.game / 'companion').exists())
+        # Game data overrides the automatic skip policy and clears skipped after a successful build.
+        code, out, err = self.finish(self.popen(['companion=ok:100'], stages=('companion',), skip_companion=True))
+        self.assertEqual(out['install']['stages']['companion'], {'done': True})
+        self.assertTrue((self.game / 'companion/fake.txt').is_file())
 
     def test_companion_failing_keeps_install_playable(self):
         code, out, err = self.finish(self.popen(['companion=fail:300', 'shaders=ok:500']))

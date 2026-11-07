@@ -82,6 +82,15 @@ int main(void) {
     need(high.profile->holder[0].handle == owner.handle && high.profile->holder[0].ns == 200, "core-holder snapshot attribution");
     pthread_mutex_lock(&G); g_all = &high; high.pt = pthread_self(); high.mport = host_thread_port_self(); pthread_setspecific(g_keythr, &high); g_svc_profile = 1; pthread_mutex_unlock(&G);
     runtime_svc_profile_frame(300); need(high.profile->walking && !high.profile->object[SP_ADDR].n, "300-present walking report resets window");
+    /* Short-timeout histogram: zero-timeout polls, a 4 us timed wait that times out, and the 20 us boundary. */
+    pthread_mutex_lock(&G);
+    need(block(&high, 3, 0) == R_TIMEOUT && high.profile->polls == 1, "zero-timeout poll counted");
+    need(block(&high, 3, 4000) == R_TIMEOUT, "4 us timed wait times out");
+    need(high.profile->tiny[2] == 1 && high.profile->tiny_timeouts == 1, "timed wait in the 2-5 us bin, timed out");
+    need(block(&high, 3, 20000) == R_TIMEOUT && high.profile->tiny[0] + high.profile->tiny[1] + high.profile->tiny[2] +
+         high.profile->tiny[3] + high.profile->tiny[4] == 1, "20 us is not a short timeout");
+    pthread_mutex_unlock(&G);
+    runtime_svc_profile_frame(600); need(!high.profile->polls && !high.profile->tiny[2] && !high.profile->tiny_timeouts, "report resets short-timeout counters");
     free(high.profile); pthread_cond_destroy(&owner.cv); pthread_cond_destroy(&high.cv); pthread_cond_destroy(&low.cv);
     puts("PASS guest-waits: late-wake negative control, ready reservation, masks, priority/FIFO/inheritance/protection, stale flag, FREE_CORES, exact object/dispatch/core/peer accounting");
     return 0;

@@ -42,7 +42,7 @@ TURNIP_SHA256 = audit_apk.TURNIP_SHA256
 LICENSES = HERE / 'apk/licenses'   # licence texts of the prebuilt inputs (their sources are not fetched by this build)
 # The app's own semantic version (the game version, 1.4.3, is shown separately in About). versionCode is derived from
 # it, so it only ever grows: major * 10000 + minor * 100 + patch (1.0.0 -> 10000, 1.2.3 -> 10203; minor and patch < 100).
-APP_VERSION = '1.0.0'
+APP_VERSION = '1.0.1'
 
 
 def semver_code(name):

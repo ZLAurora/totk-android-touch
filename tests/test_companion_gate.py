@@ -47,12 +47,37 @@ public class Context {
 }''',
     'android/content/Intent.java': '''package android.content;
 public class Intent {
+    public static final String ACTION_VIEW = "view";
+    public Intent() {}
+    public Intent(Context context, Class<?> target) {}
+    public Intent setAction(String value) { return this; }
+    public Intent putExtra(String name, boolean value) { return this; }
     public Intent setClassName(Context context, String name) { return this; }
     public Intent putExtra(String name, String value) { return this; }
+    public boolean getBooleanExtra(String name, boolean fallback) { return fallback; }
+}''',
+    'android/content/res/Configuration.java': 'package android.content.res; public final class Configuration {}',
+    'com/aure/totk/GameLaunch.java': '''package com.aure.totk;
+public final class GameLaunch {
+    static final String OPEN_SETTINGS = "com.aure.totk.OPEN_SETTINGS";
+    static boolean onMainScreen(Object activity) { return true; }
+    static void start(Object activity) {}
 }''',
     'com/aure/totk/setup/SetupActivity.java': '''package com.aure.totk.setup;
 public final class SetupActivity {
     public static final String EXTRA_GAME_ERROR = "com.aure.totk.setup.GAME_ERROR";
+    public static final String EXTRA_UPDATE = "com.aure.totk.setup.UPDATE";
+    public static void openOnGame(android.app.Activity game) {}
+}''',
+    'com/aure/totk/Updates.java': '''package com.aure.totk;
+public final class Updates {
+    public static void check(android.content.Context context, java.util.function.Consumer<String> result) { result.accept(null); }
+}''',
+    'com/aure/totk/setup/UpdatePrompt.java': '''package com.aure.totk.setup;
+public final class UpdatePrompt {
+    public static void show(android.app.Activity activity, String version, java.util.function.Consumer<Boolean> answer) {
+        throw new AssertionError("update networking is outside this companion fixture");
+    }
 }''',
     'android/os/Build.java': '''package android.os;
 public final class Build {
@@ -70,6 +95,7 @@ public interface AttachedSurfaceControl {
     void addOnBufferTransformHintChangedListener(OnBufferTransformHintChangedListener listener);
     void removeOnBufferTransformHintChangedListener(OnBufferTransformHintChangedListener listener);
 }''',
+    'android/view/Display.java': 'package android.view; public final class Display { public int getDisplayId() { return 0; } }',
     'android/view/View.java': '''package android.view;
 public class View {
     public boolean isAttachedToWindow() { return false; }
@@ -79,20 +105,28 @@ public class View {
 public class Window {
     public View getDecorView() { return new View(); }
 }''',
+    'android/app/Activity.java': 'package android.app; public class Activity extends android.content.Context {}',
     'android/app/NativeActivity.java': '''package android.app;
 import android.content.Context;
 import android.os.Bundle;
 import android.view.Window;
-public class NativeActivity extends Context {
+public class NativeActivity extends Activity {
     public static Runnable initialize, destroy;
     public static boolean initialized;
     protected void onCreate(Bundle state) { initialize.run(); initialized = true; }
+    protected void onNewIntent(android.content.Intent intent) {}
+    public void setIntent(android.content.Intent intent) {}
+    public void onConfigurationChanged(android.content.res.Configuration config) {}
     protected void onResume() {}
     protected void onPause() {}
     protected void onStop() {}
     protected void onDestroy() { destroy.run(); }
     public boolean isFinishing() { return false; }
+    public boolean hasWindowFocus() { return true; }
     public Window getWindow() { return new Window(); }
+    public android.view.Display getDisplay() { return new android.view.Display(); }
+    public void onWindowFocusChanged(boolean focused) {}
+    public void onTopResumedActivityChanged(boolean top) {}
 }''',
     'com/aure/totk/companion/AssetStore.java': '''package com.aure.totk.companion;
 import android.content.Context;
@@ -124,12 +158,18 @@ final class TextEntry {
 }''',
     'com/aure/totk/companion/PresentationController.java': '''package com.aure.totk.companion;
 import android.app.NativeActivity;
+import android.content.Context;
+import android.view.Display;
 public final class PresentationController {
     public static int created, closed;
+    public static int secondScreenKind;
+    public static int secondScreen(Context context, Display own) { return secondScreenKind; }
     public PresentationController(NativeActivity owner, DataSource source) {
         if (!NativeActivity.initialized) throw new AssertionError("controller constructed before native initialization");
         created++;
     }
+    public void ownerTopResumed(boolean top) {}
+    public void onDisplayChanged(int id) {}
     public void close() { closed++; }
 }''',
     'com/aure/totk/companion/Snapshot.java': '''package com.aure.totk.companion;
@@ -180,6 +220,7 @@ class CompanionGate(unittest.TestCase):
             'com/aure/totk/TextRules.java',
             'com/aure/totk/companion/CompanionNative.java',
             'com/aure/totk/companion/DataSource.java',
+            'com/aure/totk/companion/DisplayClass.java',
             'com/aure/totk/companion/ItemActions.java',
             'com/aure/totk/companion/SnapshotPoller.java',
         ))

@@ -16,7 +16,7 @@ from test_android_saves import save_set, tree
 
 ROOT = Path(__file__).resolve().parents[1]
 JAVA = ROOT / 'games/totk/android/java/com/aure/totk/setup'
-SOURCES = [JAVA / 'StoragePaths.java', JAVA / 'SaveManager.java', JAVA / 'Settings.java', JAVA / 'DataSize.java',
+SOURCES = [JAVA / 'StoragePaths.java', JAVA / 'SaveManager.java', JAVA / 'GameLock.java', JAVA / 'Settings.java', JAVA / 'DataSize.java',
            ROOT / 'games/totk/tests/storage/DirectAccessProbe.java']
 PKG = 'com.aure.totk'
 PRIVATE_FILES = f'/data/user/0/{PKG}/files'

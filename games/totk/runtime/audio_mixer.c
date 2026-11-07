@@ -46,12 +46,14 @@ typedef struct Mixer {
     AudioComponentInstance unit;
 #elif defined(__ANDROID__)
     AAudioStream *unit; _Atomic int lost;          /* lost: the device went away (headphones, Bluetooth); reopened by output_watch */
+    unsigned background;                         /* output worker: 0 playing, 1 pausing, 2 flushing, 3 empty */
 #endif
     int unit_ok, rate;
     float ring[RING_FRAMES * 2]; _Atomic uint64_t wr, rd, underruns, overruns;
     _Atomic int playing; int ready; _Atomic uint64_t missing_frames, trims, trimmed_frames;
     _Atomic uint64_t flush_until; _Atomic unsigned stop_epoch; unsigned callback_epoch;
     _Atomic uint64_t callback_frames,callback_nonzero;
+    unsigned lifecycle_epoch;                    /* callback-owned: discard pre-pause samples even after a quick resume */
     EffectState *effect; int *effect_order; unsigned effect_reported;
     uint64_t *sink_address; uint32_t *sink_size, *sink_offset, *sink_old, *sink_written;
     unsigned reported;                             /* one-time reports */
@@ -63,6 +65,15 @@ typedef struct Mixer {
 } Mixer;
 
 static _Atomic float device_volume = 1.0f;
+static _Atomic int output_paused;
+static _Atomic unsigned output_pause_epoch;
+/* NativeActivity's UI thread must never wait for an AAudio operation, the
+   renderer mutex or a stream being opened/closed by the device worker. */
+void runtime_audio_output_pause(int paused) {
+    if (atomic_exchange_explicit(&output_paused, paused, memory_order_acq_rel) != paused && paused)
+        atomic_fetch_add_explicit(&output_pause_epoch, 1, memory_order_release);
+}
+int audio_mixer_output_paused(void) { return atomic_load_explicit(&output_paused, memory_order_acquire); }
 static unsigned audio_revision(const AudioRenderer *r) { unsigned byte=r->revision>>24;return byte>='0'?byte-'0':0; }
 static void report_once(Mixer *m, unsigned bit, const char *msg, int value) {
     if (m->reported & (1u << bit)) return;
@@ -121,6 +132,13 @@ static int prefill_blocks(void) {   // read once before the device starts (audio
 /* The device's callback: `frames` interleaved stereo float frames from the ring (silence while not ready). */
 static void pull_frames(Mixer *m, float *out, uint32_t frames) {
     atomic_fetch_add(&m->callback_frames,frames);
+    unsigned lifecycle = atomic_load_explicit(&output_pause_epoch, memory_order_acquire);
+    if (m->lifecycle_epoch != lifecycle || audio_mixer_output_paused()) {
+        m->lifecycle_epoch = lifecycle; m->ready = 0;
+        atomic_store_explicit(&m->rd, atomic_load_explicit(&m->wr, memory_order_acquire), memory_order_release);
+        memset(out, 0, (size_t)frames * 2 * sizeof(float));
+        return;
+    }
     unsigned epoch=atomic_load_explicit(&m->stop_epoch,memory_order_acquire);
     uint64_t rd = atomic_load(&m->rd), wr = atomic_load_explicit(&m->wr, memory_order_acquire), have = wr - rd;
     if(epoch!=m->callback_epoch){uint64_t until=atomic_load_explicit(&m->flush_until,memory_order_acquire);if(until>rd){rd=until<wr?until:wr;atomic_store_explicit(&m->rd,rd,memory_order_release);}have=wr-rd;m->callback_epoch=epoch;m->ready=0;}
@@ -185,7 +203,7 @@ static aaudio_data_callback_result_t pull_aaudio(AAudioStream *s, void *ctx, voi
 }
 static void lost_aaudio(AAudioStream *s, void *ctx, aaudio_result_t error) { (void)s; (void)error; atomic_store(&((Mixer *)ctx)->lost, 1); }
 static void output_close(Mixer *m) { AAudioStream_requestStop(m->unit); AAudioStream_close(m->unit); m->unit = NULL; }
-static int output_restart(Mixer *m) { return AAudioStream_requestStart(m->unit) == AAUDIO_OK; }
+static int output_restart(Mixer *m) { return audio_mixer_output_paused() || AAudioStream_requestStart(m->unit) == AAUDIO_OK; }
 static void output_watch_start(void);
 static void output_open(Mixer *m, int rate) {
     if (getenv("TOTK_AUDIO_OFF")) { fprintf(stderr, "[totk-audio] TOTK_AUDIO_OFF: mixing without an audio device\n"); return; }
@@ -209,7 +227,8 @@ static void output_open(Mixer *m, int rate) {
     }
     /* Two bursts of buffer: low latency without crackle when the game thread is late by a frame. */
     AAudioStream_setBufferSizeInFrames(m->unit, 2 * AAudioStream_getFramesPerBurst(m->unit));
-    if (AAudioStream_requestStart(m->unit) != AAUDIO_OK) { fprintf(stderr, "[totk-audio] 【红】AAudio start failed: mixing without sound\n"); AAudioStream_close(m->unit); m->unit = NULL; return; }
+    m->background = audio_mixer_output_paused() ? 3u : 0u;
+    if (!m->background && AAudioStream_requestStart(m->unit) != AAUDIO_OK) { fprintf(stderr, "[totk-audio] 【红】AAudio start failed: mixing without sound\n"); AAudioStream_close(m->unit); m->unit = NULL; return; }
     atomic_store(&m->lost, 0);
     m->unit_ok = 1; fprintf(stderr, "[totk-audio] AAudio output %d Hz stereo, burst %d frames%s\n", rate, AAudioStream_getFramesPerBurst(m->unit),
                             AAudioStream_getPerformanceMode(m->unit) == AAUDIO_PERFORMANCE_MODE_LOW_LATENCY ? ", low latency" : "");
@@ -239,6 +258,38 @@ void runtime_audio_output_restart(int recreate) {
     pthread_mutex_unlock(&g_out_mu);
 }
 #if defined(__ANDROID__)
+/* Only this worker changes stream lifecycle. Pause then flush before restarting,
+   never requestStart while PAUSING/FLUSHING. The callback mutes immediately;
+   the renderer still signals its 5-ms event without advancing voices. */
+static void output_background(Mixer *m) {
+    int paused = audio_mixer_output_paused();
+    if (paused && !m->background) {
+        if (AAudioStream_requestPause(m->unit) != AAUDIO_OK) { atomic_store(&m->lost, 1); return; }
+        m->background = 1;
+    }
+    aaudio_stream_state_t state = AAudioStream_getState(m->unit);
+    /* Legacy callback streams need waitForStateChange to service their state
+       machine after the callback thread stops; getState alone can stay PAUSING
+       forever. This bounded wait is on the device worker, never the UI/renderer. */
+    if (state == AAUDIO_STREAM_STATE_PAUSING || state == AAUDIO_STREAM_STATE_FLUSHING) {
+        aaudio_result_t result = AAudioStream_waitForStateChange(m->unit, state, &state, 20000000);
+        if (result != AAUDIO_OK && result != AAUDIO_ERROR_TIMEOUT) { atomic_store(&m->lost, 1); return; }
+    }
+    if (m->background == 1 && state == AAUDIO_STREAM_STATE_PAUSED) {
+        if (AAudioStream_requestFlush(m->unit) != AAUDIO_OK) { atomic_store(&m->lost, 1); return; }
+        m->background = 2;
+    } else if (m->background == 2 && state == AAUDIO_STREAM_STATE_FLUSHED) {
+        m->background = 3;
+        fprintf(stderr, "[totk-audio] AAudio background stream paused and flushed\n");
+    }
+    if (!paused && m->background == 3) {
+        atomic_store_explicit(&m->flush_until, atomic_load_explicit(&m->wr, memory_order_acquire), memory_order_release);
+        atomic_fetch_add_explicit(&m->stop_epoch, 1, memory_order_release);
+        if (AAudioStream_requestStart(m->unit) != AAUDIO_OK) { atomic_store(&m->lost, 1); return; }
+        m->background = 0;
+        fprintf(stderr, "[totk-audio] AAudio foreground stream resumed with fresh prefill\n");
+    }
+}
 /* Reopen streams whose device went away (lost_aaudio), checked every 200 ms. */
 static void *output_watch(void *arg) {
     (void)arg;
@@ -247,7 +298,10 @@ static void *output_watch(void *arg) {
         struct timespec t = {0, 200000000}; nanosleep(&t, NULL);
         int lost = 0;
         pthread_mutex_lock(&g_out_mu);
-        for (int i = 0; i < 4; i++) if (g_out[i] && g_out[i]->unit_ok && atomic_load(&g_out[i]->lost)) lost = 1;
+        for (int i = 0; i < 4; i++) if (g_out[i] && g_out[i]->unit_ok) {
+            if (!atomic_load(&g_out[i]->lost)) output_background(g_out[i]);
+            if (atomic_load(&g_out[i]->lost)) lost = 1;
+        }
         pthread_mutex_unlock(&g_out_mu);
         if (lost) runtime_audio_output_restart(1);
     }
@@ -257,6 +311,7 @@ static void output_watch_spawn(void) { pthread_t t; if (!pthread_create(&t, NULL
 static void output_watch_start(void) { static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, output_watch_spawn); }
 #endif
 static void output_push(Mixer *m, const float *lr, int frames) {
+    if (audio_mixer_output_paused()) return;
     uint64_t wr = atomic_load(&m->wr), rd = atomic_load_explicit(&m->rd, memory_order_acquire);
     if (m->unit_ok && wr + (uint64_t)frames - rd > RING_FRAMES) { atomic_fetch_add(&m->overruns, 1); return; }   /* device stalled: drop this frame */
     for (int i = 0; i < frames; i++) { uint64_t k = (wr + (uint64_t)i) % RING_FRAMES; m->ring[2 * k] = lr[2 * i]; m->ring[2 * k + 1] = lr[2 * i + 1]; }

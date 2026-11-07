@@ -6,7 +6,7 @@
      totk-setup keys --keys prod.keys                       which needed keys exist (never their values)
      totk-setup identify GAME --keys K [--update]           NCA inventory and the selected Program NCA
      totk-setup exefs --update U --keys K --out D --work W [--libdir L]
-     totk-setup merge --base B --update U --keys K --out D --work W [--libdir L] [--part-bytes N]
+     totk-setup merge --base B --update U --keys K --out D --work W [--libdir L] [--part-bytes N] [--nobackup D]
      totk-setup romfs --part F [--part F ...] --out D [--part-bytes N] [--pins P]    D/romfs.bin or D/romfs.bin.000 ...
      totk-setup index --romfs F|D --out-index F --out-config F [--pins P]          one image file, or a folder with either layout
      totk-setup fonts --font F [--font F ...] --out-dir D --out-txt F
@@ -208,6 +208,7 @@ int main(int argc, char **argv) {
         SetupRequest *r = calloc(1, sizeof *r); SetupContainers *s = calloc(1, sizeof *s);
         int merge = !strcmp(cmd, "merge");
         if (!r || !s || !opt("out") || !opt("work")) { free(r); free(s); free(c); return usage(); }
+        if (merge) snprintf(c->nobackup, sizeof c->nobackup, "%s", opt("nobackup") ? opt("nobackup") : "");
         snprintf(c->keydir, sizeof c->keydir, "%s/import-keys", work);
         mkdir(c->keydir, 0700);
         if (!(rc = open_input(c, opt("update"), &r->update)) && !(rc = open_input(c, opt("keys"), &r->keys)) &&

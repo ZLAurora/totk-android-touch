@@ -163,6 +163,59 @@ preparation by actual context changes; it has no valid game camera and cannot
 prove <1ms on Thor. See `APP.md` for raw host measurements, reproduction and the
 exact operator-run generated-count/fence-cadence/latency/video acceptance plan.
 
+## Logical 32-lane subgroups (experimental)
+
+`TOTK_VK_SUBGROUP_FIX=1` reconciles translated Maxwell subgroup operations with
+the Vulkan device; default **off**, startup-only (device features and immutable
+modules/pipelines cannot be switched live). Restart both arms and check the
+`[nvn-vk] subgroup fix:` line plus each `subgroup shader` line for the actual size.
+
+The backend requires Vulkan 1.3, where `VK_EXT_subgroup_size_control` is core.
+It queries the native size, size-control range and required-size stages, enables
+`subgroupSizeControl` only for this experiment, and pins affected stages to 32
+when supported, otherwise 64 when supported. Geometry is never pinned.
+No `ALLOW_VARYING_SUBGROUP_SIZE` or `REQUIRE_FULL_SUBGROUPS` stage flags are used:
+unpinnable stages retain the reported fixed default. No pinning alone can fix
+32-lane code on a 64/128-lane device.
+
+The in-memory SPIR-V rewrite masks lane-id loads to 31, selects the current
+32-lane word from ballots (zeroing the other three words), rebases absolute
+shuffle targets to the physical lane's aligned 32-lane base, and lowers all/any
+to predicate/active ballots within that group. This preserves partial/divergent
+active masks rather than pretending that each invocation is a singleton.
+Only the translator's observed ballot/all/any/shuffle and lane-id/size builtins
+are accepted; other subgroup operations or a physical size outside 32/64/128
+refuse the module with a diagnostic, never silently run an incorrect fallback.
+Shaders without subgroup operations keep their original bytes and unpinned stages.
+Seed files and the seed/reflection format do not change.
+
+Run `android/inventory_subgroups.py <seed>/v143` on a loose seed to enumerate
+actual operations, shader keys, variant names, stages and content hashes (unused
+capabilities do not count; unused builtin declarations are separated from loads).
+Add `--romfs <verified-romfs> --modules <rewritten/v143>`
+for source-package names using the existing seed scanner. Output is local
+game-derived data, not a shader bundle to commit. Package names identify likely
+uses, not proof that a pass executes in any particular scene.
+
+Host census of the prepared 1.4.3 seed: **38/24,751 modules actually use subgroup
+operations**, across 30 raw keys (22 fragment, 11 vertex, 5 compute); one additional
+vertex variant only declares an unused lane builtin and is not rewritten.
+The operations are ballot (21 instructions), all (14), any (14), shuffle (8).
+The 11 vertex shaders come from the tree package; remaining uses come from
+system, application AGL, AGL common and gsys common packages. All 39 candidate
+modules validate after rewriting. The local optimized/overlay seed has 42 actual
+users/25,286 modules (the same 30 raw keys), plus the same unused declaration;
+all 43 candidate modules validate after rewriting. This is shader inventory and
+SPIR-V validation, not evidence of which shaders execute in a particular scene.
+
+`tests/test_vk_subgroup.py` assembles a ballot/shuffle/vote compute fixture,
+validates the rewritten module, executes its emitted instructions in a host
+wave32/64/128 oracle, and checks Vulkan SSBO outputs with lavapipe. A lavapipe
+device smaller than 32 only exercises partial active masks; it does not establish
+Adreno wave64/128 execution. `make ... vksubgrouptest` builds the standalone
+production-rewrite probe (`input.spv output.spv [gpu]`). Device acceptance is a
+restart visual A/B focused on the inventory's passes, not an FPS claim.
+
 ## Offline SPIR-V optimization experiment
 
 `android/optimize_shader_seed.py <seed>/v143 --output .scratch/seed-opt/v143`
@@ -489,6 +542,14 @@ The arena survives the **last game-submission fence**, not one ring slot: more t
 not recycle earlier descriptors. Fresh native capture supplies the base; `g_snap_seq` is its copied-update watermark,
 distinct from an update's Vulkan materialization fence. Full and partial overlays apply in sequence order even after
 chunk seals. No queued original-buffer update or writable lag guard is generated merely for a private UBO update.
+`TOTK_VK_PREPARE_MASK=1` (default unset = off) skips the per-draw pre-render preparation (`vk_lag_uniform_prepare`) of a
+consumed UBO register unless its bound range changed or an overlay/producer/mapping revision advanced since it was last
+prepared; selection, snapshots and guards are unchanged. `TOTK_VK_OFF=prepare` forces it off; `TOTK_VK_PREPARE_CHECK=1`
+runs every skipped preparation and dies on a missed materialization (correctness runs only). Startup logs the value;
+`[prepare-mask]` counts preparations and skips per 300 presents. Host `--lag-walk-bench 6` (lag on, two recorders, 7
+interleaved pairs): whole-walker ns/draw −3.2 % stable, −2.7 % churn, −5.5 % chunk stress (median per pair), 74 % fewer
+preparations; compare walker ms/frame on the Odin. Live (`totk.ctl`): the next draw takes it, and a change dirties
+every register.
 
 Real non-UBO reads/writes/copies, CPU steps/readback and completion-side consumers materialize the relevant updates
 in command order before original storage is consumed. Virtual aliases normalize to physical ownership. True GPU
@@ -525,6 +586,38 @@ start adds the whole GPU time to the frame. Measured standing in the Gerudo Dese
   Explicit positive thresholds and `0` (disable automatic chunking) win. At a render-pass start, after that many draws, recorded work goes to the GPU
   while the rest of the frame is recorded. The once-only `[totk-gfx] frame policy: FPS60=… FRAME_LAG=… CHUNK_DRAWS=…`
   startup line records resolved values. One submission per frame made the frame recording + GPU time.
+- **Early submit inside long passes** (`TOTK_VK_SPLIT_PASS_DRAWS=<n>`, default **0** = off): the chunk threshold is
+  only checked when a pass opens, so a pass of hundreds of draws starts on the GPU only after it is fully recorded.
+  With `n` set, the next draw after `n` draws in a still-open pass ends it, the reopen submits that part through the
+  same chunk path, and the same targets reopen with `loadOp=LOAD`. Refused (counted) for passes with a `DONT_CARE`
+  store, native/canvas UI, framegen extraction or pass diagnostics; nothing splits with chunking off (`CHUNK_DRAWS=0`).
+  **Cost:** each split stores and reloads every attachment on a tiler (GMEM), so it stays off. Try `512`, then `256`;
+  `[split-pass]` logs splits, extra passes, refused candidates, depth touches and LRZ refusals per 300 presents.
+  Compare p95/GPU-busy overlap, not just fps. Live (`totk.ctl`, APP.md *Live switches*): each pass (part) takes the
+  draw threshold when it opens. "Keep the GPU busy" enables `512`, defaulting on only for Snapdragon 8 Elite-class chips.
+- **LRZ-safe splits** (`TOTK_VK_SPLIT_LRZ_SAFE=1`, default **on**, inert when pass splitting is off):
+  live at the next split/depth-pass boundary; `0` restores the unsafe control. Color+depth scene passes keep their cuts,
+  but depth LOAD after a command-buffer epoch change gets an exact one-texel GPU transfer write-back before rendering.
+  Depth-only/masked regions defer cuts; unsupported/MSAA depth refuses further cuts in that game submission.
+  A/B with splitting fixed at `512`: count isolated luminance dips in 600 recorded frames, plus fps/GPU ms and touches.
+- **Attachment load elision** (`TOTK_VK_LOAD_ELIDE=1`, default **0**): at the next pass open, certify a straight-line
+  SPIR-V `vec4(position.xy,0,1)` and an unconditional fragment output, then prove full-area triangle/quad coverage
+  from ordered vertex bytes. Blending, masks, depth/stencil tests, feedback, unknown shaders or GPU-only vertices retain
+  `LOAD`. `[load-elide]` counts proven/elided passes per 300 presents; compare GPU ms on identical scenes and pixels.
+- **Narrow feedback splits** (`TOTK_VK_FEEDBACK_NARROW=1`, default **0**, live at the next pass open): defer only
+  texture-only invalidations while sampled attachments remain unwritten. Earlier writes, current writes, later writes
+  to previously sampled attachments, storage, aliases and unknown descriptors retain the split; the full end-of-pass
+  barrier drains deferred invalidations before dependent reads. `[feedback-narrow]` counts net avoided ends per 300 presents.
+- **NVN alpha rejection** (`TOTK_VK_ALPHA_TEST=1`, default **0**, live at the next draw): select a fragment variant
+  for the NVN comparison and an immutable 16-byte reference uniform (reused by reference bits per submission).
+  Alpha rejection runs after the shader and suppresses color/depth/stencil writes; alpha variants use late tests.
+  `[alpha-test]` reports enabled and ignored draws every 300 presents **even while off**. Compare cutout/menu pixels,
+  not fps; `vkrectest --alpha-clear` checks all comparisons with a checkerboard and inline/worker recording.
+- **Pending clear before read** (`TOTK_VK_CLEAR_ON_READ=1`, default **0**, live at the next texture read): when a
+  sampled/storage image overlaps a pending attachment clear, materialize the load-clear and end its pass before
+  returning the read view, including descriptor-cache hits and storage aliases. Do not cancel the NVN write.
+  `[clear-on-read] forced=N reason=first-read` counts resolutions per 300 presents. Compare menu backdrops;
+  `vkrectest --alpha-clear` checks read-before-attach ordering with both live arms and aliases.
 - **The uniform-update log** drops entries a newer update covers entirely (the game rewrites the same constant blocks
   many times a frame), and `ub_prune` returns at once unless a submission finished. `ub_overlaps` had been a quarter of
   the render thread.
@@ -893,6 +986,22 @@ if still queued, or joins its one in-flight builder. It never races a second bui
 an existing handle. The bound trades one possible hitch for prolonged missing geometry; it is not a wall-time bound.
 Use **2** as the aggressive area-load/loading-map diagnostic, versus 90 and disabled, before selecting a lower default.
 Offscreen color captures still build/wait immediately, even if their key was first queued by a screen pass.
+
+`TOTK_VK_PIPE_BOOST=1` (default unset = off) lends priority to a joined build: when a recording thread waits in
+such a join (or a dispatch joins the compute worker), the worker building that entry runs at the waiter's nice
+until it publishes, then returns to +10. Every 300 presents `pipeline joins: N waits on worker builds ... in X ms;
+boosts B, refused R` reports both arms; compare the join ms and the frames over 50 ms. `refused` counts kernel
+refusals (no `RLIMIT_NICE` headroom), logged once as `pipe boost: ... refused`. Live (`totk.ctl`): the next join reads
+the new value; a loan already made is still restored by the worker.
+
+`TOTK_VK_UNWRITTEN_MASK=1` (default unset = off) builds `colorWriteMask` 0 for every colour attachment whose location
+the fragment shader does not output (`fout` in the seed, array outputs spanning their locations). NVN/Maxwell leaves
+such a bound target untouched; Vulkan leaves it undefined and Adreno writes black, and the write also costs bandwidth.
+The mask follows the key's fragment shader, so pipeline keys and PSO lists are shared by both arms. Every 300 presents
+`unwritten colour attachments: P new pipelines masked A attachments` (switch on); compare GPU ms and look for black or
+stale targets. Live (`totk.ctl`): only pipelines and output libraries built after the change follow it; pipelines
+already built keep their masks, because the key does not carry the switch (PSO lists stay shared). Every fragment
+shader keeps its SPIR-V output span (`fout_span`) so an array output is never masked when the switch turns on live.
 
 Build errors are no longer permanent silent skips. Each failed key logs its identity, shader variants and Vulkan
 result once, then retries synchronously after a failure is observed: one subsequent game submission for the first
@@ -1327,10 +1436,220 @@ measurements, the ownership contract is:
   and secondary [WriteTimestamp2](https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdWriteTimestamp2.html).
   The saved Thor probe and current device extension setup do not enumerate/enable maintenance7 or nested-command-buffer
   support; their availability is not inferred and the recorder does not depend on either extension.
-- **Diagnostics:** occlusion queries, pass dumps, pass profiling (including `TOTK_VK_GPU_PROFILE=1/2`),
-  `TOTK_VK_PASS_MERGE=1` and pass probes force the original single-thread path with a diagnostic log.
-  CPU split profiling continues to measure the walking thread; worker busy time and waits are reported
-  separately, not spuriously added into its exclusive categories.
+- **Diagnostics:** occlusion queries, pass dumps, `TOTK_VK_PASS_PROFILE`, `TOTK_VK_PASS_MERGE=1`
+  and pass probes force the original single-thread path with a diagnostic log. `TOTK_VK_GPU_PROFILE`
+  (default off) retains recorder workers and asynchronous assembly. Full mode
+  (`TOTK_VK_GPU_PROFILE_SAMPLE` absent/`0`) brackets every rendering pass part on its original primary,
+  from before BeginRendering to after EndRendering. All secondary chunks contribute to that one exact
+  bracket, not separately timed chunk approximations; an explicit pass split creates another pass part.
+  Sampled mode uses the same bracket only on selected parts. Empty passes and `REC_THREADS=0` use
+  the same timing authority when selected. Optional pipeline statistics use
+  independent begin/end queries inside each secondary and sum into the pass; no primary statistics query remains
+  active across ExecuteCommands, so recorder profiling does not require `inheritedQueries`. Inline passes keep
+  their primary statistics query. The walker allocates chunk queries before queueing, and the assembler uses
+  captured end handles/indices without consulting or waiting for the walking profiler.
+  Keep profiler mode fixed for worker-count A/Bs; CPU split profiling still measures only the walking thread,
+  with worker busy time and waits reported separately rather than added into its exclusive categories.
+- **Profiler CPU budget:** draw/pass hooks are O(1) in the number of draws, bound resources and
+  earlier passes: first draw hashes at most six bounded shader keys, later draws only increment
+  the counter, and pass begin captures at most ten attachments. There are no binding/registry scans,
+  prior-pass read searches, audit arrays/candidate checks, allocations or logs in these hooks.
+  The old speculative `LOAD-before-full-clear` / `STORE-no-later-observed-read` audit is removed,
+  not hidden behind sampling; static attachment operations and logical byte summaries remain,
+  computed from pass keys off the walker. Nested timing scopes preserve only their timing parent,
+  command buffer and secondary-query state.
+  With profiling unset/off, secondary pass closes do not initialize/copy an end token and chunks
+  never store/read profiler query metadata. `rec_job`/`rec_pass` retain their non-profiler sizes
+  and member offsets: only enabled runs allocate enclosing cold metadata tails. The parked-pass
+  close keeps its original one-argument ordinary entry; the enabled token copy has a separate
+  profiled entry selected by the draw-side guard, not a token-preserving wrapper around ordinary work.
+  Cached `vk_gpuprof_on` guards remain predictable branches, not a claim of zero instructions.
+  One opt-in startup preparation creates sixteen query-slot leases on the dedicated `totk-gpuprof`
+  worker; startup may wait for readiness once. Thereafter the walker takes a prepared lease with
+  a short private O(1) mutex operation, without query resets, result reads, formatting or I/O.
+  Existing fence completion only detaches/enqueues the fenced lease and releases the game ring slot.
+  The profiler worker alone reads results without WAIT or polling, aggregates, formats, writes/logs,
+  resets queries and returns prepared leases. The bounded sixteen-lease FIFO never blocks the game
+  for output: no available lease means dropped profiler coverage, recorded by cumulative
+  `background_dropped_slots` and missing frame coverage. Its mutex is not the recorder-worker mutex.
+  CPU frame closure has its own bounded 256-entry FIFO under the same private background mutex:
+  `{frame, end_sequence}` is published at CPU present, independently of whether a command buffer
+  is still open. Every sealed submission, including one without a profiler lease, has an ordered
+  sequence; canceled, never-submitted leases do not advance it. The worker finalizes a ready closure
+  only after processing fenced leases through its end sequence, including closures arriving after
+  those leases were already consumed. Overflow increments cumulative `background_dropped_closures`;
+  the analyzer takes a per-launch maximum, warns and censors coverage, rather than hiding the loss.
+  The cumulative drop count is a per-launch maximum in analysis, not a sum of successive windows;
+  coverage stays explicitly censored rather than pretending skipped metadata was observed.
+  Worker placement reuses the seed/cache-writer policy: nice 10, the lowest clearly separated
+  inherited CPU-capacity tier when available, never widening the inherited affinity mask.
+  Actual placement and errors are logged once. Orderly close first stops new renderer-work admission
+  and flushes/drains renderer GPU work, then drains the profiler reporter before closing its writer.
+- **Profiler coverage:** named `upload`, `transfer`, `post`, `upscale`, `present` and `framegen` scopes
+  cover backend-owned Vulkan commands; game compute dispatches retain their own records. In full mode,
+  slot envelopes start in pre (when present), include adopted immutable framegen primaries and every main
+  primary, and reconcile each frame's pass sum against its first-to-last GPU timestamp span. Sampled mode
+  instead has one whole-main-frame pair, excluding pre/slot envelopes, plus selected pass pairs.
+  JSONL `gap_ms` is the signed residual, not profiler overhead. In sampled mode it includes intentionally
+  untimed passes, but sampled pre work/overlap may make it negative; it is not total untimed work.
+  A frame boundary can split a still-open slot without forcing a submission; its GPU marker remains
+  supported. Android can instead seal/submit the final slot before CPU present. In full mode the
+  ordered CPU closure uses that slot's real envelope end, with **no extra GPU timestamp or submit**;
+  it does not need another frame to wake finalization. Frame rows expose `closure_source`
+  (`cpu-sealed`, `gpu-marker` or `missing-closure`) and `closure_sequence`; missing closure remains
+  invalid. Cross-frame pre uploads can execute before their recording frame's main work; such overlap
+  is surfaced by `reconciliation_failed`, never clamped away. External GL/QCOM/LSFG execution,
+  compositor work and scanout are outside Vulkan timestamp authority. Profiling requires
+  graphics/compute timestamps and hostQueryReset; query pools are host-reset only after their
+  existing slot fence, before either pre or main can use them.
+- **Profiler size identity (schema 3):** exact keys retain absolute renderArea/attachment dimensions for
+  driver-area joins. Each completed frame reports its largest depth+multi-color scene extent; pass attachment
+  fractions use that common reference, with the game resolution as an explicit no-scene fallback, not the pass area.
+  Analyzer families merge scene-relative MRTs and scene-sized depth prepasses through DRS; fixed depth targets
+  keep absolute families. Window rows preserve separate reference variants of the same absolute key.
+- **Compact profiler windows:** `TOTK_VK_GPU_PROFILE_ORDINALS=0` (default; only exact `1` enables it)
+  aggregates across frame ordinals by exact key + reference dimensions + `scene_relative`; ordinal `0`
+  is the all-ordinals sentinel, not a pass position. `=1` restores positive-ordinal window rows.
+  `[gpu-profile] window ordinals=0/1` proves the launch policy. Mode-2 raw split logs and mode-3
+  selected `long_frame` rows retain actual positive ordinals in either setting. Times, counts, absolute
+  areas and explicitly statistics-matched draws/time are still sums, not averages or synthetic zeros.
+- **Sampled profiler:** `TOTK_VK_GPU_PROFILE_SAMPLE=0` (including unset) leaves full profiling unchanged.
+  A strict integer `1`–`16` enables a per-frame budget `k`; start with **`GPU_PROFILE=1 SAMPLE=2 STATS=0`**
+  using the full `TOTK_VK_GPU_PROFILE_*` environment names. Selection rotates contiguous frame ordinals
+  deterministically using the preceding frame's observed pass count. Every observed key, draw count,
+  absolute area, scene reference and scene role remains available, including passes with zero samples.
+  Only selected passes get timestamp/statistics queries. Rotation is not random sampling: periodic key
+  churn or a short route can under-cover a key, so inspect coverage rather than assuming representativeness.
+  Each frame emits actual profiler-owned `vkCmdWriteTimestamp2` command `timestamp_count`, including
+  deferred ends after assembly, not the game's independent timestamp reports. It is at least the two
+  whole-main-frame endpoints and at most **`2k+2`**. There are no additional pre/slot timestamp pairs.
+  The whole pair uses completion-accurate `ALL_COMMANDS`, spanning main submissions through present.
+  When CPU present finds no open command buffer, SAMPLE must issue **one small marker-only main
+  submission** for the real end timestamp (the start was written earlier). This is an explicit extra
+  submission cost, not a per-slot end or CPU-time fallback; it keeps the **`2k+2`** write bound.
+  With an open command buffer the existing in-buffer end marker is used. The full-mode closure path
+  above adds neither a query nor a submission.
+  Frame/window `measured_ms` and pass `gpu_ms` sum valid sampled durations only; `gap_ms` is the residual.
+  `sampling` retains observed/sample counts, distinct observed/sampled frame counts and a 272-bin histogram;
+  `stats_valid` cannot exceed sampled count. No total is extrapolated to untimed observations.
+  Analyzer tables aggregate the whole input/measured interval by default; `--per-window` adds a diagnostic
+  window breakdown. Means divide sampled duration by sampled count. p50/p90/p99 are merged-histogram
+  **bucket upper bounds**, with eighth-octave spacing (at most about 9.1% quantization above 1 ns);
+  zero and sub-nanosecond durations occupy the first bucket. Thin coverage warns below 10 sampled frames
+  across the interval, not merely because a 300-frame window has three samples. There is no fixed
+  percentage gate: 15–30 samples/ordinal in 48 seconds can be useful even near 1% frame coverage.
+  Coverage fractions remain visible. Below 100 samples, p99 is flagged descriptive-only, not a reliable
+  stutter-tail estimate; histogram precision does not establish statistical confidence.
+  Overlapping family frame populations expose bounds rather than fabricated exact unions. A missing key
+  observation in a censored capture is not a zero-cost pass.
+- **Profiler capture lifecycle:** the default is 128 MiB per JSONL file × four files; compact windows
+  target a 6–8-minute pan without rotation, not a guaranteed duration for arbitrary pass counts/raw modes.
+  Each rotation repeats a schema-3 header with launch ID, APK `assets/build.txt` commit, package/versionCode
+  when available, whitelisted launch environment, effective profiling switches and Vulkan driver identity.
+  Exact APK/driver hashes must be joined from the capture artifacts; they are not invented in process.
+  Monotonic window sequences and rotation indices let the analyzer flag complete missing windows and
+  retention eviction. Orderly Android close/destruction stops new renderer-work admission, flushes/drains
+  renderer GPU work (including submissions still in flight at shutdown entry), then drains/joins the
+  profiler reporter and writes `session_end` under the writer lock. `clean_end` reports successful writer
+  closure independently of retirement. New footers always carry boolean `all_queries_retired` and
+  `query_retirement`: nonnegative integer `leases_acquired`, `leases_submitted`, `leases_retired`,
+  `leases_cancelled`, `leases_outstanding`, `queries_submitted`, `queries_retired`, `queries_cancelled`
+  and `queries_outstanding`. Acquired leases equal retired + cancelled + outstanding; submitted leases
+  include retired leases and exclude cancelled ones. Outstanding queries equal submitted minus retired;
+  `all_queries_retired` is true iff both outstanding counts are zero. Retired leases have fenced results
+  read/attempted; retired queries require available results (successful statistics reads), so unavailable
+  queries can remain outstanding even after every lease was processed. Counts cover activated timestamp/
+  statistics query instances, not pool capacity or the six statistics counter values. Cancelled counts
+  describe activated queries/leases in abandoned, never-submitted recordings, not submitted work.
+  Historical footers without `query_retirement` retain nullable `all_queries_retired: null` as unknown.
+  Force-stop/crash/kill normally has no footer; the analyzer reports missing closure, not a fabricated
+  end marker or GPU failure. The footer also retains `pending_frame_closures`; zero pending CPU closures
+  alone does not establish query retirement. The additive header `background_closures: 256` records the
+  closure FIFO capacity, independently of the sixteen query leases.
+  Enabled GPU draining has one two-second budget. On expiry, `query_drain_timed_out: true` accompanies
+  the retirement accounting; uncompleted leases and unread queries remain outstanding rather than
+  being fabricated as retired. The additive timeout field is boolean when present; old footers without
+  it remain unknown in analysis. Profiling-off shutdown is a no-op and does not flush or wait for GPU work.
+  The explicit host option `gpuprof.py --frame-close-replay` adds conditional results only for
+  header-attributed d003f2d full-mode captures with complete contiguous windows, zero loss/failure
+  counters, available valid raw GPU endpoints/domain, bounded recomputed intervals, nonnegative gaps
+  and consistent frame/pass/window sums. Original invalid rows and ordinary totals remain untouched.
+  Missing authority stays unknown/rejected; this cannot establish device correction or performance.
+  The old host fixture kept a command buffer open at present and exercised the GPU-marker path,
+  missing Android's sealed-then-present ordering. The new host scenario covers both already-consumed
+  and not-yet-fenced submissions and an isolated final CPU closure, not new Android evidence.
+  Each GPU-blocked close also acquires/cancels a profiler lease on a real independent, never-submitted
+  command buffer, and requires the exact cancellation count in the footer. It does not assume
+  optional renderer admission succeeds: that API deliberately uses a nonblocking mutex trylock
+  and may reject submit/completion contention even with free slots. The separate `--cancel` case
+  retains optional-slot cancellation integration coverage.
+  The host `--shutdown-inflight` scenario enters shutdown with a verifiably unsignalled real GPU fence
+  and no prior profiler flush; its modes 1/3 × workers 0/2 × stats 0/1 × SAMPLE 0/2 matrix requires
+  complete frame output and zero outstanding lease/query counts after shutdown, not merely writer closure.
+  Profiling-off runs require that same pending work to remain undrained by the shutdown no-op.
+  `--shutdown-timeout` holds the real event beyond the two-second drain budget; workers 0/2 and SAMPLE
+  0/2 require a clean writer end with timeout=true, false retirement and positive outstanding counts.
+- **Invalid span authority:** timestamp reads request 64-bit values **and availability**, without WAIT;
+  an unavailable endpoint is never a zero-duration sample or silently replaced by a later endpoint.
+  Each retired slot captures its immutable device, queue, queue family, `timestampValidBits` and period.
+  Both endpoints and cross-slot adjacency must have the same domain. The renderer uses queue index zero
+  of its one graphics+compute family (`V.queue`) for pre/main/framegen command buffers; worker secondaries
+  inherit that submission, not a separate worker queue. Device/queue/domain changes invalidate a span.
+  Counters are masked to the family's valid bits before modular subtraction; a genuine short counter wrap
+  is accepted and counted. Modular arithmetic alone cannot distinguish a wrap from a backwards/stale
+  endpoint: every individual interval and whole frame must also be at most 10,000 ms.
+  This bound is a conservative corruption guard, **not** proof that available values have no driver fault.
+  Thor's 48-bit/52.0833320618-ns counter wraps after roughly 169.7 days; the old huge positive spans
+  were backwards endpoints misread as that wrap. Old files lack ticks/availability, so their original
+  driver/query failure cannot be reconstructed.
+  Frame/window `span_valid=false` makes `span_ms`/`gap_ms` null, with per-window unavailable/invalid
+  timestamp and invalid-span counts plus raw forensic endpoint fields retained. A valid span requires
+  every contributing endpoint/interval and complete records. Full mode also requires nonnegative
+  reconciliation within timestamp quantization tolerance; sampled negative residuals alone do not
+  invalidate main-frame authority. Windows retain `valid_span_ms`/`span_frames` separately if any frame is invalid.
+  The analyzer also rejects implausibly huge older positive spans despite an old success flag.
+  Explicit `--legacy-span-replay` accepts schema-2 frame/window timing only; it cannot recover missing
+  query availability or reinterpret old pass-area semantics. No mobile overhead benefit is claimed.
+- **Odin attribution correction (2026-11-05):** the fixed-order Hateno report
+  `.scratch/bench/rpmode/odin-overhead/report.md` for APK `716c122ff09b` has timestamps-only P1
+  at **21.55 fps / 43.750 ms recording / 36.6% GPU busy**, versus C0 at
+  **57.96 fps / 10.789 ms recording / 80.2% GPU busy**. Recording adds **32.961 ms/frame**,
+  and the GPU spends 91.12% of its clock residence at 660 MHz. These CPU observations and reduced
+  GPU feeding supersede the earlier GPU-dominant explanation of this collapse. Stats P2 adds only
+  0.55 ms recording and -0.15 fps versus P1 (inside the 0.51-fps control bracket); its independent
+  FPS cost is unresolved. Different timestamp/NVN GPU scopes, cache/compile contexts and fixed order
+  prevent a measured mechanism-by-mechanism split.
+  Before cutover, `vk_gpuprof_draw` scanned up to 2×160 texture/storage-image bindings per graphics
+  draw even on unselected passes; each live handle called `vk_treg_get` (`vk_res.c`), which took
+  `g_reg_mu` and copied a registry entry. `vk_gpuprof_read` then searched all earlier pass audit
+  records, while pass end appended/reallocated audit storage and present scanned/logged candidates.
+  This source identifies nonconstant CPU work, not a measurement that the audit alone cost 32.961 ms.
+  The removed liveness audit could not prove safe discards across frames/raw-memory consumers anyway.
+  Host CPU benchmarks and a new matched device A/B are separate acceptance evidence; this change
+  does not claim measured mobile recovery.
+- **Profiler cost is not passive:** in the inspected Turnip source
+  (`turnip/wt-rpmode/mesa/src/freedreno/vulkan/tu_query_pool.cc:2100–2144`), every
+  `ALL_COMMANDS` timestamp issues a WFI before reading the always-on counter; its comment explicitly
+  calls out CP stalling. Full profiling adds two such timestamps per timed pass/scope plus frame/slot
+  boundaries. Sampled mode reduces this to at most `2k+2` writes/frame; it does not make the remaining
+  writes free. Modes 2/3 do not reduce the selected query cost: mode 2 adds raw CPU logs, and mode 3 adds
+  history memory/output for selected long frames, retaining untimed pass metadata as well.
+  Statistics add query start/stop barriers per secondary chunk (or inline primary) of selected passes,
+  not merely once per aggregate pass. Turnip's `emit_begin_stat_query`/`emit_end_stat_query`
+  (`tu_query_pool.cc:1157–1222,1674–1733`) start/stop counters, WFI, snapshot all statistic registers,
+  then subtract/accumulate results with memory-write waits. In a tiled pass that draw stream can execute
+  repeatedly. Vertex-stage statistics explicitly disable concurrent binning for GMEM passes
+  (`tu_cmd_buffer.cc:3479–3486`); secondary draw streams replay per tile (`:3817,6524`).
+  These are real GPU instrumentation costs, not evidence that they dominate the observed Odin
+  FPS loss. Host query resets are CPU memory writes; retired result reads use no WAIT flag
+  (`tu_query_pool.cc:678–789,1075–1086`), so they do not intentionally add a new queue/fence wait.
+  Removing the CPU audit and moving reporting off the critical path does not remove these GPU barriers.
+  Always isolate profile-off, sampled timestamps-only, sampled statistics, then full profiling under
+  identical driver/TU_DEBUG settings. Sampled duration representativeness is conditional on the remaining
+  instrumentation **not serializing or otherwise changing GPU execution**; statistics still perturb the
+  passes actually sampled. Device A/Bs must compare GPU clock **time-in-state deltas over equal intervals**
+  with an unprofiled control, alongside fps, power, temperatures and thermal history. A single MHz reading
+  is not equivalent. Do not interpret any instrumented span as uninstrumented game performance.
 
 Pipeline handle selection deliberately remains on the walking thread in this cutover. `pipe_get`'s cold asynchronous
 misses skip draws; emitted draws immediately update cumulative synthetic samples, used by later reports and conditions.
@@ -1353,11 +1672,90 @@ is on and native VMA pressure is absent, otherwise 75; an explicit setting inclu
 `TOTK_VK_COMPILE_THREADS` (pipeline compiler workers, unchanged default 2). Worker creation failure reduces the count
 to the workers actually started, with zero retaining the original path.
 
+**Worker wakes** (`TOTK_VK_REC_WAKE_BATCH`, default **0** = off): every queued chunk batch signals a parked worker,
+and the walker pays the futex wake (T7: 0.6 ms/frame Odin, 1.0 Duo; the default also signals workers already woken).
+`1` signals from the walker only when no worker is already on its way to the queue; a worker that takes a batch and
+leaves more queued wakes the next parked worker. `n ≥ 2` also lets an idle worker poll the queue for up to `n` µs
+before it parks, so steady chunk streams need no wake (CPU spent polling; try 50/200 against 0). `recorder
+wakes/frame` (every 300 presents) counts walker and worker signals, polled hits and parks. Live at the next enqueue;
+`vkrectest` compares bytes with 1 and 200 at 2/3 workers, and `--lag-walk-bench` prints wakes per case.
+
 Every 300 presents, `recorder frame ...` reports per-present walking elapsed time excluding GPU and worker waits,
 each of four possible workers' busy elapsed time (unused entries zero), worker wait time, and parallel/inline chunk
 and pass counts. Worker busy includes preemption and Vulkan calls, not thread CPU time. `TOTK_VK_REC_PROFILE`
 remains exclusive walking-thread accounting: moved work is reported by the recorder busy fields, not its P buckets;
 its original Amdahl estimate is meaningful only with recording threads disabled.
+
+Every 300 presents, with or without recorder workers, the backend also logs
+`descriptors frame <n>, per-frame: sets … allocate-calls … pool-resets … walker-ns … list-ns … lists … template-ns … templates …`.
+`sets` are successful driver set allocations, `allocate-calls` every `vkAllocateDescriptorSets` attempt (pool-full
+retries included) and `pool-resets` actual `vkResetDescriptorPool` calls, summed over recorder workers (published once
+per job) and the primary slot owner (immediate graphics, compute, post, presentation). The three `-ns` columns are
+elapsed time and stay 0 unless `TOTK_VK_REC_PROFILE=1` or frame tracing enables timing; `walker-ns` includes the list
+and template times. `vkdrawtest --lag-walk-bench` prints the same counts per measured frame, and the driver-level
+`vkAllocateDescriptorSets`/`vkResetDescriptorPool` counts when `TOTK_VK_TEST_CALL_COUNTS=<file>` is set.
+The same line ends with what is retained, in both arms of `TOTK_VK_DESC_STOCK`:
+`retained: pools N (recorder R, primary P) ~M MiB, stock sets S`. N counts the descriptor pools that exist (a pool is
+never destroyed by the default policy, only reset, so N is each owner's peak); M is N times one pool's approximate
+driver memory, with every declared descriptor at 64 bytes, a combined image sampler at 128 and a sampler at 16 (about
+7.4 MiB a pool; a driver that reserves a pool's descriptors when it creates it keeps them until the pool is destroyed);
+S is the sets held in the stocks. Compare M with the kgsl / `memory` sampler figure of the same window.
+
+Every recorder context (1,024 sets) and primary slot (4,096 sets) makes its descriptor pools from one shape
+(`vk_desc_pool_sizes`): combined image samplers and uniform buffers 32,768, sampled images and storage buffers 8,192,
+samplers 8,192 (raised from 4,096, which was one per set in a primary pool, so a layout with two separate samplers
+filled it at half its sets), storage images and uniform texel buffers 2,048, storage texel buffers 1,024. These are every
+type a backend layout uses; input attachments and the `*_DYNAMIC` types are used by none and are not declared, since
+each declared descriptor is driver memory reserved in every pool. A type no pool declares has zero capacity and would
+fail even a fresh pool (DIE); shader loading now refuses such a layout, or one larger than a pool, with
+`descriptor set layout of <shader>: ...` (`vkdrawtest --descriptor-stock` checks both and allocates every type).
+
+`TOTK_VK_DESC_STOCK=1` (default **off**; logs `descriptor stock: on/off`) keeps each recorder context's and primary
+slot's descriptor sets per exact layout (batches 1, 1, 2, 4 … 32) and reissues them, always rewritten, only after that
+slot's own retirement, where every pool used to be reset; pools reset only after 32 generations under quarter use.
+Measure with `descriptors frame`: warm `allocate-calls`/`pool-resets` drop to about 0. Host `--lag-walk-bench 32`, frames
+16–31, allocate calls/resets per frame: threaded stable 263.88/2 → 0.06/0, churn 906.56/2 → 0.25/0; synchronous 70/1
+and 140/1 → 0/0. Live (`totk.ctl`): each recorder context and primary slot switches at its next slot generation,
+where it used to reset its pools; switched off, it frees its stock and destroys its pools, returning the retained sets'
+memory (the off policy grows pools again as needed). `descriptor stock: on/off (live; ...)` logs the change once.
+
+`TOTK_VK_DESC_STOCK_MAX_SETS=N` (default unset = no ceiling, today's stock; logs `descriptor stock ceiling: N sets
+per owner ...` or `descriptor stock ceiling: none`) is a hard per-owner ceiling for the stock arm: an owner's stock
+never holds more than N sets, a checkout past N is allocated outside the stock, and at the handoff an owner that
+needed more (set limit) or holds more than ⌈N / pool sets⌉ + 1 pools (pool limit: 1,024-set recorder and 4,096-set
+primary pools) resets its pools and destroys those past the limit, so the arm falls back to reset-and-allocate and
+never keeps more than that. The descriptors line adds `stock sets S (ceiling N/owner)` and `stock resets
+off/pressure/set-limit/pool-limit a/b/c/d pools-destroyed e` per frame: steady `set-limit` or `pools-destroyed`
+above 0 means N is below the scene's demand (each such generation allocates as the off arm does, and pool churn costs a
+pool create per destroy). Live (`totk.ctl`, 0…1048576, 0 = none) at the same generation handoff; a lower value applies
+there at once. Host `--lag-walk-bench 32` (REC_THREADS=2, FRAME_LAG=1, stock on): stock sets 8,000 → 859 at N=128,
+pools 16 in both. `vkdrawtest --descriptor-stock` checks the set limit, reuse under it, live lowering, the pool limit
+and live off on one recorder context, and the primary slots' fallback below the ceiling.
+
+Why a live switch-off (or a ceiling reset) may destroy pools there: `vkDestroyDescriptorPool` and the default policy's
+`vkResetDescriptorPool` need the same thing, that no pending command buffer uses a set of the pool, and both happen at
+the same point. A primary slot reaches `slot_open` only with `busy` (its fence observed by the completion thread),
+`submit_busy` (the async submit owner) clear and no replay pin (`replay_until`: frame-generation owner leases and
+external split continuations, released only once `g_done` reaches the covering ticket); a cancelled optional
+pre-submit never reached the GPU. A recorder context recycles at its first job of the slot's next incarnation, which is
+dispatched only after that open; its secondary leases have returned (`DIE` otherwise) and contexts belong to one slot.
+Frame-generation UI replay re-binds sets of the frame being sealed, and extraction refuses split submissions.
+`vkdrawtest --descriptor-stock-live` toggles `TOTK_VK_DESC_STOCK` and its ceiling through the live channel every three
+frames over 240 frames of 64 draws (each its own UBO, tile and set) with six frames in flight, checks every frame's
+pixels, and counts, at each reset or destroy by either owner, whether the slot's previous ticket had retired (the
+primary one also checks the submit owner and replay pins); `vkreplaypintest` stages a toggle with every churn
+submission while pinned slots are skipped. Both pass at 0/2/3 recorder workers, stock launched off and on, plain and
+under ThreadSanitizer (`LP_NUM_THREADS=0`, no suppressions) with zero violations; no Khronos validation layer is
+installed on the host.
+
+`TOTK_VK_STAGING_RETAIN_MB=N` (default unset = no cap; logs `staging retention: N MiB per slot` or `staging retention:
+no cap`) caps what each of the 8 slot arenas keeps after its reset. Texture-upload staging comes from the slot arena,
+and a reset keeps what the submission needed (compacted into one high-water chunk), so an upload burst stays allocated
+in that slot for the session; with N (8…4096) a slot keeps whole chunks up to N MiB and clips the high-water hint to N,
+and a later submission that needs more allocates it again. Live (`totk.ctl`) at each slot open, after its fence. The
+per-300 `memory staging retention: cap N MiB per slot, trims T, M MiB not retained` line counts it; compare
+`memory recording: slot/... arenas retained`. Host `vktest --staging-retain` (a 45 MiB burst, then 16 quiet
+submissions): the slot arenas keep 101 MiB uncapped, 72 MiB with N=16 (the burst slot 45 → 16 MiB).
 
 `recorder overhead ...` additionally separates synchronous secondary recording, batched ExecuteCommands, walking
 and worker pool-reset time, and job setup. Reset is a subset of inline/worker busy time, not another additive cost.
@@ -1594,7 +1992,7 @@ are unique. Existing pipeline/dynamic guards already removed redundant calls, so
 All 0/2/3 baseline-vs-revised output files compare identically. Normal and TSan identity matrices pass at default,
 chunk 1, inline/chunk 512, leading chunks disabled, profile disabled, and linear-span/dedup/dynamic diagnostics off.
 The test-only API wrappers also run clean under TSan with recorder workers enabled. Direct
-`REC_THREADS=2 GPU_PROFILE=2` execution logs forced inline recording and passes the draw fixture.
+`REC_THREADS=2 GPU_PROFILE=2` execution in that pre-v2 test logged forced inline recording and passed the draw fixture; the v2 profiler above now retains workers.
 
 Inspected Mesa source anchors (relative to `src/`): `vulkan/runtime/vk_command_pool.c:141` (pool walk),
 `vulkan/runtime/vk_command_buffer.c:92` (implicit reset), `freedreno/vulkan/tu_cmd_buffer.cc:4371`
@@ -2259,7 +2657,7 @@ recovery and long-session matched-configuration map deltas still require the aut
 | Pipeline map/prewarm keys | Walking thread/startup only, as before. Compiler workers publish entry handles with release/acquire state; recorder workers consume the already-selected handle. |
 | Texture/sampler/view registries and dirty/write-back state | Walking thread under existing resource/recording locks; workers see only Vulkan handles, retained through slot completion by existing retirement rules. |
 | Pool spans and address hints | Walking capture copies each index generation under the pool lock, at most once per version per slot. Packets retain immutable versions until slot reuse; workers never read live span generations/maps and use context-local hints. Linear diagnostic mode preserves original alias/pool order. |
-| Command/descriptor pools, descriptor dedup and bound-state memos | One command pool per recording owner across slots; per-slot lease chains retain handles through actual GPU/submit retirement. Descriptor/dedup/span contexts remain worker/slot-generation scoped and reset on that owner. Vertex/index/pipeline/dynamic memos start empty per secondary; zero buffers remain immutable context allocations. |
+| Command/descriptor pools, descriptor dedup and bound-state memos | One command pool per recording owner across slots; per-slot lease chains retain handles through actual GPU/submit retirement. Descriptor/dedup/span contexts remain worker/slot-generation scoped and reset on that owner; with `TOTK_VK_DESC_STOCK=1` the owner rewinds its per-layout set stock at that same generation change instead of resetting its pools, and never hands sets to another owner; a live switch-off or a `TOTK_VK_DESC_STOCK_MAX_SETS` reset destroys pools only there (`--descriptor-stock-live`). Vertex/index/pipeline/dynamic memos start empty per secondary; zero buffers remain immutable context allocations. |
 | Packet/descriptor slabs and size-class lists | Walking-only allocator per slot. Growth copies only the unpublished job; workers read immutable blocks after queue publication. Old construction pointers do not survive commit/abort. After GPU/submit-owner retirement, pressure pruning clears only cold job references and recycles blocks; slab live counts prevent unmapping referenced arrays, and free-list links are removed before an empty slab is released. ASan poison tracks returned payloads; physical-capacity counters are atomic. |
 | Secondary lease returns and cold-tail maintenance | The final backend busy/submit_busy pin publishes stable completed-slot chain endpoints under rec_mu, once per slot and with no Vulkan calls. Only the recording owner splices these chains into its free list, mutates handle links, resets cold excess or frees/trims the pool. Pending flags protect chains against repeat retirement; a new generation consumes returns before reusing its context. No owner accesses command-pool metadata owned by another recording thread. Counters/timings publish atomically without inspecting owner metadata. |
 | Retired primary/arena BOs and cached texel views | Walking-only metadata; reset requires the slot's busy and submit-owner pins to retire, or the snapshot arena's whole-submission release fence. View invalidation holds the recursive resource mutex, including deferred views with the same source buffer. No old packet, Vulkan descriptor or GPU command can reference a compacted buffer. |
@@ -2382,6 +2780,12 @@ On Standard mode the GPU stays at 401 MHz and the game's CPU thread waits about 
   `occlusionQueryPrecise` (startup logs it if missing); conditions on still-unknown sample reports stay enabled, as on
   Metal; `[occl]` logs queries per frame and the share reporting 0. Lookout Landing: 76 queries a frame, 25 % report
   0, draws −1.6 %, recording +1.4 ms (the queries), so no gain there; it stays opt-in.
+
+**Vertex position precision:** `TOTK_VK_POS_INVARIANT=1` and `TOTK_VK_POS_NOCONTRACT=1` are independent, startup-only, default **0**.
+The first adds `Invariant` to vertex Position outputs (including block members); existing seed decorations are preserved in every arm.
+The second adds `NoContraction` only to core float arithmetic feeding Position through SSA, calls and conservative memory aliases; explicit fused Fma remains fused. Invariant/NoContraction guarantees require identical position computations and inputs: they do **not** make arbitrary shaders, or depth across unrelated shaders, identical.
+Each opt-in arm isolates shader/pipeline/prewarm cache identity. Compare identical fresh-process camera sweeps for flicker, GPU ms and compile/warm-up cost; no speedup is claimed.
+Host checks: `python3 -m unittest discover -s tests -p test_vk_position.py -v`; with `spirv-val`, set `TOTK_TEST_POSITION_SEED` to a loose seed directory or `seed.vkpack` for real vertex samples in all four arms.
 
 ### Original NVN early fragment tests (guest semantics)
 
@@ -2517,6 +2921,42 @@ including the 9-frame lighting cycle; also check Gerudo Town, the Depths, menu t
 `test_vkdraw.c` adds color/depth readback cases for full, partial, disabled and copy-before-clear paths; run its existing
 host harness separately with each option combination. Device timing, power, visual comparisons and host execution are
 pending; only Android compile checks are part of this change's host acceptance.
+
+### Region and channel-masked texture clears (correctness, unconditional)
+
+NVN `ClearTexture` clears a region of one level and only the channels in its mask. It used to become
+`vkCmdClearColorImage`/`vkCmdClearDepthStencilImage` of the whole level and every channel (logged `cleared whole`).
+A region or colour channel mask now opens a temporary pass per layer/slice on that level (`loadOp=LOAD`): a region is
+`vkCmdClearAttachments` with the region as its rect; a mask draws one triangle through a small pipeline whose
+`colorWriteMask` is the mask (`vk_clear_mask.vert/.frag`, float/uint/int outputs), scissored to the region. Mask 0
+writes nothing. Whole unmasked clears keep the image clears; views that cannot be render targets keep the old path and
+its log line. `vkdrawtest` checks level-0/level-1 region, green-only and red+alpha clears texel by texel.
+
+### Texture ID memo (`TOTK_VK_TEX_MEMO`, default off)
+
+Descriptor builds resolve every sampled texture ID through `vk_tex_by_id`; on the Duo walker that path
+(`vk_tex_by_id` + `tex_get_inner` + `vk_treg_kind`) took ~2.7 ms/frame in T7, mostly cache misses: the ID's generation,
+its cache entry and two identity cells per lookup. `TOTK_VK_TEX_MEMO=1` puts a per-thread direct-mapped memo (2,048
+entries) in front of that cache, keyed by ID and shader target and valid while the registry revision, a global
+texture/image identity revision (every stamp bump or drop) and the submission are unchanged; any change retires the
+whole memo, which then refills from the cache. With it on, a registration that writes the same texture (same bytes,
+serial included) and view again keeps every revision, so it no longer retires the memo, the stage signatures (the
+`vk_treg_kind` scans) or freeze keys. Startup logs the value; `[tex-memo]` reports hits, misses, hit rate, retirements,
+registrations and unchanged ones per frame every 300 presents. Live: each lookup and registration reads it.
+`TOTK_VK_TEXGEN_CHECK=1` re-resolves every memo hit through the cache and aborts on a mismatch.
+`vktest --texture-cache-bench`/`--texture-churn-bench` and `vkrectest` (texture/sampler handles changing per draw)
+cover it.
+
+### Same-pass mip feedback (`TOTK_VK_FEEDBACK_CUT`, default off)
+
+A pass that renders one level of an image while sampling that image (mip chains generated level by level) has a
+feedback loop when the sampled view includes the attached level; Vulkan leaves it undefined and Adreno shows NaN
+blotches. `TOTK_VK_FEEDBACK_CUT=1` gives such views only the levels below the attached one (`[base, attached)`, keeping
+LOD numbering); a view based at the attached level is left whole. Startup logs `TOTK_VK_FEEDBACK_CUT=…`;
+`[feedback-cut]` logs cut and left-whole views per 300 presents. Compare screenshots (`TOTK_VK_SHOT`) of scenes with
+blotches. `vkdrawtest` renders a mip step with the switch off and on and checks identical texels and the counters.
+Live (`totk.ctl`): each descriptor build takes the current value; the freeze memo's key carries the pass serial only
+while the cut is on, so sets built under the other value are never reused.
 
 ## Upstream Android integration (2026-10-22, device measurement pending)
 
@@ -2752,6 +3192,13 @@ policy as ours and measured the same dead ends (DONT_CARE loads, forced GMEM, LR
    colours. Texture copies (B2T, T2B, T2T), clears, and render targets as dynamic rendering. Textures in pools need the
    same "pool contents changed → re-upload" tracking the Metal backend has (`nvn_dirty.c`). On Linux it protects 64 KiB
    units (`TOTK_DIRTY_UNIT_KB`), because the per-process mapping limit (`vm.max_map_count`) is reached with single pages.
+   `TOTK_VK_UPLOAD_THREADS=<1..3>` (default unset/0: serial on the calling thread) splits block-linear uploads of at
+   least 512 KiB into runs of whole block rows (≥64 KiB) that 1–3 helper threads and the caller decode
+   (`vk_upload_pool.c`); the copy is recorded after every run, byte-identical to the serial path (`uploadpooltest`,
+   TSan). Helpers inherit the first uploading thread's nice and affinity. Every 300 presents `texture uploads: N (M MiB)
+   in X ms, Y ms/frame; parallel deswizzles J` reports both arms; compare Y and the over-50 ms frame counts. Live
+   (`totk.ctl`): each upload takes the current count before it starts (`uploadpooltest` decodes byte-identically while
+   another thread reconfigures the helpers); at 0 the started helpers sleep without work.
    **Pipelines and draws.** Hash the NVN state into `VkPipeline`s, with dynamic state where the driver has it.
    Pipelines are created at their first draw; the `VkPipelineCache` is kept between runs in `TOTK_VK_PIPELINE_CACHE`
    (default `state/vk-pipeline-cache.bin`, `0` turns it off), checked against the driver's cache UUID when read and

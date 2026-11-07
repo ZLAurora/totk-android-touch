@@ -10,6 +10,7 @@
 #include <sched.h>
 
 static _Atomic int snapshots, reads, modules, presses, releases, requests;
+static _Atomic int focus_calls, focus_flags;
 #ifdef COMPANION_GATE_NATIVE_TEST
 static _Atomic int allow_release;
 #endif
@@ -50,6 +51,12 @@ void runtime_input_key_synthetic(unsigned code, int down) {
 void runtime_android_present_transform_hint(uint64_t epoch, int hint) { (void)epoch; (void)hint; }
 /* TotkActivity's text dialog and rumble/motion bridges (frontend_android.c, feedback_android.c): not part of this probe. */
 void runtime_android_text_done(JNIEnv *env, jclass cls, jlong serial, jbyteArray utf8) { (void)env; (void)cls; (void)serial; (void)utf8; }
+void runtime_android_game_focus(JNIEnv *env, jclass cls, jboolean focused, jboolean single_display) {
+    (void)env; (void)cls;
+    atomic_fetch_add(&focus_calls, 1);
+    atomic_store(&focus_flags, (focused ? 1 : 0) | (single_display ? 2 : 0));
+}
+void runtime_android_game_input_focus(JNIEnv *env, jclass cls, jboolean top) { (void)env; (void)cls; (void)top; }
 void runtime_android_motion(JNIEnv *env, jclass cls, jfloat ax, jfloat ay, jfloat az, jfloat gx, jfloat gy, jfloat gz) {
     (void)env; (void)cls; (void)ax; (void)ay; (void)az; (void)gx; (void)gy; (void)gz;
 }
@@ -89,6 +96,8 @@ JNIEXPORT jint JNICALL Java_com_aure_totk_CompanionGateProbe_count(JNIEnv *env, 
     case 2: return atomic_load(&modules);
     case 3: return atomic_load(&presses);
     case 4: return atomic_load(&releases);
+    case 5: return atomic_load(&focus_calls);
+    case 6: return atomic_load(&focus_flags);
     default: return -1;
     }
 }

@@ -10,14 +10,14 @@ import java.util.regex.Pattern;
 
 /** Whether the second-screen art in <game>/companion was made by this app's generator. The art is generated on the
  * device once (setup's companion stage); an app update that changes the generator (names, icons) leaves the old art in
- * place, so InstallState treats art from an older generator, or an unreadable index, as not done and Home updates it.
- * Plain Java without Android types so the host test can run it (tests/test_android_companion_art.py). */
+ * place. InstallState distinguishes missing art from old-but-present art, which Home updates only on dual-screen
+ * devices. Plain Java without Android types so the host test can run it (tests/test_android_companion_art.py). */
 final class CompanionArt {
     private CompanionArt() { }
 
     /** setup/companion/stage_companion.c GENERATOR_VERSION (and scripts/make_companion_assets.py); the host test keeps
      * the three equal. */
-    static final int GENERATOR = 4;
+    static final int GENERATOR = 5;
     /** index.json begins {"schema":1,"generator":N,...}; the rest of the file (hundreds of KB) is never read. */
     private static final int HEAD = 4096;
     private static final Pattern FIELD = Pattern.compile("\"generator\"\\s*:\\s*(\\d{1,9})[\\s,}]");

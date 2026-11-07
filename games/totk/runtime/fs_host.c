@@ -65,6 +65,9 @@ static _Atomic uint64_t save_changed_ns;
    completes the save, which removes it just before it publishes the next save generation: the launcher's mirror, in
    another process, copies a save set only while the file is absent and the generation unchanged. */
 static _Atomic int save_marked;
+/* An admitted Android close retains this mutex until _exit. Any later save stops before its first change, rather than
+   racing the pipeline-cache flush. Save-first admission is refused, and the caller retries after Commit. */
+static pthread_mutex_t save_close_lock = PTHREAD_MUTEX_INITIALIZER;
 static void save_mark(void) {
     if (atomic_exchange(&save_marked, 1)) return;
     const char *p = getenv("TOTK_SAVE_BUSY");
@@ -75,10 +78,29 @@ static void save_unmark(void) {
     atomic_store(&save_marked, 0);
     if (p && *p) unlink(p);
 }
-static void save_touched(void) { atomic_store(&save_changed_ns, runtime_now_ns()); atomic_store(&save_dirty, 1); save_mark(); }
+static void save_touched(void) {
+    pthread_mutex_lock(&save_close_lock);
+    atomic_store(&save_changed_ns, runtime_now_ns()); atomic_store(&save_dirty, 1); save_mark();
+    pthread_mutex_unlock(&save_close_lock);
+}
 int runtime_fs_save_busy(void) {
     if (atomic_load(&save_writers) > 0) return 1;
     return atomic_load(&save_dirty) && runtime_now_ns() - atomic_load(&save_changed_ns) < 3000000000ull;
+}
+/* Unlike the UI's short busy heuristic, suspension must wait through Commit,
+   however long the gap between files. No locks or I/O on the acquire path. */
+int runtime_fs_save_pending(void) {
+    return atomic_load(&save_marked) || atomic_load(&save_writers) > 0 || atomic_load(&save_dirty);
+}
+int runtime_fs_begin_close(void) {
+    pthread_mutex_lock(&save_close_lock);
+    const char *path = getenv("TOTK_SAVE_BUSY");
+    struct stat st;
+    if (atomic_load(&save_marked) || runtime_fs_save_busy() || (path && *path && (!stat(path, &st) || errno != ENOENT))) {
+        pthread_mutex_unlock(&save_close_lock);
+        return 0;
+    }
+    return 1;   /* exit caller owns save_close_lock for the rest of the process lifetime */
 }
 static void make_dir(const char *p) { if (mkdir(p, 0700) && errno != EEXIST) runtime_fail("create profile storage directory"); }
 static int remove_tree(const char *path) {

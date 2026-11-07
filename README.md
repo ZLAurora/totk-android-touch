@@ -82,20 +82,22 @@ Tested devices:
 
 ## Install and first setup
 
-1. Download `TotK-Native-1.0.0.apk` from the Releases page and install it (allow installs from your browser or file
-   manager).
+1. Download the latest `TotK-Native-<version>.apk` from the Releases page and install it (allow installs from your
+   browser or file manager).
 2. Copy your dump to the device or an SD card.
 3. Open **TotK Native** and press **Begin setup**. Then:
    1. **Storage**: where the game data goes. Internal storage is recommended (fastest); the SD card or a folder you
       choose work too.
    2. **What you have**: pick your route.
    3. **Choose your files** with the file picker. Each file is checked as soon as you pick it; when everything is
-      there, press **+** or *Install*.
-   4. **Prepare**: the game is built on the device. With a decrypted dump on internal storage this took about
+      there, press **+** or *Continue*.
+   4. **Updates**: choose whether to check GitHub for a newer app version when the game starts (On by default).
+   5. **Prepare**: the game is built on the device. With a decrypted dump on internal storage this took about
       1 minute 45 seconds on an AYN Thor, 1 minute 40 seconds on an Odin 3 and 3 minutes on a Retroid Pocket Duo. The
       container route also merges the base game and update: about 12 minutes on a Thor with the files and the install
-      on an exFAT SD card. The second-screen art is optional: you can start playing before it is done.
-   5. **Choose graphics** opens with your device's preset selected. Press **+** to play.
+      on an exFAT SD card. The optional second-screen art is skipped on single-screen devices; on dual-screen devices
+      you can start playing before it is done.
+   6. **Choose graphics** opens with your device's preset selected. Press **+** to play.
 4. Nothing is uploaded: your files stay on the device.
 
 <p align="center">
@@ -358,8 +360,8 @@ Options: Device language, English, 日本語, Deutsch, Français, Español, Ital
 <summary><b>Game data</b> and <b>About</b></summary>
 
 *Game data* shows the installed game (verified against the 1.4.3 digests), where it is stored, and lets you rebuild the
-shaders or the second-screen art, choose another graphics driver (or go back to the bundled one), run setup again
-(finished steps are kept) or delete the imported data (saves, settings and the driver are kept).
+shaders or the second-screen art, choose another graphics driver (a Turnip AdrenoTools `.zip` or 64-bit ARM `.so`, or
+go back to the bundled one), run setup again (finished steps are kept) or delete the imported data (saves, settings and the driver are kept).
 
 <img src="docs/images/game-data.webp" width="640" alt="Game data">
 
@@ -372,6 +374,23 @@ component and the project's home.
 
 **X** on the main menu turns on *Open the game directly next time*; to reach the menu again, long-press the app icon
 and choose *Settings*.
+
+## Privacy and app updates
+
+When the game starts, TotK Native checks for a newer stable app release with **one tiny HEAD request to GitHub**,
+only when Android reports a validated internet connection. It runs in the background, never delays the game, and
+does not follow redirects or download a response body. GitHub sees the ordinary connection information (including
+your IP address), but the app sends no identifier, settings, saves, keys or game data. There is no telemetry.
+Offline, errors and timeouts are silent, with no retry during that game session.
+
+The **Updates** setup step and **About → Check for updates when the game starts** switch turn checks off.
+The default is On, including when updating an existing install. Development versions do not check.
+If a new version is found, a controller-friendly dialog pauses the game: **Update now** closes it safely before
+downloading; **Next time** remembers the version and asks in the menu next launch, even offline. Downloads need a
+connection and can be cancelled. The app verifies the APK checksum, package, newer version and matching installed
+signing certificate before Android asks you to allow this app as an install source and confirm installation.
+Updating keeps your saves and game data; **do not uninstall** to update.
+
 
 ## Saves and storage
 
@@ -403,6 +422,10 @@ saving, on the title screen, with full hearts, and for the actions not available
 Only a display built into the device is used; external monitors and cast displays are ignored. Turn it off in
 *Graphics → Screen → Second screen*. More: [docs/companion.md](docs/companion.md).
 
+Setup prepares the art only when a built-in second screen is present. If it is missing on a dual-screen device,
+**Start game** offers **Prepare second-screen art** (build it, then play) or **Play without it** (remembered for this
+install). You can prepare it later in **Game data → Second-screen art**, even on a single-screen device.
+
 ## Known limitations
 
 - Game version **1.4.3** only, from the two setup routes above. No DLC, online features or amiibo.
@@ -422,7 +445,10 @@ Only a display built into the device is used; external monitors and cast display
 1.4.3 RomFS with the update applied (all split parts) or the 1.4.3 update NSP, then choose it again. Every check and
 message: [docs/android-install.md](docs/android-install.md).
 
-**Setup was interrupted or stopped.** Open the app again and press *Resume*: finished steps are kept.
+**Setup was interrupted or stopped.** Finished steps are kept; *Resume* continues setup. On **Setup stopped**, use
+**Share details** **before Resume** to include that failed run's logs in a bug report (Resume clears them).
+It opens Android's share sheet with the error, device/build information and bounded, redacted setup logs.
+No game files or keys are included; nothing is sent until you choose an app. Missing logs are marked explicitly.
 
 **Home shows "Shaders not built".** The game would draw nothing without its shaders: press *Build shaders* (a few
 minutes), then start the game.
@@ -443,6 +469,7 @@ kept; progress since the last save is lost. The details are in `totk.log`; pleas
 game directly next time* with **X**.
 
 **Can I use my phone's own GPU driver or another Turnip build?** Another Turnip build: *Game data → Graphics driver*.
+Pick its AdrenoTools `.zip` as downloaded, or the 64-bit ARM `.so` inside it; *Use the bundled driver* resets it.
 The system driver does not work (see [Requirements](#requirements)).
 
 ## For developers

@@ -41,6 +41,15 @@ class PsoKeysTests(unittest.TestCase):
         self.assertEqual(data[24:56], hashlib.sha256(data[64:]).digest())
         self.assertEqual(pso.decode(pso.encode([])), [])
 
+    def test_alpha_stage_word(self):
+        for comparison in range(8):
+            for early in range(2):
+                packed = bytearray(key())
+                struct.pack_into('<I', packed, 160, early | comparison << 1)
+                records = [(bytes(packed), 1, 0)]
+                self.assertEqual(pso.decode(pso.encode(records)), records)
+                self.assertEqual(pso.decode_tsv(pso.encode_tsv(records)), records)
+
     def test_strict_envelope(self):
         data = pso.encode([(key(), 1, 0)])
         for i in (0, 8, 12, 16, 20, 24, 55, 56, 63, 100, len(data)-1):
@@ -52,7 +61,7 @@ class PsoKeysTests(unittest.TestCase):
                 pso.decode(bad)
 
     def test_key_validation(self):
-        for at, value in ((160, 2), (164+10*4, 9), (164+11*4, 3),
+        for at, value in ((160, 16), (164+10*4, 9), (164+11*4, 3),
                           (164+16*4, 3), (164+(75+2)*4, 16), (164+123*4, 2)):
             bad = bytearray(key()); struct.pack_into('<I', bad, at, value)
             with self.subTest(byte=at), self.assertRaises(ValueError):
@@ -132,7 +141,7 @@ class PsoKeysTests(unittest.TestCase):
                    text.replace(b'TOTKPSO-TSV 1', b'TOTKPSO-TSV 2'),
                    text + text[len(pso.TSV_HEADER):]]
         for column, replacement in ((0, b'a'*64 + b'-123'), (1, b''),
-                                    (2, b'2'), (3, b'0,' + fields[3]),
+                                    (2, b'16'), (3, b'0,' + fields[3]),
                                     (3, fields[3].replace(b'0', b'00', 1)),
                                     (3, fields[3].replace(b'0', b'F', 1)),
                                     (3, fields[3].replace(b'0', b'100000000', 1)),

@@ -222,7 +222,9 @@ public final class AssetStore {
         return actor;
     }
     public String itemName(String actor) {
-        return Snapshot.object(Snapshot.object(text, "items"), pouchActor(actor)).optString("name", humanize(actor));
+        String name = Snapshot.object(Snapshot.object(text, "items"), pouchActor(actor)).optString("name", "");
+        // Unknown/modded fuse objects still get readable text, without the internal Obj_/DgnObj_/SpObj_ prefix.
+        return name.isEmpty() ? humanize(actor.replaceFirst("^[A-Za-z]*Obj_", "")) : name;
     }
     public String itemDescription(String actor) {
         return Snapshot.object(Snapshot.object(text, "items"), pouchActor(actor)).optString("desc", "");

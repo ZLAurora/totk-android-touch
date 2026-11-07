@@ -28,6 +28,19 @@ public final class CompanionGateProbe {
         DataSource source = new CompanionNative();
         check(source.enabled() == enabled, "source must expose the runtime gate");
         for (int i = 0; i < 4; i++) check(count(i) == 0, "gate must not inspect guest state or press buttons");
+        // A live recents tile can lose/regain focus without onPause/onResume.
+        // Only a single display admits that extra pause facet.
+        for (int kind = 0; kind < 3; kind++) {
+            PresentationController.secondScreenKind = kind;
+            activity.onWindowFocusChanged(false);
+            check(count(6) == (kind == 0 ? 2 : 0), "focus-loss bridge must preserve multi-resume");
+            activity.onWindowFocusChanged(true);
+            check(count(6) == (kind == 0 ? 3 : 1), "focus return must wake without onResume");
+        }
+        check(count(5) == 6, "all focus transitions must reach the native bridge");
+        activity.onTopResumedActivityChanged(false);
+        activity.onTopResumedActivityChanged(true);
+        check(count(5) == 6, "controller routing must not change the pause-focus facet");
 
         check((CompanionNative.snapshot(0) != null) == enabled, "direct live snapshot must honor gate");
         check((source.read(1) != null) == enabled, "source full snapshot must honor gate");

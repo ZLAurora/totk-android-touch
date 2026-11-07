@@ -12,7 +12,14 @@ $CC $COMMON -I"$ROOT/android/compat/include" -I"$ROOT/runtime" -I"$ROOT/third_pa
     "$ROOT/tests/sync_fastpath/probe.c" "$ROOT/tests/guest_waits/host_support.c" -Wl,--gc-sections -o "$OUT/sync-fastpath"
 $CC $COMMON -I"$ROOT/android/compat/include" -I"$ROOT/runtime" -I"$ROOT/third_party/d2r_gfx/gfx/nvn/include" \
     "$ROOT/tests/sync_fastpath/preempt.c" -Wl,--gc-sections -o "$OUT/sync-preempt"
+$CC $COMMON -I"$ROOT/android/compat/include" -I"$ROOT/runtime" -I"$ROOT/third_party/d2r_gfx/gfx/nvn/include" \
+    "$ROOT/tests/sync_fastpath/event.c" -Wl,--gc-sections -o "$OUT/core-wait-event"
+for event in 0 1; do
+    for kick in 0 1; do
+        TOTK_CORE_WAIT_EVENT=$event TOTK_SYNC_KICK=$kick TOTK_SYNC_STATS=1 "$OUT/sync-fastpath" "${SYNC_ROUNDS:-3000}"
+        TOTK_CORE_WAIT_EVENT=$event TOTK_SYNC_KICK=$kick TOTK_SYNC_STATS=1 "$OUT/sync-preempt" "${SYNC_PREEMPT_ROUNDS:-1000}"
+    done
+done
 for kick in 0 1; do
-    TOTK_SYNC_KICK=$kick TOTK_SYNC_STATS=1 "$OUT/sync-fastpath" "${SYNC_ROUNDS:-3000}"
-    TOTK_SYNC_KICK=$kick TOTK_SYNC_STATS=1 "$OUT/sync-preempt" "${SYNC_PREEMPT_ROUNDS:-1000}"
+    TOTK_SYNC_KICK=$kick TOTK_SYNC_STATS=1 "$OUT/core-wait-event"
 done

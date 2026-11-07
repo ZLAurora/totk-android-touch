@@ -1,7 +1,8 @@
 #!/bin/sh
 # bench_input.sh -s <serial> [--event /dev/input/eventN] [--display <id>] [--package <pkg>] [--game-dir <dir>] <action> ...
 #
-# Drive the game on a rooted Android device over adb (sendevent needs root through `su`).
+# Drive the game on a rooted Android device over adb (sendevent needs root). Root commands, the screenshot included,
+# go through the serial's persistent root shell (rootsh.py: one su per session, pinned to the slowest CPU cluster).
 #   press <button> [ms]   hold a built-in controller button (A B X Y L R PLUS MINUS UP DOWN LEFT RIGHT), default 150 ms
 #   rstick <x> [y]        set the right stick (ABS_Z / ABS_RZ, -32767..32767); "rstick 0" releases it
 #   shot <file>           screenshot of the main display, written to <file> on the host
@@ -14,8 +15,9 @@
 # The controller node is the input device whose `getevent -p` lists ABS_Z and ABS_RZ (0002 / 0005) and BTN_SOUTH (0130);
 # the display is the first (internal) one of `dumpsys SurfaceFlinger --display-id`.
 set -u
+HERE=$(cd "$(dirname "$0")" && pwd)
 
-usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 die() { echo "bench_input: $*" >&2; exit 1; }
 
 # Device-side script of `freqs` (fed to a root shell on stdin; prints one line).
@@ -57,7 +59,7 @@ done
 ACT=$1; shift
 
 adbs() { adb -s "$SER" "$@"; }
-root() { adbs shell "su -c '$1'"; }
+root() { python3 "$HERE/rootsh.py" -s "$SER" run -c "$1"; }
 
 detect_event() {
   root "getevent -p" | tr -d '\r' | awk '
@@ -102,14 +104,14 @@ case $ACT in
     [ $# -ge 1 ] || usage
     need_display
     mkdir -p "$(dirname "$1")"
-    adbs exec-out screencap -d "$DISP" -p > "$1" || die "screencap failed"
+    root "screencap -d $DISP -p" > "$1" || die "screencap failed"
     [ -s "$1" ] || die "empty screenshot $1"
     echo "$1" ;;
   log)
     out=$(root "cat $GAME/totk.log" 2>&1) || die "cannot read $GAME/totk.log: $out"
     printf '%s\n' "$out" ;;
   freqs)
-    out=$(printf '%s\n' "$FREQS_SH" | adbs shell 'su -c sh' | tr -d '\r')
+    out=$(printf '%s\n' "$FREQS_SH" | python3 "$HERE/rootsh.py" -s "$SER" run | tr -d '\r')
     case $out in *cpu[0-9]*=*) printf '%s\n' "$out" ;; *) die "no cpufreq limits read (root / sysfs): '$out'" ;; esac ;;
   *) die "unknown action $ACT" ;;
 esac

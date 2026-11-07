@@ -15,6 +15,7 @@
 #include "host_os.h"
 #include "runtime.h"
 #include "world_survey.h"
+#include "android_pause.h"
 #include <jni.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -28,6 +29,8 @@ static void JNICALL native_present_transform_hint(JNIEnv *env, jclass cls, jlong
     runtime_android_present_transform_hint((uint64_t)epoch,hint);
 }
 void runtime_android_text_done(JNIEnv *env, jclass cls, jlong serial, jbyteArray utf8);   /* frontend_android.c: swkbd */
+void runtime_android_game_focus(JNIEnv *env, jclass cls, jboolean focused, jboolean single_display);
+void runtime_android_game_input_focus(JNIEnv *env, jclass cls, jboolean top);
 /* feedback_android.c: the game's rumble and six-axis sensor */
 void runtime_android_motion(JNIEnv *env, jclass cls, jfloat ax, jfloat ay, jfloat az, jfloat gx, jfloat gy, jfloat gz);
 void runtime_android_motion_live(JNIEnv *env, jclass cls, jboolean on, jstring source);
@@ -68,6 +71,7 @@ static void actions_init(void) {   /* JNI_OnLoad: before any snapshot or request
 static jint JNICALL native_request(JNIEnv *env, jclass cls, jstring action, jstring category, jint slot, jstring actor,
                                    jint partition, jlong pouch_gen) {
     if (!native_enabled(env, cls)) return COMPANION_UNSUPPORTED;
+    if (runtime_android_game_paused()) return COMPANION_BUSY;
     if (!action || !category || !actor) return COMPANION_INVALID;
     const char *a = (*env)->GetStringUTFChars(env, action, NULL), *c = (*env)->GetStringUTFChars(env, category, NULL),
                *n = (*env)->GetStringUTFChars(env, actor, NULL);
@@ -130,6 +134,7 @@ static void *release_later(void *arg) {
    decide what they do in a menu, a cutscene or a loading screen. */
 static jboolean JNICALL native_action(JNIEnv *env, jclass cls, jint kind, jint arg) {
     if (!native_enabled(env, cls) || kind != 1 || arg < 0 || arg >= 16) return JNI_FALSE;
+    if (runtime_android_game_paused()) return JNI_FALSE;
     CompanionBuf b = {0};
     int ready = companion_snapshot((uintptr_t)runtime_module_base("main"), COMPANION_LIVE, guest_read, &b) &&
                 strstr(b.data, "\"status\":\"ready\"") != NULL;
@@ -170,6 +175,8 @@ __attribute__((visibility("default"))) jint JNI_OnLoad(JavaVM *vm, void *reserve
         static const JNINativeMethod present_methods[] = {
             {"nativePresentTransformHint", "(JI)V", (void *)native_present_transform_hint},
             {"nativeTextInputDone", "(J[B)V", (void *)runtime_android_text_done},
+            {"nativeGameFocus", "(ZZ)V", (void *)runtime_android_game_focus},
+            {"nativeGameInputFocus", "(Z)V", (void *)runtime_android_game_input_focus},
             {"nativeMotion", "(FFFFFF)V", (void *)runtime_android_motion},
             {"nativeMotionLive", "(ZLjava/lang/String;)V", (void *)runtime_android_motion_live},
             {"nativeFeedbackEnabled", "()I", (void *)runtime_android_feedback_enabled},

@@ -1,9 +1,11 @@
 /* Fresh-process observation of production startup policy: no Vulkan, game data or device.
    GPU selection is included verbatim from nvn_vk.c by test_frame_lag_policy.py. */
 #include "../games/totk/runtime/frame_lag.h"
+#include "../games/totk/android/gfx/vk_gpu_time.h"
 #include <stdio.h>
 
 static int g_gpu_time_hardware;
+static int g_gpu_time_fps_median;
 #define LOGV(...) do { printf(__VA_ARGS__); putchar('\n'); } while (0)
 static void gpu_time_policy(void) {
 #include "gpu_time_policy.inc"

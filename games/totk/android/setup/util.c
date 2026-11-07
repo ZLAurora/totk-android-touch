@@ -60,7 +60,8 @@ int st_mkdirs(const char *path) {
     for (char *p = tmp + 1; *p; p++) if (*p == '/') { *p = 0; if (mkdir(tmp, 0775) && errno != EEXIST) return -1; *p = '/'; }
     if (mkdir(tmp, 0775) && errno != EEXIST) return -1;
     struct stat st;
-    if (stat(tmp, &st) || !S_ISDIR(st.st_mode)) { errno = ENOTDIR; return -1; }
+    if (stat(tmp, &st)) return -1;
+    if (!S_ISDIR(st.st_mode)) { errno = ENOTDIR; return -1; }
     return 0;
 }
 static int rm_one(const char *path, const struct stat *st, int type, struct FTW *f) {
@@ -113,7 +114,8 @@ int st_read_file(const char *path, char **out, size_t *len, size_t max) {
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return -1;
     struct stat st;
-    if (fstat(fd, &st) || !S_ISREG(st.st_mode) || (uint64_t)st.st_size > max) { close(fd); errno = EFBIG; return -1; }
+    if (fstat(fd, &st)) { int e = errno; close(fd); errno = e; return -1; }
+    if (!S_ISREG(st.st_mode) || (uint64_t)st.st_size > max) { close(fd); errno = EFBIG; return -1; }
     char *p = malloc((size_t)st.st_size + 1);
     if (!p || st_pread(fd, p, (size_t)st.st_size, 0)) { int e = errno; free(p); close(fd); errno = e; return -1; }
     close(fd); p[st.st_size] = 0; *out = p; *len = (size_t)st.st_size;
@@ -139,7 +141,7 @@ int st_sha256_fd(SetupCtx *c, int fd, uint64_t off, uint64_t len, uint8_t out[32
     for (uint64_t done = 0; done < len;) {
         if (setup_cancelled(c)) { free(buf); return SETUP_CANCELLED; }
         size_t n = len - done < cap ? (size_t)(len - done) : cap;
-        if (st_pread(fd, buf, n, off + done)) { free(buf); return st_io_fail(c, "read", "input"); }
+        if (st_pread(fd, buf, n, off + done)) { int rc = st_io_fail(c, "read", "input"); free(buf); return rc; }
         sha256_update(&s, buf, n); st_cache_drop(fd, off + done, n); done += n;
         if (stage) setup_progress(c, stage, base_done + done, total, "verifying");
     }
@@ -150,7 +152,7 @@ int st_sha256_file(SetupCtx *c, const char *path, char hex[65], int64_t *size) {
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return st_io_fail(c, "open", path);
     struct stat st; uint8_t d[32];
-    if (fstat(fd, &st)) { close(fd); return st_io_fail(c, "stat", path); }
+    if (fstat(fd, &st)) { int r = st_io_fail(c, "stat", path); close(fd); return r; }
     int r = st_sha256_fd(c, fd, 0, (uint64_t)st.st_size, d, NULL, 0, 0);
     close(fd);
     if (r) return r;

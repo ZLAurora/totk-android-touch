@@ -38,6 +38,7 @@ typedef struct AudioRenderer {
 
 void audio_mixer_open(AudioRenderer *r);
 void audio_mixer_set_running(AudioRenderer *r, int running);
+int audio_mixer_output_paused(void); /* lifecycle mute: keep renderer events paced, freeze voice/sample clocks */
 void audio_mixer_close(AudioRenderer *r);
 void audio_mixer_update_routing(AudioRenderer *r, const uint8_t *splitters, uint32_t splitter_bytes, const uint8_t *mixes, uint32_t mix_bytes, int mix_count);
 void audio_mixer_update_effects(AudioRenderer *r);

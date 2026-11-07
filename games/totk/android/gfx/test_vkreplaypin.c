@@ -2,6 +2,7 @@
  * argv[1] is the existing CS (salt 3) produced by test_vkdraw_seed.py. */
 #include "vk_int.h"
 #include "vk_framegen.h"
+#include "vk_record.h"
 #include <errno.h>
 #include <limits.h>
 #include <sched.h>
@@ -93,7 +94,15 @@ static VkDescriptorSet descriptor(VkBuffer buffer,VkDeviceSize offset) {
         .descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&info};
     vkUpdateDescriptorSets(V.dev,1,&write,0,NULL); return set;
 }
+/* Every churn submission also stages a live descriptor-stock change (on/off and its ceiling) for the next slot
+   generations: pinned slots must keep their pools while the free ones reset or destroy theirs. */
+static _Atomic unsigned churns;
 static void churn(void) {
+    static const char *const toggles[] = {"set TOTK_VK_DESC_STOCK=1\n", "set TOTK_VK_DESC_STOCK_MAX_SETS=1\n",
+        "set TOTK_VK_DESC_STOCK=0\n", "unset TOTK_VK_DESC_STOCK_MAX_SETS\nset TOTK_VK_DESC_STOCK=1\n", "unset TOTK_VK_DESC_STOCK\n"};
+    unsigned n = atomic_fetch_add(&churns, 1);
+    const char *lines = toggles[n % (sizeof toggles / sizeof *toggles)];
+    totk_live_lines l = {{0}}; totk_live_feed(&l, lines, strlen(lines)); totk_live_frame(n);
     VkBuffer buffer; VkDeviceSize offset;
     memset(vk_transient(512,256,&buffer,&offset),0xe7,512);
     (void)descriptor(buffer,offset);
@@ -468,6 +477,10 @@ int main(int argc,char **argv) {
     recorder_primitive_scenario(); immutable_optional_split_scenario();
     scenario(0); scenario(1);
     owner_lease_scenario(); lease_pressure_scenario(); lease_no_output_scenario();
+    uint64_t pool_checks,violations; vk_test_descriptor_pools_stats(&pool_checks,&violations);
+    printf("replay pin descriptor pools: %u live stock toggles, %llu pool resets/destroys checked, %llu with an unretired user\n",
+        atomic_load(&churns),(unsigned long long)pool_checks,(unsigned long long)violations);
+    CHECK(pool_checks && !violations,"live stock toggles never reset or destroy a pinned or unretired slot's pools");
     liveness_phase("completed fixture cleanup",15);
     vkDestroyPipeline(V.dev,pipeline,NULL); vkDestroyPipelineLayout(V.dev,layout,NULL); vkDestroyDescriptorSetLayout(V.dev,dsl,NULL);
     pthread_mutex_lock(&liveness.mu); liveness.done=1; pthread_cond_signal(&liveness.cv); pthread_mutex_unlock(&liveness.mu);

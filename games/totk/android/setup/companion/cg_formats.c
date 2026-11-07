@@ -185,7 +185,19 @@ int cg_msbt(const uint8_t *d, size_t n, CgMsg **out, size_t *count, SeedErr *err
         while (pos + 2 <= nt) {
             unsigned ch = rd16(texts + pos, big); pos += 2;
             if (!ch) break;
-            if (ch == 0xe) { if (pos + 6 > nt) goto bad; pos += 6 + rd16(texts + pos + 4, big); }   /* tag: group, type, size, payload */
+            if (ch == 0xe) {   /* tag: group, type, size, payload */
+                if (pos + 6 > nt) goto bad;
+                size_t size = rd16(texts + pos + 4, big);
+                if (size > nt - pos - 6) goto bad;
+                if (rd16(texts + pos, big) == 201 && rd16(texts + pos + 2, big) == 10) {
+                    /* Declension alternatives: the first length-prefixed form is the standalone/nominative name. */
+                    if (size < 2) goto bad;
+                    size_t first = rd16(texts + pos + 6, big);
+                    if ((first & 1) || first > size - 2) goto bad;
+                    for (size_t k = 0; k < first; k += 2) u[nu++] = rd16(texts + pos + 8 + k, big);
+                }
+                pos += 6 + size;
+            }
             else if (ch == 0xf) pos += 4;                                                           /* closing tag: group, type */
             else u[nu++] = (uint16_t)ch;
         }

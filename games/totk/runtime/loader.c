@@ -22,6 +22,7 @@
 #include "game_version.h"
 #include "frame_lag.h"
 #include "guest_clock.h"
+#include "crash_chain.h"
 #include <errno.h>
 #if TOTK_PINNED
 #include "totk_pins.h"   /* scripts/make_pins_header.py from assets/expected-v1.4.3.json (android/Makefile) */
@@ -525,6 +526,9 @@ static void crash(int num,siginfo_t *info,void *context) {
  }
  if((num==SIGBUS||num==SIGSEGV)&&runtime_fault_guard){sigjmp_buf *g=runtime_fault_guard;runtime_fault_guard=NULL;siglongjmp(*g,1);}   /* guarded host read of guest memory (uniform snapshot copies) */
  if(runtime_gfx_fault(info->si_addr,(host_uc_esr(u)>>6)&1,context))return;uint64_t pc=UC_PC(u),fp=UC_FP(u);
+ /* A real crash from here on. One report: the first crashing thread writes it, any other waits for it (at most 5 s; its
+    registers are in the tombstone's thread list), and a crash inside the report goes straight on (crash_chain.h). */
+ {int claim=crash_chain_claim();if(claim==CRASH_CHAIN_OTHER)crash_chain_wait(num);if(claim==CRASH_CHAIN_NESTED)crash_chain_forward(num,info,context);}
  signal_hex("[totk] signal=",num);signal_hex("fault=",(uintptr_t)info->si_addr);signal_hex("esr=",host_uc_esr(u));
  {uint64_t ra=0,rs=0,rp=0;
   if(host_region((uintptr_t)info->si_addr,&ra,&rs,&rp)){signal_hex("region=",ra);signal_hex("region size=",rs);signal_hex("region prot=",rp);}}signal_hex("pc=",pc);signal_hex("lr=",UC_LR(u));signal_hex("fp=",fp);
@@ -587,7 +591,7 @@ static void crash(int num,siginfo_t *info,void *context) {
   if(r<29&&host_safe_read(UC_X(u)[r]+(uint64_t)off,&hp,8)&&host_safe_read(hp,hh,sizeof(hh))&&hh[5]==hp&&hh[6]<0x40000000ULL){
    int fd=open(dp,O_WRONLY|O_CREAT|O_TRUNC,0644);if(fd>=0){uint64_t done=0;static char buf[65536];while(done<hh[6]){uint64_t n=hh[6]-done;if(n>sizeof buf)n=sizeof buf;
     if(!host_safe_read(hp+done,buf,n))break;if(write(fd,buf,(size_t)n)!=(ssize_t)n)break;done+=n;}close(fd);signal_hex("heapdump bytes=",done);}}}}
- _exit(128+num);
+ crash_chain_forward(num,info,context);   /* the previous handler (on Android the tombstone and the logcat backtrace), then the end */
 }
 static void *probe_thread(void *unused) {
  (void)unused;runtime_thread_init();
@@ -668,14 +672,17 @@ static void boot(void) {
 #endif
  runtime_fail("SDK Start unexpectedly returned");
 }
-/* Host aborts (e.g. Metal validation assertions) print the host call stack before the process ends. */
-#if defined(__ANDROID__) && __ANDROID_API__ < 33
-static void abort_report(int num) {
- (void)num;write(2,"[totk] host abort\n",18);   /* bionic has backtrace() from API level 33 */
-#else
+/* Host aborts (e.g. Metal validation assertions) print the host call stack, then go on to the previous SIGABRT action
+   (crash_chain.h: on Android the tombstone, with the abort message). */
+#if !defined(__ANDROID__) || __ANDROID_API__ >= 33
 #include <execinfo.h>
-static void abort_report(int num) {
- (void)num;void *frames[64];int n=backtrace(frames,64);write(2,"[totk] host abort, call stack:\n",31);backtrace_symbols_fd(frames,n,2);
+#endif
+static void abort_report(int num,siginfo_t *info,void *context) {
+ {int claim=crash_chain_claim();if(claim==CRASH_CHAIN_OTHER)crash_chain_wait(num);if(claim==CRASH_CHAIN_NESTED)crash_chain_forward(num,info,context);}
+#if defined(__ANDROID__) && __ANDROID_API__ < 33
+ write(2,"[totk] host abort\n",18);   /* bionic has backtrace() from API level 33 */
+#else
+ {void *frames[64];int n=backtrace(frames,64);write(2,"[totk] host abort, call stack:\n",31);backtrace_symbols_fd(frames,n,2);}
 #endif
  /* frame-pointer walk (the unwinder above stops inside libc's allocator): host function and file offset per frame */
  {uint64_t fp=(uint64_t)(uintptr_t)__builtin_frame_address(0);write(2,"[totk] frames:\n",15);
@@ -683,7 +690,7 @@ static void abort_report(int num) {
    if(dladdr((void *)(uintptr_t)fr[1],&di)&&di.dli_fname){const char *f=strrchr(di.dli_fname,'/');f=f?f+1:di.dli_fname;write(2,"  ",2);write(2,f,strlen(f));if(di.dli_sname){write(2," ",1);write(2,di.dli_sname,strlen(di.dli_sname));}signal_hex(" file offset=",fr[1]-(uintptr_t)di.dli_fbase);}
    else signal_hex("  lr=",fr[1]);
    if(fr[0]<=fp)break;fp=fr[0];}}
- signal(SIGABRT,SIG_DFL);raise(SIGABRT);
+ crash_chain_forward(num,info,context);
 }
 int main(int argc,char **argv) {
  need(argc==3,"usage: totk-native rewritten-dir probe|boot");
@@ -697,9 +704,10 @@ int main(int argc,char **argv) {
  /* Module layout (key page, patch area, permissions) is in 16 KiB units, so 4 KiB and 16 KiB kernels both work. */
  need(sysconf(_SC_PAGESIZE)==0x1000||sysconf(_SC_PAGESIZE)==0x4000,"expected 4KB or 16KB pages");
 #endif
+ /* Chained (crash_chain.h): the previous actions are kept and get each signal after our report. */
  struct sigaction a={0};a.sa_sigaction=crash;a.sa_flags=SA_SIGINFO|SA_ONSTACK;sigemptyset(&a.sa_mask);
- sigaction(SIGSEGV,&a,NULL);sigaction(SIGBUS,&a,NULL);sigaction(SIGILL,&a,NULL);sigaction(SIGTRAP,&a,NULL);
- {struct sigaction ab={0};ab.sa_handler=abort_report;ab.sa_flags=SA_ONSTACK;sigemptyset(&ab.sa_mask);sigaction(SIGABRT,&ab,NULL);}
+ crash_chain_install(SIGSEGV,&a);crash_chain_install(SIGBUS,&a);crash_chain_install(SIGILL,&a);crash_chain_install(SIGTRAP,&a);
+ {struct sigaction ab={0};ab.sa_sigaction=abort_report;ab.sa_flags=SA_SIGINFO|SA_ONSTACK;sigemptyset(&ab.sa_mask);crash_chain_install(SIGABRT,&ab);}
 #if defined(__APPLE__)
  for(unsigned i=0;i<8;i++)need(pthread_key_create(&runtime_keys[i],NULL)==0&&runtime_keys[i]!=0,"allocate Darwin key");
  runtime_hle_stack_init((uint64_t)runtime_keys[4]*8);

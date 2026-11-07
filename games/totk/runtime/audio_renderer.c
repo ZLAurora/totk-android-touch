@@ -260,7 +260,7 @@ static void *render_thread(void *p) {
     struct timespec next; clock_gettime(CLOCK_MONOTONIC, &next);
     while (__atomic_load_n(&r->running, __ATOMIC_ACQUIRE)) {
         pthread_mutex_lock(&r->lock);
-        if (r->state == 0) {
+        if (r->state == 0 && !audio_mixer_output_paused()) {
             audio_voices_prepare(r);
             audio_mixer_render(r, frame);
             for (int i = 0; i < r->param.voice_count; i++) advance_voice(r, &r->voices[i], frame);

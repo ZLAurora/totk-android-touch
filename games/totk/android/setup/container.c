@@ -36,7 +36,7 @@ int part_parse(SetupCtx *c, int fd, uint64_t off, uint64_t bound, const char *ma
     uint8_t *raw = malloc((size_t)size + 1);
     PEntry *e = calloc(count ? count : 1, sizeof *e);
     if (!raw || !e) { free(raw); free(e); setup_fail(c, "internal", "Out of memory"); return -1; }
-    if (st_pread(fd, raw, (size_t)size, off)) { free(raw); free(e); return st_io_fail(c, "read", what); }
+    if (st_pread(fd, raw, (size_t)size, off)) { int rc = st_io_fail(c, "read", what); free(raw); free(e); return rc; }
     const char *strings = (const char *)raw + 16 + (size_t)count * (size_t)stride;
     for (uint32_t i = 0; i < count; i++) {
         const uint8_t *r = raw + 16 + (size_t)i * (size_t)stride;

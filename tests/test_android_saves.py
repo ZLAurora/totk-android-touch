@@ -16,7 +16,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 TOTK = ROOT / 'games/totk'
 SOURCES = [TOTK / 'android/java/com/aure/totk/setup/SaveManager.java', TOTK / 'android/java/com/aure/totk/setup/Settings.java',
-           TOTK / 'tests/saves/SavesProbe.java']
+           TOTK / 'android/java/com/aure/totk/setup/GameLock.java', TOTK / 'tests/saves/SavesProbe.java']
 SLOT_FILES = {'progress.sav': 2307856, 'caption.sav': 21620, 'footprint.sav': 614760, 'direct_file_save_related.sav': 1152}
 
 
@@ -250,13 +250,13 @@ class SavesTests(unittest.TestCase):
         fd = os.open(files / 'state/game.lock', os.O_RDWR | os.O_CREAT)
         try:
             fcntl.fcntl(fd, getattr(fcntl, 'F_OFD_SETLK', 37), struct.pack('hhqqi4x', fcntl.F_WRLCK, 0, 0, 0, 0))
-            locked, refused = self.probe(('locked', files), ('replace', files, staged, 'import', 1_700_000_000_000))
+            locked, refused = self.probe(('game-state', files), ('replace', files, staged, 'import', 1_700_000_000_000))
         finally:
             os.close(fd)
-        self.assertEqual((locked, refused), ('true', 'invalid game_running'))
+        self.assertEqual((locked, refused), ('GAME', 'invalid game_running'))
         self.assertEqual(tree(live), before)
-        unlocked, answer = self.probe(('locked', files), ('replace', files, staged, 'import', 1_700_000_000_000))
-        self.assertEqual(unlocked, 'false')
+        unlocked, answer = self.probe(('game-state', files), ('replace', files, staged, 'import', 1_700_000_000_000))
+        self.assertEqual(unlocked, 'FREE')
         self.assertTrue(answer.startswith('ok 2023') or answer.startswith('ok 20'), answer)
         self.assertEqual(tree(live), incoming)
         self.assertEqual(tree(files / 'save-backups' / answer.split()[1] / 'save'), before)

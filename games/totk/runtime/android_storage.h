@@ -136,6 +136,65 @@ static int android_game_lock(const char *path, int wait_ms, char *why, size_t n)
     }
 }
 
+/* Complete both successful and refused launch handshakes. Never unlink game.lock itself (its inode is the protocol). */
+__attribute__((unused)) static int android_game_start_finished(const char *private_files) {
+    char path[PATH_MAX];
+    if (snprintf(path, sizeof path, "%s/state/game-starting", private_files) >= (int)sizeof path) { errno = ENAMETOOLONG; return -1; }
+    return unlink(path) && errno != ENOENT ? -1 : 0;
+}
+
+/* A close command must not start SINGLE_TASK TotkActivity: Android would pop the menu, losing its pending operation.
+   These private markers preserve the existing task/recents behavior. Paths are prepared once; an idle poll is one stat. */
+typedef struct { char request[PATH_MAX], response[PATH_MAX], temporary[PATH_MAX]; } AndroidClosePaths;
+__attribute__((unused)) static int android_close_paths(AndroidClosePaths *p, const char *private_files) {
+    if (snprintf(p->request, sizeof p->request, "%s/state/close-request", private_files) >= (int)sizeof p->request ||
+        snprintf(p->response, sizeof p->response, "%s/state/close-response", private_files) >= (int)sizeof p->response ||
+        snprintf(p->temporary, sizeof p->temporary, "%s/state/close-response.tmp", private_files) >= (int)sizeof p->temporary) {
+        errno = ENAMETOOLONG; return -1;
+    }
+    return 0;
+}
+static int android_close_reply(const AndroidClosePaths *p, const char *id, const char *reason) {
+    char text[512]; int n = snprintf(text, sizeof text, "%s\n%s\n", id, reason);
+    if (n < 0 || n >= (int)sizeof text) { errno = EOVERFLOW; return -1; }
+    int fd = open(p->temporary, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0) return -1;
+    ssize_t written = write(fd, text, (size_t)n);
+    int bad = written != n, saved = bad ? (written < 0 ? errno : EIO) : 0;
+    if (!bad && fsync(fd)) { bad = 1; saved = errno; }
+    if (close(fd) && !bad) { bad = 1; saved = errno; }
+    if (!bad && rename(p->temporary, p->response)) { bad = 1; saved = errno; }
+    if (bad) { unlink(p->temporary); errno = saved; return -1; }
+    return 0;
+}
+/* 0 absent or accepted, 1 consumed/refused with saving response, -1 I/O error (response includes errno when writable).
+   The Android accepted close exits; accepting/queued frontends may instead return 1. */
+__attribute__((unused)) static int android_close_poll(const AndroidClosePaths *p, int (*close_game)(void)) {
+    struct stat st;
+    if (stat(p->request, &st)) return errno == ENOENT ? 0 : -1;
+    char id[96] = "", why[256]; int fd = open(p->request, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        int saved = errno;
+        snprintf(why, sizeof why, "error: open close-request errno=%d (%s)", saved, strerror(saved));
+        android_close_reply(p, "", why); errno = saved; return -1;
+    }
+    ssize_t n = read(fd, id, sizeof id - 1); int saved = errno;
+    if (close(fd) && n >= 0) { n = -1; saved = errno; }
+    if (n <= 0) {
+        if (!n) saved = EINVAL;
+        snprintf(why, sizeof why, "error: read close-request errno=%d (%s)", saved, strerror(saved));
+        android_close_reply(p, "", why); errno = saved; return -1;
+    }
+    id[n] = 0; id[strcspn(id, "\r\n")] = 0;
+    if (unlink(p->request)) {
+        saved = errno;
+        snprintf(why, sizeof why, "error: consume close-request errno=%d (%s)", saved, strerror(saved));
+        android_close_reply(p, id, why); errno = saved; return -1;
+    }
+    if (close_game()) return 0;
+    return android_close_reply(p, id, "saving") ? -1 : 1;
+}
+
 /* A refused start (no data folder, the lock held, nothing installed) finishes the activity, but Android keeps the
    process: the next "Start game" would then reuse it, where start_game has already run once and the game never
    starts (a black window), and the launcher would see a game process and refuse save changes and moves. So the process

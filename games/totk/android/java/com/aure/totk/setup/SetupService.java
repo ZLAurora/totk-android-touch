@@ -142,17 +142,26 @@ public final class SetupService extends Service {
         wake.acquire(6 * 3600 * 1000L);
         Context context = getApplicationContext();
         new Thread(() -> {
-            String result = moveTo != null ? move(context, moveTo, moveName) : work(context, stages);
-            main.post(() -> finish(result));
+            String result;
+            GameLock.Result state = InstallState.gameState(context);
+            if (!state.free()) result = failure(moveTo != null ? "move" : "",
+                    state.state == GameLock.State.GAME ? "game_running" : "game_lock", state.reason);
+            else try (GameLock.Hold held = GameLock.hold(context.getFilesDir())) {
+                if (!held.result.free()) result = failure(moveTo != null ? "move" : "",
+                        held.result.state == GameLock.State.GAME ? "game_running" : "game_lock", held.result.reason);
+                else result = moveTo != null ? move(context, moveTo, moveName) : work(context, stages);
+            } catch (java.io.IOException failed) { result = failure(moveTo != null ? "move" : "", "game_lock", failed.toString()); }
+            String completed = result;
+            main.post(() -> finish(completed));
         }, "totk-setup").start();
     }
 
     private static String work(Context context, String[] stages) {
         if (!InstallState.libraryAvailable()) return failure("", "library", "libtotk_setup.so could not be loaded");
-        if (InstallState.gameRunning(context)) return failure("", "game_running", "the game process is running");
         Inputs inputs = Inputs.load(context);
         try (Inputs.Opened opened = inputs.open(context, true, stages)) {
             android.util.Log.i("TotkSetup", "inputs: " + opened.byPath + " by path (All files access " + (FileAccess.granted() ? "on" : "off") + ")");
+            opened.request.put("skipCompanion", ArtPolicy.skipSetup(SettingsStore.secondaryDisplay(context), stages != null));
             String result = NativeSetup.run(opened.request.toString(), (stage, done, total, detail) ->
                     main.post(() -> progress(context, stage, done, total, detail)));
             JSONObject parsed = new JSONObject(result == null ? "{}" : result);
@@ -168,14 +177,13 @@ public final class SetupService extends Service {
      * first, so the game can never start on a copy that is about to be removed — and only then remove the old copy. */
     private static String move(Context context, String to, String name) {
         if (!InstallState.libraryAvailable()) return failure("move", "library", "libtotk_setup.so could not be loaded");
-        if (InstallState.gameRunning(context)) return failure("move", "game_running", "the game process is running");
         java.io.File from = InstallState.gameDir(context), target = new java.io.File(to);
         StorageLocation.Volume volume = StorageLocation.target(context, target, name);
         if (volume == null) return failure("move", StorageLocation.kind(context, target) == StoragePaths.Kind.FOLDER && !FileAccess.granted()
                 ? "access" : "not_available", "the target storage is not available");
         try {
             JSONObject request = new JSONObject().put("from", from.getPath()).put("to", to).put("privateDir", context.getFilesDir().getPath())
-                    .put("romfsPartBytes", StorageLocation.partBytes(context, target));
+                    .put("romfsPartBytes", StorageLocation.partBytes(context, target)).put("gameLockHeld", true);
             JSONObject parsed = new JSONObject(String.valueOf(NativeSetup.move(request.toString(), (stage, done, total, detail) ->
                     main.post(() -> progress(context, stage, done, total, detail)))));
             if (!parsed.optBoolean("ok")) return parsed.toString();

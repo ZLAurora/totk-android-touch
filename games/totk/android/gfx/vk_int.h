@@ -154,12 +154,16 @@ typedef struct {
     VkPhysicalDeviceProperties props; VkPhysicalDeviceMemoryProperties mp;
     uint32_t timestamp_bits;   /* selected queue family's timestampValidBits */
     int has_pipeline_statistics;   /* pipelineStatisticsQuery, already enabled with supported core features */
+    int has_host_query_reset;   /* hostQueryReset, for fence-owned profiling pools shared by pre/main buffers */
     int has_custom_border, has_null_descriptor, has_index_u8, has_depth_clip_control, has_eds3, has_divisor, has_bc;
     int has_geometry, has_layer_output, has_logic_op, has_dual_src;
     int has_image_read_without_format, has_image_write_without_format;
     int has_cache_control;   /* pipelineCreationCacheControl: a pipeline can be asked of the pipeline cache alone (vk_draw.c pipe_get) */
     int has_pipeline_library;
     int pipeline_library_fast_linking, pipeline_library_independent_interpolation;
+    int subgroup_fix, subgroup_control;
+    VkPhysicalDeviceSubgroupProperties subgroup;
+    VkPhysicalDeviceSubgroupSizeControlProperties subgroup_sizes;
     VkSampleCountFlags samples;
     VkPipelineCache pcache;
     PFN_vkGetPhysicalDeviceFormatProperties get_format_props;
@@ -249,6 +253,7 @@ void vk_wait_fence(uint64_t ticket); /* wait this already-submitted ticket, not 
 uint64_t vk_submit_readback(void); /* seal/queue an open stream before CPU readback ownership, without a global GPU wait */
 uint64_t vk_present_ready_ns(uint64_t ticket); /* predict/framegen exact CPU completion observation; 0 if missing/expired */
 void vk_submit_chunk(void);     /* inside a game submission: submit what is recorded so far (render pass starts) */
+int vk_submit_chunk_possible(void); /* vk_submit_chunk would submit: inside a game submission with an open slot */
 void vk_gpu_time_guest_submit(uint64_t ns, uint64_t origin_ticks, uint64_t frame); /* next walk's immutable guest entry context */
 int vk_gpu_time_hardware(void);
 uint64_t vk_gpu_time_controller_end(uint64_t addr, uint64_t timestamp, uint64_t origin); /* v143 FPS END getter only; returns ns preserving producer work */
@@ -293,6 +298,11 @@ void vk_ub_read_record(uint64_t addr, void *dst, size_t size);
 int vk_lag_uniform_read(uint64_t addr, uint64_t size, VkDeviceSize align, VkDescriptorBufferInfo *out);
 /* Ordered pre-render materialization for true original-memory aliases only; never allocates a UBO copy. */
 void vk_lag_uniform_prepare(uint64_t addr, uint64_t size);
+/* TOTK_VK_PREPARE_MASK: walk-owned invalidation for that pre-render materialization, NOT selected-content authority.
+   1 when an overlay, original-memory producer or mapping revision advanced since the last call. The check variant runs
+   a preparation the masks skipped and dies if it still had to materialize (TOTK_VK_PREPARE_CHECK oracle). */
+int vk_lag_uniform_prepare_changed(void);
+void vk_lag_uniform_prepare_check(uint64_t addr, uint64_t size);
 int vk_lag_uniform_private(void);
 /* Walking-only monotonic counter: a capture without stable native writer-watch authority must not enter an outer
    freeze memo. Sample before/after a stage freeze and cache that stage only if the counter did not change. */
@@ -363,6 +373,8 @@ void vk_lag_test_stats_get(vk_lag_test_stats *out); /* no walking thread may mut
 int vk_lag_test_query_bench(void); /* standalone pre-initialization query correctness/timing fixture */
 int vk_draw_test_touch_bench(void); /* standalone reflection-enumeration microbenchmark */
 int vk_draw_test_binding_bench(void); /* standalone exact stage-binding key microbenchmark */
+int vk_draw_test_prepare_bench(void); /* --lag-walk-bench: production preparation over eight bound ranges */
+void vk_draw_test_prepare_counts(uint64_t *calls, uint64_t *skips, uint64_t *checks);
 #endif
 void vk_lag_stats(uint64_t frame);
 int vk_resolve_span(uint64_t addr, VkBuffer *buf, uint64_t *off, uint64_t *avail);   /* the buffer holding addr and the bytes it holds from there */
@@ -474,6 +486,7 @@ int vk_tex_native_window(vk_tex *x);
 int vk_tex_canvas_window(vk_tex *x);
 vk_canvas_image vk_tex_canvas_identity(vk_tex *x, unsigned level, unsigned layer);
 int vk_tex_view_identity(vk_tex *x, VkImageView view, vk_canvas_image *image, VkImageSubresourceRange *range);
+VkImageView vk_tex_view_levels(vk_tex *x, VkImageView view, uint32_t levels); /* the view's first `levels` levels only */
 void vk_pso_life_external_write(vk_tex *x, unsigned mip, unsigned layer, unsigned layers, const char *source);
 void vk_pso_life_external_read(uint32_t width, uint32_t height, const char *source);
 VkImage vk_tex_native_image(vk_tex *x); /* identity only; does not realize or synchronize */
@@ -514,11 +527,20 @@ void vk_wb_test_sweep(uint64_t v[6]); /* interval/peak WB-sweep ns, max bytes/ch
 void vk_wb_test_tile(const tex_t *t, uint64_t v[6]); /* last GPU/landed version, write sub/serial, invalidates/stale entries */
 void vk_wb_test_fresh(uint64_t v[3]); /* landed before base quiet, bytes, relevant copy-fence wait ns */
 uint64_t vk_wb_test_inflight(void); /* exact preflight matches on a synchronous owner's borrowed landing list */
+void vk_res_mem(uint64_t v[8]); /* resource memory summary (also read by the present statistics) */
+void vk_draw_test_split_counts(uint64_t out[5]); /* splits, reopened parts, refused passes, depth touches, LRZ refusals */
+void vk_draw_test_clear_counts(uint64_t out[2]); /* ClearTexture calls cleared through the region path: partial, masked */
+void vk_draw_test_feedback_counts(uint64_t out[2]); /* TOTK_VK_FEEDBACK_CUT sampled views cut, left whole */
 #endif
 void vk_res_stats(void);   /* rendered / copied / cleared by the GPU: never re-uploaded from guest memory */
+void vk_upload_threads_init(void);         /* launch-time TOTK_VK_UPLOAD_THREADS, before any upload */
+void vk_upload_report(uint64_t frame);     /* every 300 presents: uploads, their wall time and parallel deswizzles */
 void vk_texel_stats(uint64_t frame); /* opt-in CPU texel access counters, per 300 frames */
 /* the texture registered at a texture-pool id (vk_reg), resolved to its Vulkan view; NULL for an empty slot */
 VkImageView vk_tex_by_id(int tid, int *target_out, vk_tex **x_out);
+void vk_tex_memo_init(void);               /* launch-time TOTK_VK_TEX_MEMO, before any lookup */
+int vk_tex_memo_on(void);                  /* the value in use (live) */
+void vk_tex_memo_counts(uint64_t out[5]);  /* TOTK_VK_TEX_MEMO: hits, misses, retirements (published every 4096 lookups), registrations, unchanged ones */
 #ifdef TOTK_VK_TESTS
 void vk_tex_lookup_counters(uint64_t out[3]); /* calling thread: requests, registry/view slow paths, readiness checks */
 #endif
@@ -529,7 +551,7 @@ VkSampler vk_dummy_sampler(void);
 VkBufferView vk_dummy_tbuf(void);
 
 /* ---------- shaders and programs (vk_shader.c) ---------- */
-enum { RB_SUPPORT = 1, RB_CBUF, RB_C1, RB_DRV0, RB_DRV2, RB_SBUF, RB_SBUF_UBO, RB_UBO_PTR, RB_TEX, RB_TBUF, RB_IMG, RB_SAMP, RB_TEXSAMP };
+enum { RB_SUPPORT = 1, RB_CBUF, RB_C1, RB_DRV0, RB_DRV2, RB_SBUF, RB_SBUF_UBO, RB_UBO_PTR, RB_TEX, RB_TBUF, RB_IMG, RB_SAMP, RB_TEXSAMP, RB_ALPHA };
 typedef struct {
     uint16_t binding, count;
     uint8_t kind;           /* RB_* */
@@ -545,15 +567,20 @@ typedef struct vk_shader {
     size_t spv_bytes;       /* original seed module size, for opt-in compute diagnostics */
     int stage;              /* NVN stage 0 vertex, 1 fragment, 5 compute */
     VkShaderModule mod;
+    uint32_t required_subgroup_size;
     VkDescriptorSetLayout dsl;
     int nb; vk_bind *b;
     uint8_t *c1; uint32_t c1_len;   /* the shader's own constant bank c1 (from its package) */
     uint32_t vin_mask;      /* vertex inputs read (location = NVN attribute) */
     uint8_t vin_class[32];  /* 0 float 1 uint 2 sint */
-    uint32_t fout_mask;     /* fragment colour outputs written */
+    uint32_t fout_mask;     /* fragment colour output locations declared (with TOTK_VK_UNWRITTEN_MASK, arrays span theirs) */
+    uint32_t fout_span;     /* the SPIR-V Output locations, arrays spanning theirs: a live TOTK_VK_UNWRITTEN_MASK never masks them */
     int writes_depth;
+    uint8_t load_position_attr; /* 1 + attribute of a certified straight-line vec4(xy,0,1) position; zero unknown */
+    uint32_t load_full_outputs; /* unconditional complete fragment outputs, with no discard/control-flow */
     int early_tests;        /* original NVN control byte 0x718; honored by default (EARLYZ=0 is a diagnostic override) */
     int depth_spec;         /* fragment depth exports patched: + specialization constant D16_SPEC_ID (the DEPTH16 nudge, vk_draw.c) */
+    unsigned alpha_func;    /* zero: original module; 1..7: alpha-reject fragment variant with a reference UBO */
     uint32_t local[3];      /* compute thread group size */
     uint64_t c1_sub; VkDescriptorBufferInfo c1_d;   /* vk_draw.c: this submission's copy of c1 */
     int has_storage_writes; /* reflection plus SPIR-V store marking; immutable after shader creation */
@@ -575,20 +602,43 @@ typedef enum {
     VK_PASS_END_ATTACHMENTS, VK_PASS_END_CLEAR, VK_PASS_END_COPY, VK_PASS_END_QUERY,
     VK_PASS_END_COMPUTE, VK_PASS_END_CPU_WAIT, VK_PASS_END_SUBMISSION,
     VK_PASS_END_UNIFORM, VK_PASS_END_PRESENT, VK_PASS_END_DIAGNOSTIC,
-    VK_PASS_END_MERGE_HAZARD
+    VK_PASS_END_MERGE_HAZARD, VK_PASS_END_SPLIT
 } vk_pass_end_kind;
 extern int vk_gpuprof_on;   /* initialized once at first slot; off hot paths are a single branch */
+void vk_gpuprof_identity(const char *commit, const char *package, uint64_t version, const char *build);
+void vk_gpuprof_shutdown(void); /* off: no-op; enabled: bounded renderer drain, reporter join, explicit retirement */
+int vk_gpuprof_renderer_drain(uint64_t timeout_ns); /* normal-close-only bounded recorder admission/fence wait */
 void vk_gpuprof_slot_begin(vk_gpuprof_slot **slot, VkCommandBuffer cb);
-void vk_gpuprof_slot_seal(vk_gpuprof_slot *slot);
-void vk_gpuprof_slot_complete(vk_gpuprof_slot *slot);   /* completion thread, AFTER the existing fence */
+void vk_gpuprof_slot_seal(vk_gpuprof_slot *slot); /* advances submission sequence even for a dropped/null lease */
+void vk_gpuprof_slot_complete(vk_gpuprof_slot **slot); /* fence completion: detach/enqueue only; no query reads or IO */
+void vk_gpuprof_slot_pre(vk_gpuprof_slot *slot, VkCommandBuffer cb);
+void vk_gpuprof_slot_end(vk_gpuprof_slot *slot, VkCommandBuffer cb);
+void vk_gpuprof_slot_cancel(vk_gpuprof_slot **slot); /* discard unsubmitted lease off walker */
+void vk_gpuprof_scope_begin(VkCommandBuffer cb, const char *label);
+void vk_gpuprof_scope_end(VkCommandBuffer cb);
 void vk_gpuprof_begin(VkCommandBuffer cb, const VkRenderingInfo *ri, const VkFormat formats[10],
                      const tex_t *const textures[10], const uint32_t widths[10], const uint32_t heights[10], uint32_t samples);
 void vk_gpuprof_end(VkCommandBuffer cb, vk_pass_end_kind reason, uint32_t detail);
-void vk_gpuprof_draw(vk_shader *const shaders[6], int compute);
+typedef struct {
+    VkQueryPool pool, stats;
+    uint32_t timestamp, stats_query1;
+    uint32_t *timestamp_count; /* immutable retired-slot record; assembler writes before its fence */
+} vk_gpuprof_end_token;
+void vk_gpuprof_end_deferred(vk_pass_end_kind reason, uint32_t detail, vk_gpuprof_end_token *token);
+void vk_gpuprof_end_emit(VkCommandBuffer cb, const vk_gpuprof_end_token *token);
+VkQueryPipelineStatisticFlags vk_gpuprof_stats_mask(void);
+void vk_gpuprof_secondary(int enabled);
+int vk_gpuprof_chunk_query(VkQueryPool *pool, uint32_t *query);
+void vk_gpuprof_draw(vk_shader *const shaders[6]);
 void vk_gpuprof_dispatch_begin(VkCommandBuffer cb);
-void vk_gpuprof_clear(uint32_t mask);   /* proven full attachment clear, before any draw */
-void vk_gpuprof_read(uint64_t address, uint64_t size);
-void vk_gpuprof_present(void);   /* recording lock; no submission and no wait */
+void vk_gpuprof_present(void); /* recording lock; CPU closure; sampled sealed-CB path submits one end-marker slot */
+#ifdef TOTK_VK_TESTS
+void vk_gpuprof_test_frame(VkCommandBuffer cb);
+void vk_gpuprof_test_flush(void);
+void vk_gpuprof_test_wait(void);
+void vk_gpuprof_test_pause(int paused);
+void vk_gpuprof_test_background(uint64_t counts[3]); /* enqueued, processed, dropped leases */
+#endif
 #define D16_SPEC_ID 9001
 typedef struct vk_prog vk_prog;
 /* The program's shaders for the current bind state (variant per stage): 0 ok, -1 a variant is missing (draw skipped) */
@@ -601,10 +651,22 @@ void vk_compute_start(void);
 void vk_compute_prepare(vk_shader *cs); /* startup/replay only; immutable module/layout handed to worker */
 void vk_compute_stop(void);
 void vk_compute_report(void);
+/* Priority lending for joins on background compiles (TOTK_VK_PIPE_BOOST=1, vk_draw.c). Graphics and compute workers
+   run at VK_WORKER_NICE. A thread that must wait for a worker's in-flight build lends that worker its own nice until
+   the build is published; the worker then restores itself. Lend under the queue mutex that publishes the build. */
+#define VK_WORKER_NICE 10
+typedef struct { int tid, lent, nice; } vk_lend;   /* tid: the worker building; lent: a waiter raised it to nice */
+int vk_thread_tid(void);
+int vk_pipe_boost_lend(vk_lend *l);             /* 1 raised, 0 not needed or switch off, -1 refused by the kernel */
+void vk_pipe_boost_restore(const vk_lend *l);   /* the worker itself, after publishing: back to VK_WORKER_NICE */
+void vk_pipe_boost_waited(uint64_t ns);         /* one join on a worker build, counted with the switch off too */
+void vk_draw_switches_init(void);               /* launch-time vk_draw.c switches, read once before any worker */
+int vk_unwritten_mask_on(void);                 /* TOTK_VK_UNWRITTEN_MASK: pipelines mask attachments without an output */
 int vk_shaders_ready(void);
 void vk_shader_seed_startup(const char *game_dir); /* freeze game-relative selection and diagnose seed before replay */
 const char *vk_shader_cache_path(const char *base, char *out, size_t size); /* folder/content-isolated disk state */
 vk_shader *vk_shader_seed(const char *variant, int stage, int early_tests); /* startup/replay exact seed, no guest state */
+vk_shader *vk_shader_alpha(vk_shader *base, unsigned func);
 void vk_pipeline_prewarm(void);   /* device/cache ready, before replay: load keys and queue the compile workers */
 void vk_shader_io_take(uint64_t *n, uint64_t *ns, uint64_t *max_ns);   /* seed files read since the last call, their total and longest time */
 uint64_t vk_compute_pipe_cum_ns(void); /* recording-side compute blocking only, never background build time */
@@ -620,6 +682,7 @@ void mtl_scan_stats(uint64_t *shader_ns, uint64_t *pso_ns);
 void vk_draw_exec(uint32_t op, const void *a);   /* every op the walker does not handle itself */
 const uint8_t *vk_exec_draw_next(void);          /* next record only while replaying a draw; NULL outside mtl_exec */
 void vk_end_rendering(void);                     /* end the render pass if one is open (transfers, submission end) */
+void vk_draw_texture_read(int tid, const tex_t *texture); /* first sampled/storage read resolves an overlapping load-clear */
 void vk_end_rendering_at(vk_pass_end_kind reason, uint32_t detail);
 void vk_pass_merge_counters(uint64_t out[4]);   /* deferred, retained, hazard splits, avoided boundaries */
 /* the bound state the shader variants are chosen by (vk_shader.c reads it) */
@@ -632,7 +695,7 @@ typedef struct {
     uint64_t tex[6][128], samp[6][128], img[6][32];
     uint32_t st_vmask[2], st_wmask[2], st_ref[2];
     p_poly_offset po; float vp[16][6]; float dr[2]; int has_vp; int depth_clamp, render_disabled, raster_discard;
-    float blend_color[4]; int64_t copy_stride;
+    float blend_color[4], alpha_ref; int64_t copy_stride;
     p_scissor sc; int has_sc;
     p_set_rt rt; int has_rt;
     int tex_hi[6];

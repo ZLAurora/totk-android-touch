@@ -99,6 +99,10 @@ static int move(const nvn_texdesc *d, unsigned level, unsigned layer, uint8_t *b
 int nvn_deswizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src, void *dst, size_t dst_pitch) {
     return move(d, level, layer, (uint8_t *)src, (uint8_t *)dst, dst_pitch, 1, 0, UINT64_MAX);
 }
+int nvn_deswizzle_span(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src, void *dst, size_t dst_pitch,
+                       uint64_t offset, uint64_t size) {
+    return move(d, level, layer, (uint8_t *)src, (uint8_t *)dst, dst_pitch, 1, offset, size);
+}
 int nvn_swizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src, size_t src_pitch, void *dst) {
     return move(d, level, layer, (uint8_t *)dst, (uint8_t *)src, src_pitch, 0, 0, UINT64_MAX);
 }

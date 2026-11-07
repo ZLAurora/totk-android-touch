@@ -27,6 +27,8 @@ static compute_entry *head, *tail;
 static pthread_t thread;
 static int started, running, stopping, stats_on, dirty;
 static uint64_t save_after;
+static vk_lend lend;                      /* mu: the worker and any nice a dispatch join lent it */
+static compute_entry *lend_for;           /* mu: the joined entry whose publication ends the loan */
 static char path[1100];
 static char (*history)[COMPUTE_KEY_BYTES];
 static uint32_t count;
@@ -61,6 +63,10 @@ static void build(compute_entry *e, int background) {
     VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
         .stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
                   .module = e->shader->mod, .pName = "main"}, .layout = e->layout};
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup = {
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
+        .requiredSubgroupSize = e->shader->required_subgroup_size};
+    if (subgroup.requiredSubgroupSize) ci.stage.pNext = &subgroup;
     VkPipeline p = VK_NULL_HANDLE; uint64_t began = host_now_ns();
     VkResult result = vk_pcache_compute(&ci, &p);
     uint64_t elapsed = host_now_ns() - began;
@@ -77,6 +83,8 @@ static void build(compute_entry *e, int background) {
     }
     pthread_mutex_lock(&mu);
     e->pipeline = p; e->state = result ? CP_FAILED : CP_READY;
+    vk_lend done = {0};
+    if (background && lend.lent && lend_for == e) { done = lend; lend.lent = 0; lend_for = NULL; }
     if (stats_on) {
         if (background) window.background++; else window.recording++;
         window.failures += result != VK_SUCCESS;
@@ -85,6 +93,7 @@ static void build(compute_entry *e, int background) {
             e->shader->local[0], e->shader->local[1], e->shader->local[2], elapsed / 1e6, result);
     }
     pthread_cond_broadcast(&cv); pthread_mutex_unlock(&mu);
+    vk_pipe_boost_restore(&done);
 }
 static void save(void) { /* mu held; payload snapshot and fsync never on recording */
     char (*copy)[COMPUTE_KEY_BYTES] = count ? malloc((size_t)count * COMPUTE_KEY_BYTES) : NULL;
@@ -99,8 +108,9 @@ static void save(void) { /* mu held; payload snapshot and fsync never on recordi
 }
 static void *worker(void *unused) {
     (void)unused; totk_thread_start("totk-compute", NULL);
-    setpriority(PRIO_PROCESS, 0, 10);
+    setpriority(PRIO_PROCESS, 0, VK_WORKER_NICE);
     pthread_mutex_lock(&mu);
+    lend.tid = vk_thread_tid();
     for (;;) {
         if (head) {
             compute_entry *e = head; head = e->next; if (!head) tail = NULL;
@@ -189,7 +199,10 @@ VkPipeline vk_compute_pipeline(vk_shader *cs, VkPipelineLayout *layout) {
         began = host_now_ns();
         promote(e);
         if (stats_on && (e->state == CP_QUEUED || e->state == CP_BUILDING)) window.joins++;
+        int joined = e->state == CP_QUEUED || e->state == CP_BUILDING, refused = 0;
         while (e->state == CP_QUEUED || e->state == CP_BUILDING) {
+            /* The single worker may still be finishing an earlier entry; the loan covers it and ends with this one. */
+            if (!refused) { int lent = vk_pipe_boost_lend(&lend); if (lent > 0) lend_for = e; else if (lent < 0) refused = 1; }
 #ifdef TOTK_VK_TESTS
             waiters++;
 #endif
@@ -198,6 +211,7 @@ VkPipeline vk_compute_pipeline(vk_shader *cs, VkPipelineLayout *layout) {
             waiters--;
 #endif
         }
+        if (joined) vk_pipe_boost_waited(host_now_ns() - began);
         if (e->state != CP_READY) {
             /* Worker startup/build failure is not permission to skip a dispatch. */
             e->state = CP_BUILDING;

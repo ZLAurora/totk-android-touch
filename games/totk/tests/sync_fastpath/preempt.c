@@ -79,7 +79,7 @@ static void deterministic(void) {
     pthread_mutex_lock(&G); owner.core_since = now_ns() - TK_STARVE_NS; tk_core_queue(&high); high.mask = 2;
     uint64_t before = owner.core_since; pthread_mutex_unlock(&G);
     runtime_core_checkpoint();
-    need(!owner.preempt && (g_sync_kick ? owner.core_since == before : owner.core_since != before), "stale checkpoint preserves new path and reproduces old handover when disabled");
+    need(!owner.preempt && ((g_sync_kick || runtime_core_wait_event) ? owner.core_since == before : owner.core_since != before), "stale checkpoint preserves validated paths and reproduces old handover when disabled");
     pthread_mutex_lock(&G); tk_core_unqueue(&high);
     high.mask = 1; tk_core_queue(&high); owner.tk_protect_until = now_ns() + TK_PROTECT_NS;
     need(!tk_core_should_yield(&owner), "protected owner cannot be preempted"); owner.tk_protect_until = 0;

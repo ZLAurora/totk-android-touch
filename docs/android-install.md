@@ -1,6 +1,6 @@
 # Installing TotK Native on Android
 
-TotK Native 1.0.0 runs **The Legend of Zelda: Tears of the Kingdom 1.4.3** natively on arm64 Android devices with a
+TotK Native runs **The Legend of Zelda: Tears of the Kingdom 1.4.3** natively on arm64 Android devices with a
 Qualcomm Adreno GPU. Tested on the AYN Thor (QCS8550, Adreno 740), the AYN Odin 3 (CQ8725S, Adreno 830) and the Retroid
 Pocket Duo (CQ7790S, Adreno 722). It is one APK for everyone. The APK contains **no Nintendo files**: no game code, art,
 text, fonts or shaders. On first start it asks for files from **your own copy** of the game and builds everything it
@@ -53,14 +53,16 @@ refused with an explanation. Other versions are not supported.
 
 ## Install
 
-1. Download `totk-native.apk` from the project's Releases page and install it (allow installs from your browser or file
+1. Download `TotK-Native-<version>.apk` from the project's Releases page and install it (allow installs from your browser or file
    manager). It installs side by side with older test builds.
 2. Open **TotK Native**. The setup screen asks for the files of your route. Pick them with the file picker; nothing is
    uploaded anywhere.
+   Before Prepare, the **Updates** step lets you turn off **Check for updates when the game starts** (On by default).
 3. Setup runs in the foreground (a notification shows progress; keep the device charged). It rewrites the game code for
    Android, copies and verifies the RomFS (reading, hashing and writing overlap, so the copy runs at the storage's
    speed), indexes it, writes the shared fonts from the bundled open Noto Sans font, then builds the Vulkan shader seed
-   and the dual-screen companion's drawings at the same time (each shows its own progress). The game needs the shader
+   and, on devices with a built-in second screen, the companion's drawings at the same time (each shows its own progress).
+   Without a built-in second screen, the drawings are marked *skipped · Not needed on this device*. The game needs the shader
    seed (without it nothing is drawn), so setup is finished only once it is built; if it fails, setup stops with the
    reason and *Resume*. Only the companion's drawings are optional: once the seed is done, *Play without second-screen
    art* stops that step and starts the game (build it later from *Game data*). Setup can be cancelled and resumed.
@@ -95,6 +97,28 @@ directly next time*; long-press the app icon and choose *Settings* to reach the 
 usable shader seed (an earlier version's *Play now* could skip it, or its files were removed) shows *Shaders not built*
 and offers *Build shaders* in place of *Start game*; the game is not started without the seed.
 
+## Versions and updates
+
+App versions and the supported game version are separate: app 1.0.1 still runs your game dump 1.4.3.
+Install a newer APK **over the existing app**, never uninstall first: saves, imported game data and settings survive.
+Only an APK for the same package signed with the same key can update it.
+
+By default the game checks GitHub's latest stable release once at startup, in the background, only on a validated
+internet connection. It sends no personal or game information, reads no response body, and never delays launch.
+Disable it in **About → Check for updates when the game starts**, or in setup's **Updates** step.
+**Update now** pauses the game and uses the menu's save-safe close before downloading into the app's cache.
+**Next time** keeps the version and offers **Update / Not now** before Home on the next launch, including offline.
+The download needs a connection; Cancel or an error leaves the installed app unchanged and keeps the pending version.
+If the download takes more than ten minutes, or transfers less than 64 KiB in 30 seconds, it stops with a clear
+message and removes partial files. The pending update is kept so you can try again on a faster connection.
+
+The download is checked against the release's `.sha256`, then checked for the app's package, a newer version code and
+the installed app's signing certificate. Android may ask you to enable **Allow from this source** for TotK Native;
+return to the app afterwards to continue. Denying it returns to Home and keeps the update for next time. Android's
+installer still asks for confirmation. Downloaded files are removed afterwards. The system may close the app when
+the update finishes; open it again normally.
+
+
 ## The second screen (dual-screen devices)
 
 On a device with a built-in second display (AYN Thor, Retroid Pocket Duo), the second screen shows Link's status, a map
@@ -109,6 +133,11 @@ arrows. Each tap does exactly what the game itself would do. Buttons are greyed 
 not allow it: with the pause menu or map open ("Close the game menu first"), in cutscenes and conversations, while
 loading or saving, on the title screen, with full hearts (for food that only heals), or for actions not available from
 the second screen yet (energy-recovering materials, fusing Zonai devices to arrows). More: [companion.md](companion.md).
+
+If the art is missing on a dual-screen device, **Start game** offers **Prepare second-screen art** (with progress, then
+the game starts) or **Play without it** (remembered for this install, including after app restarts). You can build it
+later from **Game data → Second-screen art**, even on a single-screen device. Outdated art is updated automatically
+only on dual-screen devices; single-screen devices get no art rebuild reminder.
 
 ## Where the game data lives (internal storage, SD card or a folder you choose)
 
@@ -206,13 +235,17 @@ Saves live in the app's private storage. Uninstalling the app removes them: expo
 ## Drivers
 
 The APK bundles a pinned Mesa Turnip build (MIT; how to rebuild it: `games/totk/android/turnip/README.md`). To try your
-own Turnip build, open the app's *Game data → Graphics driver* (or copy it as `driver.so` into the game folder);
-*Use the bundled driver* goes back to the bundled one. `TOTK_VK_DRIVER=system` in `totk.env` there selects the system
-driver instead; no current Qualcomm system driver passes the game's startup check, so that is for testing only.
+own Turnip build, open the app's *Game data → Graphics driver* and pick its AdrenoTools `.zip` as downloaded, or its
+64-bit ARM `.so` (you can also copy the library as `driver.so` into the game folder). The zip's `meta.json` selects
+`libraryName` and supplies the displayed name; without metadata, a zip must contain exactly one `.so`.
+Only that library is installed, and a refused import leaves your current driver unchanged. Libraries are limited to
+128 MiB, metadata to 64 KiB and archives to 256 entries / 160 MiB. *Use the bundled driver* goes back to the bundled one.
+`TOTK_VK_DRIVER=system` in `totk.env` there selects the system driver instead; no current Qualcomm system driver
+passes the game's startup check, so that is for testing only.
 
 ## Versions
 
-The app has its own version (1.0.0, semantic versioning); the game version it runs (1.4.3) is shown separately. The
+The app has its own version (e.g. 1.0.1, semantic versioning); the game version it runs (1.4.3) is shown separately. The
 Android version code grows with it: major × 10000 + minor × 100 + patch (1.0.0 is 10000, 1.2.3 would be 10203), so an
 update always installs over the previous release. Release APKs are signed with one release key (certificate SHA-256
 `a9e7a2a9fad6fdaede18c45a458e4555c0904658c9d7f4b74a73d9c83b67e2bf`); test builds signed with other keys cannot be

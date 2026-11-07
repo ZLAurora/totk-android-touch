@@ -92,3 +92,37 @@ static inline uint64_t vk_gpu_time_sample_consume(vk_gpu_time_samples *samples,
     }
     return consumer_origin + samples->last_work_ticks;
 }
+
+/* Opt-in FPS-only median: absolute reports and DRS pairs remain untouched.
+   Re-reading one completed END against a newer live origin is not a new
+   measurement. Invalid reads hold the last filtered input, just as the raw
+   consumer holds its last valid producer duration. No synthetic warmup zeros. */
+typedef struct {
+    uint64_t work[3], addr[3], timestamp[3], output;
+    unsigned count, next;
+} vk_gpu_time_fps_filter;
+
+static inline int vk_gpu_time_fps_median_enabled(const char *value) {
+    return value && value[0] == '1' && value[1] == '\0';
+}
+
+static inline uint64_t vk_gpu_time_fps_median(vk_gpu_time_fps_filter *filter,
+                                             uint64_t addr, uint64_t timestamp,
+                                             uint64_t work, int valid) {
+    if (!valid) return filter->output;
+    for (unsigned i = 0; i < filter->count; i++)
+        if (filter->addr[i] == addr && filter->timestamp[i] == timestamp)
+            return filter->output;
+    filter->addr[filter->next] = addr; filter->timestamp[filter->next] = timestamp;
+    filter->work[filter->next] = work;
+    filter->next = (filter->next + 1) % 3;
+    if (filter->count < 3) filter->count++;
+    filter->output = work;
+    if (filter->count == 3) {
+        uint64_t a = filter->work[0], b = filter->work[1], c = filter->work[2];
+        if (a > b) { uint64_t t = a; a = b; b = t; }
+        if (b > c) b = c;
+        filter->output = a > b ? a : b;
+    }
+    return filter->output;
+}

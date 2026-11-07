@@ -124,10 +124,16 @@ typedef struct {
 typedef struct {
     uint64_t ns[VK_REC_N], cpu, wall, seal, wait, draws, freeze_hits, program_hits;
     int frames;
+    uint64_t descriptors[8], api[3], wakes[4];
 } walk_measure;
 static uint64_t walk_clock(clockid_t clock) {
     struct timespec t; if (clock_gettime(clock, &t)) DIE("walking benchmark clock_gettime failed");
     return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
+/* Driver-level descriptor calls; nonzero only when TOTK_VK_TEST_CALL_COUNTS installed the counting wrappers. */
+static void walk_api_counts(uint64_t out[3]) {
+    out[0] = atomic_load(&count_vkAllocateDescriptorSets); out[1] = atomic_load(&call_sets);
+    out[2] = atomic_load(&count_vkResetDescriptorPool);
 }
 static void walk_tint(int frame, int set, int binding, int storage, float color[4]) {
     color[0] = (float)((frame + set + binding + storage) % 5 + 1) / 8;
@@ -948,6 +954,7 @@ static int lag_walk_bench(int argc, char **argv) {
     setenv("TOTK_VK_CHUNK_DRAWS", "0", 1);
     setenv("TOTK_VK_WRITEBACK", "1", 0);
     mtl_init();
+    call_counts_install();
     CHECK(vk_rec_profile_on, "walking benchmark profiles every opcode/draw");
     const char *rename = getenv("TOTK_VK_UB_RENAME");
     CHECK(!(rename && atoi(rename) && !vk_off("rename")), "walking benchmark keeps opt-in ordinary UBO renaming OFF");
@@ -1042,6 +1049,15 @@ static int lag_walk_bench(int argc, char **argv) {
         streams[chunk] = malloc(WALK_STREAM_BYTES); if (!streams[chunk]) DIE("walking benchmark stream allocation failed");
         handles[chunk] = (uint64_t)(uintptr_t)streams[chunk];
     }
+    if (vk_lag_uniform_private()) {
+        rn = 0; walk_setup(&fixture); walk_bind(&fixture, &banks[0], 0);
+        struct { uint64_t dst, n; uint32_t value[4]; } update = {
+            (uint64_t)(uintptr_t)(banks[0].cpu + 0x28000), 16, {1, 0, 0, 0}};
+        op(OP_UPDATE_UB, &update, sizeof update);
+        mtl_sub_begin(); walk_exec();
+        CHECK(!vk_draw_test_prepare_bench(), "uniform preparation microfixture completes");
+        CHECK(mtl_wait(mtl_sub_commit(), 30000000000ull), "uniform preparation microfixture publishes its private update");
+    }
     walk_measure measured[3] = {0};
     const char *case_names[] = {"stable-binding", "churn-binding", "chunk-stress"};
     const int stress_frames = 2, case_frames = warmup + frames, recorder = vk_record_enabled();
@@ -1086,6 +1102,8 @@ static int lag_walk_bench(int argc, char **argv) {
         uint64_t previous[VK_REC_N], current[VK_REC_N], delta[VK_REC_N];
         vk_record_test_counts count0, count1; vk_record_test_counts_get(&count0);
         vk_record_test_profile_ns(previous, VK_REC_N);
+        uint64_t desc0[8], desc1[8], api0[3], api1[3], wake0[4], wake1[4]; vk_record_test_descriptors(desc0); walk_api_counts(api0);
+        vk_record_test_wakes(wake0);
         uint64_t serial = vk_submit_serial(), cpu_ns = 0, wall_ns = 0, seal_ns = 0;
         mtl_sub_begin(); mtl_sub_snapshot_ubos_cap(handles, WALK_CHUNKS, NULL);
         if (pending_service) atomic_store(&service.active, 1);
@@ -1115,6 +1133,7 @@ static int lag_walk_bench(int argc, char **argv) {
         uint64_t wait0 = walk_clock(CLOCK_MONOTONIC);
         CHECK(mtl_wait(fence, 30000000000ull), "walking frame %d real Vulkan execution completes", frame);
         uint64_t wait_ns = walk_clock(CLOCK_MONOTONIC) - wait0, chunks = vk_submit_serial() - serial;
+        vk_record_test_descriptors(desc1); walk_api_counts(api1); vk_record_test_wakes(wake1);
         CHECK(chunks == (stress ? WALK_CHUNKS : 1),
             "walking %s frame %d has %s actual Vulkan submissions (%llu observed)",
             case_names[phase], sample, stress ? "exactly twelve" : "exactly one", (unsigned long long)chunks);
@@ -1150,11 +1169,23 @@ static int lag_walk_bench(int argc, char **argv) {
             seal_ns / (double)WALK_DRAWS, wait_ns / (double)WALK_DRAWS, (unsigned long long)chunks, (unsigned long long)hash);
         walk_print_profile(label, delta, WALK_DRAWS);
         walk_print_hits(label, accepted, freeze_hits, program_hits, recorder);
+        printf("lag-walk %s descriptors: sets=%llu calls=%llu resets=%llu walker_ns=%llu list_ns=%llu lists=%llu template_ns=%llu templates=%llu\n",
+            label, (unsigned long long)(desc1[0] - desc0[0]), (unsigned long long)(desc1[1] - desc0[1]),
+            (unsigned long long)(desc1[2] - desc0[2]), (unsigned long long)(desc1[3] - desc0[3]),
+            (unsigned long long)(desc1[4] - desc0[4]), (unsigned long long)(desc1[5] - desc0[5]),
+            (unsigned long long)(desc1[6] - desc0[6]), (unsigned long long)(desc1[7] - desc0[7]));
+        if (call_counts_path)
+            printf("lag-walk %s api: vkAllocateDescriptorSets=%llu allocated_descriptor_sets=%llu vkResetDescriptorPool=%llu\n",
+                label, (unsigned long long)(api1[0] - api0[0]), (unsigned long long)(api1[1] - api0[1]),
+                (unsigned long long)(api1[2] - api0[2]));
         if (!warming) {
             walk_measure *m = &measured[phase]; m->frames++;
             m->cpu += cpu_ns; m->wall += wall_ns; m->seal += seal_ns; m->wait += wait_ns;
             m->draws += accepted; m->freeze_hits += freeze_hits; m->program_hits += program_hits;
             for (int k = 0; k < VK_REC_N; k++) m->ns[k] += delta[k];
+            for (int k = 0; k < 8; k++) m->descriptors[k] += desc1[k] - desc0[k];
+            for (int k = 0; k < 3; k++) m->api[k] += api1[k] - api0[k];
+            for (int k = 0; k < 4; k++) m->wakes[k] += wake1[k] - wake0[k];
         }
     }
     for (int phase = 0; phase < 3; phase++) {
@@ -1164,6 +1195,21 @@ static int lag_walk_bench(int argc, char **argv) {
                "measured_frames=%d measured_draws=%.0f%s\n", label, m->cpu / draws, m->wall / draws, m->seal / draws, m->wait / draws,
             m->frames, draws, phase == 2 ? " (separate actual-chunk stress case)" : "");
         walk_print_profile(label, m->ns, draws); walk_print_hits(label, m->draws, m->freeze_hits, m->program_hits, recorder);
+        double n = m->frames ? m->frames : 1;
+        printf("lag-walk %s descriptors/frame: sets=%.2f calls=%.2f resets=%.2f walker_ns=%.0f list_ns=%.0f lists=%.2f template_ns=%.0f templates=%.2f\n",
+            label, m->descriptors[0] / n, m->descriptors[1] / n, m->descriptors[2] / n, m->descriptors[3] / n,
+            m->descriptors[4] / n, m->descriptors[5] / n, m->descriptors[6] / n, m->descriptors[7] / n);
+        printf("lag-walk %s recorder wakes/frame: walker=%.2f worker_chained=%.2f polled_hits=%.2f parks=%.2f\n",
+            label, m->wakes[0] / n, m->wakes[1] / n, m->wakes[2] / n, m->wakes[3] / n);
+        if (call_counts_path)
+            printf("lag-walk %s api/frame: vkAllocateDescriptorSets=%.2f allocated_descriptor_sets=%.2f vkResetDescriptorPool=%.2f\n",
+                label, m->api[0] / n, m->api[1] / n, m->api[2] / n);
+    }
+    {   /* What the measured phases left retained (TOTK_VK_DESC_STOCK arms compare this, not only the call counts). */
+        uint64_t kept[4]; vk_record_test_descriptor_retained(kept);
+        printf("lag-walk descriptor retention: pools %llu (recorder %llu, primary %llu) ~%.1f MiB at the reported per-pool estimate, stock sets %llu\n",
+            (unsigned long long)(kept[0] + kept[1]), (unsigned long long)kept[0], (unsigned long long)kept[1],
+            (kept[0] + kept[1]) * kept[3] / 1048576.0, (unsigned long long)kept[2]);
     }
     if (pending_service) {
         atomic_store(&service.stop, 1); pthread_join(service_thread, NULL);
@@ -1178,6 +1224,10 @@ static int lag_walk_bench(int argc, char **argv) {
        but every pixel/zero-wait assertion remains mandatory and the process exits nonzero on any failure. */
     fflush(stdout); /* preserve the measured before/after data even if the bounded strict fixture exits */
     walk_safety(&fixture, &banks[WALK_SETS], output + 0x20000);
+    uint64_t prepare_calls, prepare_skips, prepare_checks;
+    vk_draw_test_prepare_counts(&prepare_calls, &prepare_skips, &prepare_checks);
+    printf("lag-prepare totals: %llu calls, %llu skipped, %llu oracle checks\n",
+        (unsigned long long)prepare_calls, (unsigned long long)prepare_skips, (unsigned long long)prepare_checks);
     for (int chunk = 0; chunk < WALK_CHUNKS; chunk++) free(streams[chunk]);
     /* Drain before releasing alias/view/owner lifetimes. No fixture mapping is retired with worker packets in flight. */
     mtl_drain(); nvn_dirty_remove_range(output); mtl_pool_del(output); munmap(output_mapping, 0x50000);
@@ -1691,7 +1741,6 @@ static int settled_learning(void) {
     CHECK(before[0] == TILES && before[6] == TILES && !before[2] && !before[5], "one prompt landing for each of the 64 baked storages");
     CHECK(!allocation[0] && !allocation[2] && !allocation[3] && allocation[4] == TILES && allocation[1] < 32768,
         "landed tiles retain only small image-free learning metadata, not record capacity or image pins");
-    extern void vk_res_mem(uint64_t v[8]);
     vk_res_mem(resources);
     CHECK(resources[0] && resources[7] && resources[4] == TILES, "landed images stay in the ordinary cache; blocks remain reusable");
 
@@ -2534,6 +2583,21 @@ int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--settled-wb")) return settled_suite();
     if (argc == 3 && !strcmp(argv[1], "--settled-wb-child")) return settled_child(!strcmp(argv[2], "off"));
     if (argc == 1 && settled_suite()) return 1;
+    /* TOTK_NVN_CALL_NOCOPY: production command probes, a call/release/EndRecording race (TSan) and the
+       CallCommands + EndRecording microbenchmark in both arms; no Vulkan needed. */
+    if (argc >= 2 && !strcmp(argv[1], "--nvn-call")) {
+        extern int test_nvn_call_nocopy(int nocopy, int rounds);
+        extern double test_nvn_call_bench(int nocopy, int frames, size_t *bytes_out);
+        int bad = 0; for (int arm = 0; arm < 2; arm++) bad += test_nvn_call_nocopy(arm, 2000);
+        int frames = argc >= 3 ? atoi(argv[2]) : 2000; size_t bytes[2] = {0};
+        for (int rep = 0; rep < 3 && frames > 0; rep++) for (int arm = 0; arm < 2; arm++) {
+            int a = rep % 2 ? 1 - arm : arm;
+            double ns = test_nvn_call_bench(a, frames, &bytes[a]);
+            printf("bench nvn-call-nocopy%d ns/draw=%.1f (ns per frame: 64 called lists into one caller, %zu bytes)\n", a, ns, bytes[a]);
+        }
+        if (bytes[0] != bytes[1]) bad++;
+        printf("%s: nvn call nocopy %d failed\n", bad ? "FAILED" : "ok", bad); return bad != 0;
+    }
     if (argc >= 2 && !strcmp(argv[1], "--lag-walk-bench")) return lag_walk_bench(argc, argv);
     if (argc == 2 && !strcmp(argv[1], "--texcopy")) return texcopy_suite();
     if (argc == 2 && !strcmp(argv[1], "--texcopy-child")) return texcopy_child();
@@ -2613,6 +2677,215 @@ int main(int argc, char **argv) {
     p_viewports vp; memset(&vp, 0, sizeof vp); vp.n = 1; vp.v[0][2] = 64; vp.v[0][3] = 64; vp.v[0][5] = 1; op(OP_VIEWPORTS, &vp, sizeof vp);
     p_draw dw = {4, 0, 3, 0, 0}; op(OP_DRAW, &dw, sizeof dw);
     p_copy_b2t cp; memset(&cp, 0, sizeof cp); cp.src = (uint64_t)(uintptr_t)readback; cp.tex = &rt; cp.r = (NVNcopyRegion){0, 0, 0, 64, 64, 1}; op(OP_COPY_T2B, &cp, sizeof cp);
+    if (argc >= 2 && !strcmp(argv[1],"--alpha-test")) {
+        CHECK(mtl_wait(run(),5000000000ull),"alpha fixture initial draw completes");
+        const float full[]={-1,-1,3,-1,-1,3}; memcpy(vtx,full,sizeof full);
+        /* Exact binary alphas keep EQUAL independent of the sampler's UNORM
+         * conversion precision (which differs between valid host drivers). */
+        fub[3]=.5f;
+        for (int y=0;y<64;y++) for (int x=0;x<64;x++) lin[4*(y*64+x)+3]=((x+y)&1)?255:0;
+        CHECK(!nvn_swizzle(&tx.d,0,0,lin,256,tx.mem),"alpha checkerboard is swizzled");
+        mtl_pool_invalidate(&P_cpu,(uint64_t)((uint8_t *)tx.mem-cpu_pool),tx.L.size);
+        extern void vk_draw_test_correctness_counts(uint64_t out[2]);
+        uint64_t before[2],after[2]; vk_draw_test_correctness_counts(before);
+        for (unsigned enabled=0;enabled<2;enabled++) {
+            totk_live_lines lines={0}; const char *setting=enabled ?
+                "set TOTK_VK_ALPHA_TEST=1\n" : "set TOTK_VK_ALPHA_TEST=0\n";
+            totk_live_feed(&lines,setting,strlen(setting)); totk_live_frame(enabled+1);
+            for (unsigned func=NVN_ALPHA_FUNC_NEVER;func<=NVN_ALPHA_FUNC_ALWAYS;func++) {
+                color_st color={0,NVN_LOGIC_OP_COPY,func};
+                p_bind_state state={.kind=1}; memcpy(state.bytes,&color,sizeof color);
+                p_scissor all={0,0,64,64};
+                op(OP_SET_RT,&srt,sizeof srt); op(OP_SCISSOR,&all,sizeof all); op(OP_CLEAR_COLOR,&cc,sizeof cc);
+                op(OP_BIND_STATE,&state,sizeof state); op(OP_BIND_VBUF,&vb,sizeof vb);
+                const float references[]={.25f,0,.5f,.25f};
+                for (unsigned stripe=0;stripe<4;stripe++) {
+                    p_scissor area={(int)stripe*16,0,16,64};
+                    p_alpha_ref ref={references[stripe]};
+                    op(OP_ALPHA_REF,&ref,sizeof ref); op(OP_SCISSOR,&area,sizeof area); op(OP_DRAW,&dw,sizeof dw);
+                }
+                op(OP_COPY_T2B,&cp,sizeof cp);
+                CHECK(mtl_wait(run(),5000000000ull),"alpha func %u enabled %u completes",func,enabled);
+                int bad=0;
+                for (int y=0;y<64;y++) for (int x=0;x<64;x++) {
+                    float a=((x+y)&1)?.5f:0, ref=references[x/16];
+                    int pass=!enabled || func==NVN_ALPHA_FUNC_ALWAYS ||
+                        (func==NVN_ALPHA_FUNC_LESS && a<ref) || (func==NVN_ALPHA_FUNC_EQUAL && a==ref) ||
+                        (func==NVN_ALPHA_FUNC_LEQUAL && a<=ref) || (func==NVN_ALPHA_FUNC_GREATER && a>ref) ||
+                        (func==NVN_ALPHA_FUNC_NOTEQUAL && a!=ref) || (func==NVN_ALPHA_FUNC_GEQUAL && a>=ref);
+                    const uint8_t *pixel=readback+4*(y*64+x);
+                    bad+=pass ? abs(pixel[0]-4*x)>2 || abs(pixel[1]-2*y)>2 ||
+                        pixel[2]!=128 || abs(pixel[3]-(int)(a*255+.5f))>1 :
+                        pixel[0]!=0 || pixel[1]!=0 || pixel[2]!=255 || pixel[3]!=255;
+                }
+                CHECK(!bad,"alpha checkerboard comparison %u live %u: %d incorrect pixels",func,enabled,bad);
+            }
+        }
+        vk_draw_test_correctness_counts(after);
+        CHECK(after[0]-before[0]==56 && after[1]-before[1]==28,
+            "alpha-use counters include switch-off draws, exclude ALWAYS (%llu enabled, %llu ignored)",
+            (unsigned long long)(after[0]-before[0]),(unsigned long long)(after[1]-before[1]));
+        printf("%s: alpha-test %d checks, %d failed\n",fails?"FAILED":"ok",checks,fails);
+        return fails!=0;
+    }
+    if (argc >= 2 && !strcmp(argv[1],"--clear-on-read")) {
+        CHECK(mtl_wait(run(),5000000000ull),"read-before-attach fixture initial draw completes");
+        extern uint64_t vk_draw_test_clear_read_count(void);
+        tex_t alias=rt; alias.serial=103;
+        mtl_reg_tex(2,&rt,NULL); mtl_reg_tex(3,&alias,NULL);
+        for (unsigned fixture=0;fixture<4;fixture++) {
+            int enabled=fixture&1;
+            totk_live_lines lines={0}; const char *setting=enabled ?
+                "set TOTK_VK_CLEAR_ON_READ=1\n" : "set TOTK_VK_CLEAR_ON_READ=0\n";
+            totk_live_feed(&lines,setting,strlen(setting)); totk_live_frame(fixture+1);
+            p_scissor all={0,0,64,64};
+            op(OP_SET_RT,&srt,sizeof srt); op(OP_SCISSOR,&all,sizeof all); op(OP_CLEAR_COLOR,&cc,sizeof cc);
+            CHECK(mtl_wait(run(),5000000000ull),"read-before-attach old contents are blue");
+            uint64_t before=vk_draw_test_clear_read_count();
+            mtl_sub_begin();
+            p_clear_color green={0,15,{0,1,0,1}};
+            vk_draw_exec(OP_SET_RT,&srt); vk_draw_exec(OP_CLEAR_COLOR,&green);
+            int target=1; vk_tex *image=NULL;
+            (void)vk_tex_by_id(1,&target,NULL); /* unrelated reader must not resolve the target */
+            CHECK(vk_draw_test_clear_read_count()==before,"unrelated texture read preserves pending clear");
+            (void)vk_tex_by_id(fixture<2?2:3,&target,&image);
+            (void)vk_tex_by_id(fixture<2?2:3,&target,NULL); /* cached first reader must still order the write */
+            VkBuffer buffer; uint64_t offset=0;
+            CHECK(image && vk_resolve((uint64_t)(uintptr_t)readback,64*64*4,&buffer,&offset),
+                "first read resolves image and readback buffer");
+            vk_barrier_all(vk_cb());
+            VkBufferImageCopy copy={.bufferOffset=offset,.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},
+                .imageExtent={64,64,1}};
+            /* Deliberately do not call vk_end_rendering here: that would flush
+             * the pending clear even in the control arm and hide the ordering. */
+            vkCmdCopyImageToBuffer(vk_cb(),vk_tex_image(image),VK_IMAGE_LAYOUT_GENERAL,buffer,1,&copy);
+            vk_barrier_all(vk_cb());
+            CHECK(mtl_wait(mtl_sub_commit(),5000000000ull),"first-read copy completes");
+            CHECK(vk_draw_test_clear_read_count()-before==(unsigned)enabled,
+                "one first-read resolution, including storage alias (%u)",fixture);
+            int bad=0;
+            for (int pixel=0;pixel<64*64;pixel++) {
+                const uint8_t *p=readback+4*pixel;
+                bad+=p[0] || p[1]!=(enabled?255:0) || p[2]!=(enabled?0:255) || p[3]!=255;
+            }
+            CHECK(!bad,"read before any attaching draw sees %s (%d incorrect pixels)",enabled?"NVN clear":"control's old contents",bad);
+        }
+        printf("%s: clear-on-read %d checks, %d failed\n",fails?"FAILED":"ok",checks,fails);
+        return fails!=0;
+    }
+    if (argc == 3 && !strcmp(argv[1], "--load-elide")) {
+        CHECK(mtl_wait(run(), 5000000000ull), "coverage fixture setup completes");
+        shader_binary(0, 37, vctl, vcode, &vlen); memcpy(vc, vcode, vlen);
+        pg.serial = 99007;
+        const float full[] = {-1,-1,3,-1,-1,3}, quad[] = {-1,-1,1,-1,-1,1,-1,1,1,-1,1,1};
+        FILE *output = fopen(argv[2], "wb"); if (!output) { perror(argv[2]); return 1; }
+        const char *setting = getenv("TOTK_VK_LOAD_ELIDE"); int enabled = setting && atoi(setting) == 1;
+        extern void vk_draw_test_load_counts(uint64_t out[2]);
+        for (int fixture = 0; fixture < 9; fixture++) {
+            memcpy(vtx, fixture == 1 ? quad : full, fixture == 1 ? sizeof quad : sizeof full);
+            p_draw first = dw; if (fixture == 1) first.count = 6;
+            p_bind_vattr position = va; va_st element = {fixture == 7 ? 0x11 : 0x16,0,0};
+            memcpy(position.st,&element,sizeof element);
+            p_bind_vstream stride = vs; if (fixture == 7) stride.st[0].stride = 4;
+            if (fixture == 7) {
+                const uint16_t half[] = {0xbc00,0xbc00,0x4200,0xbc00,0xbc00,0x4200};
+                memcpy(vtx,half,sizeof half);
+            }
+            p_draw_idx indexed = {4,0,3,0,0,1,(uint64_t)(uintptr_t)(cpu_pool+0x202000)};
+            cpu_pool[0x202000]=0; cpu_pool[0x202001]=1; cpu_pool[0x202002]=2;
+            p_scissor scissor = {0,0,fixture == 2 ? 32 : 64,64};
+            color_st color = {fixture == 3 ? 1 : 0,NVN_LOGIC_OP_COPY,NVN_ALPHA_FUNC_ALWAYS};
+            p_bind_state cb = {.kind=1}; memcpy(cb.bytes,&color,sizeof color);
+            chmask_st channels = {.mask=fixture == 4 ? 7u : 15u};
+            p_bind_state cm = {.kind=2}; memcpy(cm.bytes,&channels,sizeof channels);
+            ds_st depth = {.dt=fixture == 5,.df=NVN_DEPTH_FUNC_ALWAYS};
+            p_bind_state db = {.kind=5}; memcpy(db.bytes,&depth,sizeof depth);
+            if (fixture == 6) { /* Geometry is not merely bounded by a full-screen rectangle. */
+                float partial[] = {-1,-1,1,-1,-1,1}; memcpy(vtx,partial,sizeof partial);
+            }
+            uint64_t before[2], after[2]; vk_draw_test_load_counts(before);
+            rn = 0; op(OP_SET_RT,&srt,sizeof srt); op(OP_SCISSOR,&scissor,sizeof scissor);
+            op(OP_CLEAR_COLOR,&cc,sizeof cc); op(OP_END,NULL,0);
+            CHECK(mtl_wait(run(),5000000000ull),"coverage fixture %d initializes prior pixels",fixture);
+            rn = 0; op(OP_BIND_PROGRAM,&bp,sizeof bp); op(OP_BIND_STATE,&cb,sizeof cb);
+            op(OP_BIND_STATE,&cm,sizeof cm); op(OP_BIND_STATE,&db,sizeof db);
+            op(OP_BIND_VATTR,&position,sizeof position); op(OP_BIND_VSTREAM,&stride,sizeof stride);
+            if (fixture == 8) op(OP_DRAW_IDX,&indexed,sizeof indexed); else op(OP_DRAW,&first,sizeof first);
+            op(OP_COPY_T2B,&cp,sizeof cp); op(OP_END,NULL,0);
+            CHECK(mtl_wait(run(),5000000000ull),"coverage fixture %d draws",fixture);
+            vk_draw_test_load_counts(after);
+            CHECK(after[1]-before[1] == (uint64_t)(enabled && (fixture < 2 || fixture >= 7)),
+                "coverage fixture %d elides only full triangle/quad (%llu proven, %llu elided)",fixture,
+                (unsigned long long)(after[0]-before[0]),(unsigned long long)(after[1]-before[1]));
+            CHECK(fwrite(readback,64*64*4,1,output)==1,"coverage fixture %d writes all pixels",fixture);
+            printf("load-elide fixture=%d proven=%llu elided=%llu\n",fixture,
+                (unsigned long long)(after[0]-before[0]),(unsigned long long)(after[1]-before[1]));
+        }
+        CHECK(!fclose(output),"coverage fixture output closes");
+        return fails != 0;
+    }
+    if (argc == 3 && !strcmp(argv[1], "--feedback-narrow")) {
+        CHECK(mtl_wait(run(),5000000000ull),"feedback fixture setup completes");
+        shader_binary(0,37,vctl,vcode,&vlen); memcpy(vc,vcode,vlen); pg.serial=99107;
+        const float full[]={-1,-1,3,-1,-1,3}; memcpy(vtx,full,sizeof full);
+        fub[0]=fub[1]=fub[2]=fub[3]=1;
+        uint8_t actl[0x880], acode[0x230]; uint32_t alen;
+        shader_binary(1,46,actl,acode,&alen); memcpy(cpu_pool+0x102000,acode,alen);
+        prog_t array=pg; array.serial=99108; array.sd[1].control=actl;
+        array.sd[1].data=(uint64_t)(uintptr_t)(cpu_pool+0x102000);
+        p_bind_program ab={&array,3};
+        tex_t auxiliary=rt; auxiliary.mem=gpu_pool+0x10000; auxiliary.serial=99109;
+        tex_t alias=tx; alias.serial=99110;
+        mtl_reg_tex(2,&auxiliary,NULL); mtl_reg_tex(3,&alias,NULL);
+        p_set_rt two=srt; two.n=2; two.color[1]=&auxiliary;
+        p_scissor all={0,0,64,64};
+        FILE *output=fopen(argv[2],"wb"); if (!output) { perror(argv[2]); return 1; }
+        const char *setting=getenv("TOTK_VK_FEEDBACK_NARROW"); int enabled=setting && atoi(setting)==1;
+        extern void vk_draw_test_feedback_narrow_counts(uint64_t out[3]);
+        for (int fixture=0;fixture<7;fixture++) {
+            rn=0; op(OP_SET_RT,&two,sizeof two); op(OP_SCISSOR,&all,sizeof all);
+            op(OP_CLEAR_COLOR,&cc,sizeof cc);
+            p_clear_color red={1,15,{1,0,0,1}}; op(OP_CLEAR_COLOR,&red,sizeof red); op(OP_END,NULL,0);
+            CHECK(mtl_wait(run(),5000000000ull),"feedback fixture %d initializes attachments",fixture);
+            p_set_rt targets=(fixture==0 || fixture==5) ? srt : two;
+            if (fixture==1 || fixture==4) targets.color[1]=&tx;
+            p_bind_handles sample=th; sample.h[0]=(fixture==2 || fixture==3 || fixture==6 ? 2 : fixture==4 ? 3 : 1)|(1u<<20);
+            chmask_st mask={fixture==2 ? 255u : 15u};
+            p_bind_state channels={.kind=2}; memcpy(channels.bytes,&mask,sizeof mask);
+            uint64_t before[3], after[3]; vk_draw_test_feedback_narrow_counts(before);
+            vk_record_test_counts start,end; vk_record_test_counts_get(&start);
+            rn=0; op(OP_SET_RT,&targets,sizeof targets); op(OP_BIND_PROGRAM,fixture==2 ? &ab : &bp,sizeof bp);
+            op(OP_BIND_STATE,&channels,sizeof channels); op(OP_BIND_VATTR,&va,sizeof va);
+            op(OP_BIND_VSTREAM,&vs,sizeof vs); op(OP_BIND_VBUF,&vb,sizeof vb);
+            /* The first draw never simultaneously samples an image it writes. */
+            p_bind_handles initial=sample; if (fixture==2) initial.h[0]=1|(1u<<20);
+            op(OP_BIND_TEX,&initial,sizeof initial); op(OP_DRAW,&dw,sizeof dw);
+            int bits=NVN_BARRIER_INVALIDATE_TEXTURE_BIT;
+            if (fixture==5) bits|=NVN_BARRIER_INVALIDATE_ZCULL_BIT;
+            op(OP_BARRIER,&bits,sizeof bits);
+            mask.mask=fixture==3 ? 255u : 15u; memcpy(channels.bytes,&mask,sizeof mask);
+            op(OP_BIND_STATE,&channels,sizeof channels);
+            op(OP_BIND_PROGRAM,fixture==3 ? &ab : &bp,sizeof bp); op(OP_BIND_TEX,&sample,sizeof sample);
+            op(OP_DRAW,&dw,sizeof dw);
+            if (fixture==6) {
+                mask.mask=255; memcpy(channels.bytes,&mask,sizeof mask);
+                op(OP_BIND_STATE,&channels,sizeof channels); op(OP_BIND_PROGRAM,&ab,sizeof ab);
+                op(OP_DRAW,&dw,sizeof dw); /* late write restores the deferred boundary */
+            }
+            op(OP_COPY_T2B,&cp,sizeof cp); op(OP_END,NULL,0);
+            CHECK(mtl_wait(run(),5000000000ull),"feedback fixture %d completes",fixture);
+            vk_record_test_counts_get(&end); vk_draw_test_feedback_narrow_counts(after);
+            unsigned avoided=enabled && fixture<2;
+            CHECK(end.passes-start.passes==2-avoided,"feedback fixture %d retains required pass boundaries (%llu passes)",fixture,
+                (unsigned long long)(end.passes-start.passes));
+            CHECK(after[1]-before[1]==avoided,"feedback fixture %d reports net avoided ends %u",fixture,avoided);
+            CHECK(fwrite(readback,64*64*4,1,output)==1,"feedback fixture %d writes all pixels",fixture);
+            printf("feedback-narrow fixture=%d deferred=%llu avoided=%llu hazards=%llu passes=%llu\n",fixture,
+                (unsigned long long)(after[0]-before[0]),(unsigned long long)(after[1]-before[1]),
+                (unsigned long long)(after[2]-before[2]),(unsigned long long)(end.passes-start.passes));
+        }
+        CHECK(!fclose(output),"feedback output closes"); return fails!=0;
+    }
     if (overlay_scene_mode) {
         CHECK(mtl_wait(run(), 5000000000ull), "overlay scene fixture warms a real draw");
         const size_t bytes = 64u << 20;
@@ -2835,6 +3108,141 @@ int main(int argc, char **argv) {
         mtl_set_tex_pool_n(0); mtl_reg_tex(1, NULL, NULL);
         mtl_tex_release(&replacement);
         printf("%s: texture registry pixels %d checks, %d failed\n", fails ? "FAILED" : "ok", checks, fails);
+        return fails != 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--descriptor-stock")) {
+        CHECK(mtl_wait(run(), 5000000000ull), "descriptor stock fixture warmup completes");
+        mtl_drain();
+        int stock = vk_desc_stock_enabled();
+        CHECK(vk_record_test_descriptor_stock(), "layout-isolated stock checkout, retirement, batching and pressure rebuild");
+        CHECK(vk_record_test_descriptor_ceiling(), "stock ceiling: set limit, reuse under it, live lowering, pool limit and live off");
+        /* The pool shape: a layout with one binding of every declared type comes from a fresh real pool (it used to
+           need SAMPLER no more than one per set); a type no pool declares is refused before it could reach one. */
+        {
+            VkDescriptorSetLayoutBinding every[VK_DESC_POOL_TYPES]; char why[128];
+            for (unsigned t = 0; t < VK_DESC_POOL_TYPES; t++)
+                every[t] = (VkDescriptorSetLayoutBinding){t, vk_desc_pool_sizes[t].type, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
+            CHECK(vk_desc_layout_fits(every, VK_DESC_POOL_TYPES, why, sizeof why), "every declared type fits: %s", why);
+            VkDescriptorSetLayoutCreateInfo all = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = VK_DESC_POOL_TYPES, .pBindings = every};
+            VkDescriptorSetLayout every_dsl; VKCHECK(vkCreateDescriptorSetLayout(V.dev, &all, NULL, &every_dsl));
+            mtl_sub_begin();
+            for (int i = 0; i < 64; i++) CHECK(vk_alloc_set(every_dsl) != VK_NULL_HANDLE, "an every-type set %d comes from a real pool", i);
+            CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "every-type submission completes");
+            vkDestroyDescriptorSetLayout(V.dev, every_dsl, NULL);
+            static const VkDescriptorType undeclared[] = {VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,
+                VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC};
+            for (unsigned i = 0; i < 3; i++) {
+                VkDescriptorSetLayoutBinding one[2] = {every[6], {1, undeclared[i], 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL}};
+                CHECK(!vk_desc_layout_fits(one, 2, why, sizeof why) && strstr(why, "no descriptor pool declares"),
+                    "undeclared type %d is refused at layout creation: %s", (int)undeclared[i], why);
+            }
+            VkDescriptorSetLayoutBinding many = {0, VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1025, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
+            CHECK(!vk_desc_layout_fits(&many, 1, why, sizeof why) && strstr(why, "exceed"), "a set larger than a pool is refused: %s", why);
+        }
+        /* Primary slots through real submissions: 100 sets per submission, eight warm-up submissions (one per ring
+           slot), then two more passes of the ring. Each set is checked out once per submission. */
+        VkDescriptorSetLayoutBinding lb = {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_ALL, NULL};
+        VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 1, .pBindings = &lb};
+        VkDescriptorSetLayout dsl; VKCHECK(vkCreateDescriptorSetLayout(V.dev, &li, NULL, &dsl));
+        uint64_t before[8], after[8]; int unique = 1;
+        for (int round = 0; round < 24; round++) {
+            if (round == 8) vk_record_test_descriptors(before);
+            VkDescriptorSet sets[100];
+            mtl_sub_begin();
+            for (int i = 0; i < 100; i++) { sets[i] = vk_alloc_set(dsl); for (int k = 0; k < i; k++) unique &= sets[k] != sets[i]; }
+            uint64_t fence = mtl_sub_commit(); CHECK(mtl_wait(fence, 5000000000ull), "descriptor stock primary submission %d completes", round);
+        }
+        vk_record_test_descriptors(after);
+        uint64_t sets = after[0] - before[0], calls = after[1] - before[1], resets = after[2] - before[2];
+        printf("descriptor-stock primary stock=%d 16 warm submissions: sets=%llu calls=%llu resets=%llu\n", stock,
+            (unsigned long long)sets, (unsigned long long)calls, (unsigned long long)resets);
+        CHECK(unique, "primary slot never issues one set twice in a submission");
+        uint32_t ceiling = vk_desc_stock_ceiling();
+        if (stock && ceiling && ceiling < 100)   /* every submission needs more than the ceiling: reset-and-allocate */
+            CHECK(sets == 1600 && resets >= 16, "a ceiling below each submission's 100 sets falls back to allocating every set and resetting per slot (%llu/%llu/%llu)",
+                (unsigned long long)sets, (unsigned long long)calls, (unsigned long long)resets);
+        else if (stock) CHECK(!sets && !calls && !resets, "warm primary stock needs no allocations or pool resets (%llu/%llu/%llu)",
+            (unsigned long long)sets, (unsigned long long)calls, (unsigned long long)resets);
+        else CHECK(sets == 1600 && calls == 1600 && resets >= 16, "default primary path allocates per set and resets per slot (%llu/%llu/%llu)",
+            (unsigned long long)sets, (unsigned long long)calls, (unsigned long long)resets);
+        vk_record_stats(300);
+        printf("%s: descriptor stock %d checks, %d failed\n", fails ? "FAILED" : "ok", checks, fails);
+        return fails != 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--descriptor-stock-live")) {
+        /* TOTK_VK_DESC_STOCK and its ceiling toggled through the live channel every few frames while up to BACKLOG
+           frames are in flight: 64 draws a frame, each into its own 8x8 tile with its own colour UBO (so its own
+           descriptor set), the tile -> UBO assignment rotating per frame. Every frame's pixels are checked once its
+           fence retires, and both owners count, right before they reset or destroy pools, whether every submission
+           that may reference them has retired (vk_test_descriptor_pools_check). */
+        enum { TILES = 64, FRAMES = 240, BACKLOG = 6, READBACK = 64 * 64 * 4 };
+        CHECK(mtl_wait(run(), 5000000000ull), "descriptor stock live fixture warmup completes");
+        uint8_t *colors = cpu_pool + 0x220000, *readbacks = cpu_pool + 0x400000;
+        for (int k = 0; k < TILES; k++) {
+            float c[4] = {(float)(k % 8 + 1) / 8, (float)(k / 8 + 1) / 8, 1, 1};
+            memcpy(colors + k * 256, c, sizeof c);
+        }
+        const float full_tri[6] = {-1, -1, 3, -1, -1, 3};   /* full-target triangle, written before any frame reads it */
+        memcpy(cpu_pool + 0x202000, full_tri, sizeof full_tri);
+        p_bind_vbuf full = vb; full.r[0].address = (uint64_t)(uintptr_t)(cpu_pool + 0x202000);
+        static const char *const toggles[] = {"set TOTK_VK_DESC_STOCK=1\n", "set TOTK_VK_DESC_STOCK_MAX_SETS=16\n",
+            "set TOTK_VK_DESC_STOCK=0\n", "set TOTK_VK_DESC_STOCK=1\nset TOTK_VK_DESC_STOCK_MAX_SETS=1\n",
+            "unset TOTK_VK_DESC_STOCK_MAX_SETS\n", "set TOTK_VK_DESC_STOCK_MAX_SETS=48\n", "unset TOTK_VK_DESC_STOCK\n",
+            "set TOTK_VK_DESC_STOCK=1\nset TOTK_VK_DESC_STOCK_MAX_SETS=0\n"};
+        uint64_t fences[FRAMES], events0[VK_DESC_STOCK_REASONS + 1], events1[VK_DESC_STOCK_REASONS + 1];
+        uint64_t pool_checks0, violations0, pool_checks1, violations1;
+        vk_record_test_stock_events(events0); vk_test_descriptor_pools_stats(&pool_checks0, &violations0);
+        int bad_frames = 0, applied = 0, in_flight = 0;
+        for (int frame = 0; frame < FRAMES + BACKLOG; frame++) {
+            int done = frame - BACKLOG;
+            if (done >= 0) {   /* the frame that used this readback slot: wait for it, then check every tile */
+                CHECK(mtl_wait(fences[done], 30000000000ull), "descriptor stock live frame %d completes", done);
+                const uint8_t *out = readbacks + (done % BACKLOG) * READBACK; int bad = 0;
+                for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++) {
+                    int k = ((y / 8) * 8 + x / 8 + done) % TILES;
+                    float r = (float)(k % 8 + 1) / 8, g = (float)(k / 8 + 1) / 8;
+                    const uint8_t *p = out + 4 * (y * 64 + x);
+                    bad += abs(p[0] - (int)(4 * x * r + .5f)) > 2 || abs(p[1] - (int)(4 * y * g + .5f)) > 2 ||
+                        abs(p[2] - 128) > 2 || p[3] != 255;
+                }
+                if (bad && bad_frames++ < 4) printf("descriptor stock live frame %d: %d wrong pixels\n", done, bad);
+            }
+            if (frame >= FRAMES) continue;
+            rn = 0;
+            p_scissor all = {0, 0, 64, 64};
+            op(OP_SET_RT, &srt, sizeof srt); op(OP_SCISSOR, &all, sizeof all); op(OP_CLEAR_COLOR, &cc, sizeof cc);
+            op(OP_BIND_PROGRAM, &bp, sizeof bp); op(OP_BIND_VATTR, &va, sizeof va); op(OP_BIND_VSTREAM, &vs, sizeof vs);
+            op(OP_BIND_UBO, &u0, sizeof u0); op(OP_BIND_TEX, &th, sizeof th); op(OP_VIEWPORTS, &vp, sizeof vp);
+            op(OP_BIND_VBUF, &full, sizeof full);
+            for (int t = 0; t < TILES; t++) {
+                p_bind_buf u = u1; u.addr = (uint64_t)(uintptr_t)(colors + ((t + frame) % TILES) * 256);
+                p_scissor tile = {(t % 8) * 8, (t / 8) * 8, 8, 8};
+                op(OP_BIND_UBO, &u, sizeof u); op(OP_SCISSOR, &tile, sizeof tile); op(OP_DRAW, &dw, sizeof dw);
+            }
+            p_copy_b2t copy = cp; copy.src = (uint64_t)(uintptr_t)(readbacks + (frame % BACKLOG) * READBACK);
+            op(OP_COPY_T2B, &copy, sizeof copy);
+            fences[frame] = run(); in_flight += frame > 0 && !mtl_wait(fences[frame - 1], 0);   /* the previous frame still runs */
+            if (frame % 3 == 2) {   /* stage like totk.ctl; applied at this "presented" frame */
+                const char *lines = toggles[applied++ % (sizeof toggles / sizeof *toggles)];
+                totk_live_lines l = {{0}}; totk_live_feed(&l, lines, strlen(lines));
+            }
+            totk_live_frame((uint64_t)frame);
+        }
+        mtl_drain();
+        vk_record_test_stock_events(events1); vk_test_descriptor_pools_stats(&pool_checks1, &violations1);
+        uint64_t kept[4]; vk_record_test_descriptor_retained(kept);
+        printf("descriptor-stock-live: %d frames (%d committed while the previous one ran), %d toggles, pool checks %llu, violations %llu; resets off/pressure/set-limit/pool-limit %llu/%llu/%llu/%llu, pools destroyed %llu; retained pools %llu+%llu, stock sets %llu\n",
+            FRAMES, in_flight, applied, (unsigned long long)(pool_checks1 - pool_checks0), (unsigned long long)(violations1 - violations0),
+            (unsigned long long)(events1[0] - events0[0]), (unsigned long long)(events1[1] - events0[1]),
+            (unsigned long long)(events1[2] - events0[2]), (unsigned long long)(events1[3] - events0[3]),
+            (unsigned long long)(events1[4] - events0[4]), (unsigned long long)kept[0], (unsigned long long)kept[1],
+            (unsigned long long)kept[2]);
+        CHECK(!bad_frames, "every in-flight frame keeps its own descriptors through live stock toggles (%d bad frames)", bad_frames);
+        CHECK(pool_checks1 > pool_checks0 && violations1 == violations0,
+            "no pool is reset or destroyed while a submission that may reference it is unretired");
+        CHECK(events1[VK_DESC_STOCK_OFF] > events0[VK_DESC_STOCK_OFF] && events1[VK_DESC_STOCK_SET_LIMIT] > events0[VK_DESC_STOCK_SET_LIMIT] &&
+            events1[VK_DESC_STOCK_REASONS] > events0[VK_DESC_STOCK_REASONS], "the toggles exercised live off, the set limit and pool destruction");
+        printf("%s: descriptor stock live %d checks, %d failed\n", fails ? "FAILED" : "ok", checks, fails);
         return fails != 0;
     }
     if (argc == 2 && !strcmp(argv[1], "--program-resolve-bench")) {
@@ -3248,6 +3656,136 @@ int main(int argc, char **argv) {
         }
         { void vk_mem_report(void); vk_mem_report(); }
         printf("%s: job reuse %d checks, %d failed\n", fails ? "FAILED" : "ok", checks, fails);
+        return fails != 0;
+    }
+    /* TOTK_VK_SPLIT_PASS_DRAWS: one 300-draw pass per submission with overlapping textured stripes (draw order decides
+       every column) and a partial in-pass clear between the would-be parts. Fresh processes with the split on and off
+       must write identical bytes (vkrectest); pass counts are checked here against the exact split arithmetic. */
+    if (argc == 3 && (!strcmp(argv[1], "--split-pass") || !strcmp(argv[1], "--split-depth") ||
+            !strcmp(argv[1], "--split-depth-only") || !strcmp(argv[1], "--split-depth-mask"))) {
+        int with_depth = strcmp(argv[1], "--split-pass") != 0, depth_only = !strcmp(argv[1], "--split-depth-only");
+        int masked = !strcmp(argv[1], "--split-depth-mask");
+        const char *safe_env = getenv("TOTK_VK_SPLIT_LRZ_SAFE");
+        int safe = !safe_env || !*safe_env || atoi(safe_env) != 0;
+        FILE *out = fopen(argv[2], "wb"); if (!out) { perror(argv[2]); return 1; }
+        tex_t tx2 = tx; tx2.serial = 10012; tx2.mem = cpu_pool + 0x20000;
+        for (int i = 0; i < 64 * 64; i++) { lin[i * 4] = 255 - lin[i * 4]; lin[i * 4 + 1] = 255 - lin[i * 4 + 1]; }
+        nvn_swizzle(&tx2.d, 0, 0, lin, 256, tx2.mem); mtl_reg_tex(2, &tx2, NULL); mtl_reg_samp(2, &sp);
+        const float full[] = {-1, -1, 3, -1, -1, 3}; memcpy(cpu_pool + 0x202000, full, sizeof full);
+        p_bind_vbuf full_vb = vb; full_vb.r[0].address = (uint64_t)(uintptr_t)(cpu_pool + 0x202000);
+        fub[0] = 1; fub[1] = 0.5f; fub[2] = 1; fub[3] = 1;
+        const char *e = getenv("TOTK_VK_SPLIT_PASS_DRAWS"); long n = e && *e ? atol(e) : 0;
+        const int draws = 300, hole_at = 150;
+        uint64_t splits = n > 0 ? (uint64_t)(draws - 1) / (uint64_t)n : 0;
+        uint64_t candidates = splits;
+        if (safe && depth_only) splits = 0;
+        if (safe && masked && n > 0) {
+            uint64_t first = n < hole_at ? (uint64_t)hole_at : (uint64_t)n;
+            splits = first < draws ? 1 + ((uint64_t)draws - 1 - first) / (uint64_t)n : 0;
+        }
+        tex_t depth = rt; depth.serial = 10013; depth.d.format = 0x34; depth.mem = gpu_pool + 0xf00000;
+        nvn_tex_layout(&depth.d, &depth.L);
+        p_set_rt target = srt; if (with_depth) target.depth = &depth; if (depth_only) target.n = 0;
+        p_copy_b2t depth_copy = cp; depth_copy.tex = &depth; depth_copy.src = (uint64_t)(uintptr_t)(readback + 0x5000);
+        p_bind_state depth_state = {.kind = 5};
+        ds_st ds = {.dt = with_depth, .dw = with_depth, .df = NVN_DEPTH_FUNC_LESS};
+        memcpy(depth_state.bytes, &ds, sizeof ds);
+        p_clear_ds depth_clear = {1.0f, 1, 0, 0};
+        p_scissor all = {0, 0, 64, 64}, hole = {16, 16, 8, 8};
+        p_clear_color red = {0, 0xf, {1, 0, 0, 1}};
+        for (int round = 0; round < 12; round++) {
+            vk_record_test_counts count0, count1; vk_record_test_counts_get(&count0);
+            uint64_t split0[5], split1[5]; vk_draw_test_split_counts(split0);
+            float expect_depth[64][64];
+            for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++) expect_depth[y][x] = 1;
+            uint8_t expect[64][64][4];
+            for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++) { expect[y][x][0] = expect[y][x][1] = 0; expect[y][x][2] = expect[y][x][3] = 255; }
+            rn = 0; op(OP_SCISSOR, &all, sizeof all);
+            /* Clear color even for the depth-only refusal arm, then switch before its first draw. */
+            if (depth_only) { op(OP_SET_RT, &srt, sizeof srt); op(OP_CLEAR_COLOR, &cc, sizeof cc); }
+            op(OP_SET_RT, &target, sizeof target);
+            if (!depth_only) op(OP_CLEAR_COLOR, &cc, sizeof cc);
+            op(OP_BIND_STATE, &depth_state, sizeof depth_state);
+            p_bind_state mask = {.kind = 2}; memset(mask.bytes, masked ? 0 : 255, sizeof(chmask_st));
+            op(OP_BIND_STATE, &mask, sizeof mask);
+            if (with_depth) op(OP_CLEAR_DS, &depth_clear, sizeof depth_clear);
+            op(OP_BIND_PROGRAM, &bp, sizeof bp); op(OP_BIND_VATTR, &va, sizeof va); op(OP_BIND_VSTREAM, &vs, sizeof vs);
+            op(OP_BIND_VBUF, &full_vb, sizeof full_vb); op(OP_BIND_UBO, &u0, sizeof u0); op(OP_BIND_UBO, &u1, sizeof u1);
+            op(OP_VIEWPORTS, &vp, sizeof vp);
+            for (int i = 0; i < draws; i++) {
+                if (masked && i == hole_at) { memset(mask.bytes, 255, sizeof(chmask_st)); op(OP_BIND_STATE, &mask, sizeof mask); }
+                if (i == hole_at && !depth_only) {
+                    op(OP_SCISSOR, &hole, sizeof hole); op(OP_CLEAR_COLOR, &red, sizeof red);
+                    for (int y = 16; y < 24; y++) for (int x = 16; x < 24; x++) { expect[y][x][0] = 255; expect[y][x][1] = 0; expect[y][x][2] = 0; }
+                }
+                int which = (i + round) & 1, x0 = (i * 37 + round * 11) & 63;
+                p_scissor stripe = {x0, 0, 3, 64};
+                p_bind_handles texture = th, sampler = th;
+                texture.h[0] = (uint64_t)(1 + which) | ((uint64_t)(1 + which) << 20);
+                sampler.h[0] = (uint64_t)(1 + which) << 20;
+                op(OP_SCISSOR, &stripe, sizeof stripe);
+                op(OP_BIND_TEX, &texture, offsetof(p_bind_handles, h) + sizeof texture.h[0]);
+                op(OP_BIND_SAMP, &sampler, offsetof(p_bind_handles, h) + sizeof sampler.h[0]);
+                float z = i & 1 ? 0.9f : 0.75f - (float)i / 600.0f;
+                if (with_depth) { p_depth_range range = {z, z}; op(OP_DEPTH_RANGE, &range, sizeof range); }
+                /* A threshold reached during discard must not end the pass or submit anything. */
+                if (n > 0 && i && i % n == 0) {
+                    p_flag off = {1}, on = {0};
+                    op(OP_RASTER_DISCARD, &off, sizeof off); op(OP_DRAW, &dw, sizeof dw);
+                    op(OP_RASTER_DISCARD, &on, sizeof on);
+                }
+                op(OP_DRAW, &dw, sizeof dw);
+                for (int x = x0; x < x0 + 3 && x < 64; x++) for (int y = 0; y < 64; y++) {
+                    if (with_depth) {
+                        if (z >= expect_depth[y][x]) continue;
+                        expect_depth[y][x] = z;
+                    }
+                    if (depth_only || (masked && i < hole_at)) continue;
+                    expect[y][x][0] = (uint8_t)(which ? 255 - 4 * x : 4 * x);
+                    expect[y][x][1] = (uint8_t)(which ? (255 - 4 * y) / 2 : 2 * y); expect[y][x][2] = 128;
+                }
+            }
+            op(OP_SCISSOR, &all, sizeof all); op(OP_COPY_T2B, &cp, sizeof cp);
+            if (with_depth) op(OP_COPY_T2B, &depth_copy, sizeof depth_copy);
+            uint64_t fence0 = mtl_last_fence(), fence = run();
+            CHECK(mtl_wait(fence, 5000000000ull), "split round %d completes", round);
+            CHECK(fence - fence0 == 1 + splits, "split round %d: %llu GPU submissions, expected one per part (%llu)", round,
+                (unsigned long long)(fence - fence0), (unsigned long long)(1 + splits));
+            vk_record_test_counts_get(&count1); vk_draw_test_split_counts(split1);
+            CHECK(count1.draws - count0.draws == (uint64_t)draws, "split round %d records every draw (%llu)", round,
+                (unsigned long long)(count1.draws - count0.draws));
+            uint64_t refused = safe && depth_only && candidates ? (uint64_t)(draws - n) : 0;
+            if (safe && masked && n > 0 && n < hole_at) refused = (uint64_t)(hole_at - n);
+            CHECK(split1[0] - split0[0] == splits && split1[1] - split0[1] == splits && split1[2] - split0[2] == refused,
+                "split round %d: %llu splits, %llu reopened parts, %llu refused; expected %llu/%llu", round,
+                (unsigned long long)(split1[0] - split0[0]), (unsigned long long)(split1[1] - split0[1]),
+                (unsigned long long)(split1[2] - split0[2]), (unsigned long long)splits, (unsigned long long)refused);
+            CHECK(split1[3] - split0[3] == (safe && with_depth ? splits : 0) &&
+                    split1[4] - split0[4] == refused,
+                "split round %d pins LRZ policy: %llu touches, %llu safety refusals", round,
+                (unsigned long long)(split1[3] - split0[3]), (unsigned long long)(split1[4] - split0[4]));
+            uint64_t passes = 1 + splits + (uint64_t)depth_only;
+            CHECK(count1.passes - count0.passes == passes, "split round %d actual passes %llu, expected %llu", round,
+                (unsigned long long)(count1.passes - count0.passes), (unsigned long long)passes);
+            int bad = 0;
+            for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++) {
+                const uint8_t *p = readback + 4 * (y * 64 + x);
+                for (int c = 0; c < 4; c++) bad += abs(p[c] - expect[y][x][c]) > 2;
+                if (with_depth) {
+                    float z; memcpy(&z, readback + 0x5000 + 4 * (y * 64 + x), 4);
+                    bad += z != expect_depth[y][x];
+                }
+            }
+            CHECK(!bad, "split round %d pixels follow draw order across parts and the in-pass clear (%d wrong)", round, bad);
+            uint64_t actual = count1.draws - count0.draws;
+            CHECK(fwrite(&actual, sizeof actual, 1, out) == 1 && fwrite(readback, 64 * 64 * 4, 1, out) == 1, "write split identity");
+            if (with_depth) CHECK(fwrite(readback + 0x5000, 64 * 64 * 4, 1, out) == 1, "write exact split depth identity");
+            int crop[] = {0, 0, 0, 0}; mtl_present(&rt, 1.0 / 60, crop);
+        }
+        const uint64_t footer[] = {0x53504c4954504153ull, 12};
+        CHECK(fwrite(footer, sizeof footer, 1, out) == 1 && !fclose(out), "close split identity output");
+        printf("%s: %s (TOTK_VK_SPLIT_PASS_DRAWS=%ld LRZ_SAFE=%d) kept %llu/%llu splits per round; %d checks, %d failed\n",
+            fails ? "FAILED" : "ok", argv[1], n, safe, (unsigned long long)splits, (unsigned long long)candidates, checks, fails);
         return fails != 0;
     }
     if (argc == 3 && !strcmp(argv[1], "--rec-identity")) {
@@ -4364,6 +4902,91 @@ int main(int argc, char **argv) {
         CHECK(mtl_wait(f, 5000000000ull), "GPU profile: 301 frames and trailing slot finish");
         int correct = 1; for (uint32_t i = 0; i < 64; i++) if (result[i] != (i ^ 0x12345678u)) correct = 0;
         CHECK(correct, "GPU profile: compute dispatch writes all 64 output words");
+    }
+    /* NVN ClearTexture: only the region of the selected level changes, and only the masked channels. Before the region
+       path these cleared the whole level and every channel. */
+    {
+        tex_t ct = rt; ct.d.levels = 2; nvn_tex_layout(&ct.d, &ct.L); ct.mem = gpu_pool + 0xa00000; ct.serial = 30101;
+        uint8_t *back = cpu_pool + 0x700000; memset(back, 0xcd, 2 * 64 * 64 * 4);
+        view_t level1 = {.set_levels = 1, .base_level = 1, .nlevels = 1};
+        p_clear_tex all = {.tex = &ct, .r = {0, 0, 0, 64, 64, 1}, .mask = 0xf, .c = {.f = {0, 0, 1, 1}}};
+        p_clear_tex all1 = all; all1.view = level1; all1.has_view = 1; all1.r = (NVNcopyRegion){0, 0, 0, 32, 32, 1};
+        p_clear_tex box = all; box.r = (NVNcopyRegion){8, 4, 0, 16, 20, 1}; box.c.f[0] = 1; box.c.f[2] = 0;
+        p_clear_tex green = all; green.r = (NVNcopyRegion){40, 40, 0, 10, 12, 1}; green.mask = 0x2;
+        green.c.f[1] = 1; green.c.f[2] = 0; green.c.f[3] = 0;
+        p_clear_tex box1 = all1; box1.r = (NVNcopyRegion){4, 4, 0, 8, 8, 1}; box1.mask = 0x9;
+        box1.c.f[0] = 1; box1.c.f[1] = 1; box1.c.f[2] = 0; box1.c.f[3] = 0.5f;
+        p_clear_tex none = box; none.mask = 0; none.r = all.r;
+        p_copy_b2t c0 = {.src = (uint64_t)(uintptr_t)back, .tex = &ct, .r = {0, 0, 0, 64, 64, 1}};
+        p_copy_b2t c1 = {.src = (uint64_t)(uintptr_t)(back + 64 * 64 * 4), .tex = &ct, .view = level1, .has_view = 1, .r = {0, 0, 0, 32, 32, 1}};
+        uint64_t clears0[2], clears1[2]; vk_draw_test_clear_counts(clears0);
+        op(OP_CLEAR_TEX, &all, sizeof all); op(OP_CLEAR_TEX, &all1, sizeof all1); op(OP_CLEAR_TEX, &box, sizeof box);
+        op(OP_CLEAR_TEX, &green, sizeof green); op(OP_CLEAR_TEX, &box1, sizeof box1); op(OP_CLEAR_TEX, &none, sizeof none);
+        op(OP_COPY_T2B, &c0, sizeof c0); op(OP_COPY_T2B, &c1, sizeof c1);
+        CHECK(mtl_wait(run(), 5000000000ull), "region/masked texture clears complete");
+        vk_draw_test_clear_counts(clears1);
+        CHECK(clears1[0] - clears0[0] == 3 && clears1[1] - clears0[1] == 2,
+            "region/mask clear path taken for 3 regions and 2 masks (got %llu/%llu)",
+            (unsigned long long)(clears1[0] - clears0[0]), (unsigned long long)(clears1[1] - clears0[1]));
+        int bad0 = 0, bad1 = 0;
+        for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++) {
+            const uint8_t *p = back + 4 * (y * 64 + x);
+            int in_box = x >= 8 && x < 24 && y >= 4 && y < 24, in_green = x >= 40 && x < 50 && y >= 40 && y < 52;
+            int r = in_box ? 255 : 0, g = in_green ? 255 : 0, b = in_box ? 0 : 255;
+            bad0 += p[0] != r || p[1] != g || p[2] != b || p[3] != 255;
+        }
+        for (int y = 0; y < 32; y++) for (int x = 0; x < 32; x++) {
+            const uint8_t *p = back + 64 * 64 * 4 + 4 * (y * 32 + x);
+            int in = x >= 4 && x < 12 && y >= 4 && y < 12;
+            bad1 += p[0] != (in ? 255 : 0) || p[1] != 0 || p[2] != 255 || abs(p[3] - (in ? 128 : 255)) > 1;
+        }
+        CHECK(!bad0, "level-0 region and green-only clears keep every other texel and channel (%d wrong)", bad0);
+        CHECK(!bad1, "level-1 red+alpha region clear keeps level 0, other texels and green/blue (%d wrong)", bad1);
+    }
+    /* TOTK_VK_FEEDBACK_CUT: a pass rendering level 1 of a texture while sampling the same texture (one mip-generation
+       step) gets a sampled view of level 0 only; a pass rendering level 0 leaves the view whole. The rendered level-1
+       texels (LOD 0 reads) are identical with the switch on and off; only the counters differ. */
+    {
+        const char *cut_env = getenv("TOTK_VK_FEEDBACK_CUT"); int cut_on = cut_env && atoi(cut_env) == 1;
+        tex_t mt = rt; mt.d.levels = 2; nvn_tex_layout(&mt.d, &mt.L); mt.mem = gpu_pool + 0xb00000; mt.serial = 30102;
+        mtl_reg_tex(3, &mt, NULL);
+        uint8_t *back = cpu_pool + 0x780000; memset(back, 0xcd, 32 * 32 * 4);
+        view_t level0 = {.set_levels = 1, .base_level = 0, .nlevels = 1}, level1 = {.set_levels = 1, .base_level = 1, .nlevels = 1};
+        p_clear_tex fill0 = {.tex = &mt, .view = level0, .has_view = 1, .r = {0, 0, 0, 64, 64, 1}, .mask = 0xf, .c = {.f = {0.25f, 0.5f, 0.75f, 1}}};
+        p_clear_tex fill1 = {.tex = &mt, .view = level1, .has_view = 1, .r = {0, 0, 0, 32, 32, 1}, .mask = 0xf, .c = {.f = {0, 0, 0, 0}}};
+        const float full[] = {-1, -1, 3, -1, -1, 3}; memcpy(cpu_pool + 0x202000, full, sizeof full);
+        p_bind_vbuf full_vb = vb; full_vb.r[0].address = (uint64_t)(uintptr_t)(cpu_pool + 0x202000);
+        fub[0] = 1; fub[1] = 0.5f; fub[2] = 1; fub[3] = 1;
+        p_set_rt mip1 = {.n = 1, .color = {&mt}, .cview = {level1}, .has_cview = {1}}, mip0 = {.n = 1, .color = {&mt}, .cview = {level0}, .has_cview = {1}};
+        p_bind_handles sampled = th; sampled.h[0] = 3 | (1u << 20);
+        p_viewports half = vp; half.v[0][2] = 32; half.v[0][3] = 32;
+        p_scissor all = {0, 0, 64, 64}, corner = {0, 0, 4, 4};
+        p_copy_b2t c1 = {.src = (uint64_t)(uintptr_t)back, .tex = &mt, .view = level1, .has_view = 1, .r = {0, 0, 0, 32, 32, 1}};
+        uint64_t fb0[2], fb1[2], fb2[2]; vk_draw_test_feedback_counts(fb0);
+        op(OP_CLEAR_TEX, &fill0, sizeof fill0); op(OP_CLEAR_TEX, &fill1, sizeof fill1);
+        op(OP_SCISSOR, &all, sizeof all); op(OP_SET_RT, &mip1, sizeof mip1);
+        op(OP_BIND_PROGRAM, &bp, sizeof bp); op(OP_BIND_VATTR, &va, sizeof va); op(OP_BIND_VSTREAM, &vs, sizeof vs);
+        op(OP_BIND_VBUF, &full_vb, sizeof full_vb); op(OP_BIND_UBO, &u0, sizeof u0); op(OP_BIND_UBO, &u1, sizeof u1);
+        op(OP_BIND_TEX, &sampled, sizeof sampled); op(OP_VIEWPORTS, &half, sizeof half); op(OP_DRAW, &dw, sizeof dw);
+        op(OP_COPY_T2B, &c1, sizeof c1);
+        CHECK(mtl_wait(run(), 5000000000ull), "mip-generation step with same-texture sampling completes");
+        vk_draw_test_feedback_counts(fb1);
+        int bad = 0;
+        for (int i = 0; i < 32 * 32; i++) {
+            const uint8_t *p = back + 4 * i;
+            bad += abs(p[0] - 64) > 2 || abs(p[1] - 64) > 2 || abs(p[2] - 191) > 2 || p[3] != 255;
+        }
+        CHECK(!bad, "level 1 renders level 0's texels, switch %s (%d wrong)", cut_on ? "on" : "off", bad);
+        CHECK(cut_on ? fb1[0] > fb0[0] && fb1[1] == fb0[1] : fb1[0] == fb0[0] && fb1[1] == fb0[1],
+            "feedback cut %s: %llu views cut, %llu left whole", cut_on ? "on" : "off",
+            (unsigned long long)(fb1[0] - fb0[0]), (unsigned long long)(fb1[1] - fb0[1]));
+        op(OP_SCISSOR, &corner, sizeof corner); op(OP_SET_RT, &mip0, sizeof mip0);
+        op(OP_VIEWPORTS, &vp, sizeof vp); op(OP_DRAW, &dw, sizeof dw);
+        CHECK(mtl_wait(run(), 5000000000ull), "level-0 draw sampling its own base level completes");
+        vk_draw_test_feedback_counts(fb2);
+        CHECK(fb2[0] == fb1[0] && (cut_on ? fb2[1] > fb1[1] : fb2[1] == fb1[1]),
+            "a view based at the attached level is never cut (%llu cut, %llu left whole)",
+            (unsigned long long)(fb2[0] - fb1[0]), (unsigned long long)(fb2[1] - fb1[1]));
     }
     { void vk_mem_report(void); vk_mem_report(); }   /* the memory line runs */
 #ifdef TOTK_FRAME_TIMELINE_TEST

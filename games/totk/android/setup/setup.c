@@ -194,6 +194,7 @@ int setup_request_parse(SetupRequest *r, const char *json, size_t len, char *err
     int64_t part_bytes = 0;
     if (json_get(j, "romfsPartBytes") && (json_int(j, "romfsPartBytes", &part_bytes) || part_bytes < 0)) { snprintf(err, errcap, "romfsPartBytes must be a non-negative integer"); goto out; }
     r->romfs_part_bytes = (uint64_t)part_bytes;
+    r->skip_companion = json_bool(j, "skipCompanion");
     const Json *st = json_get(j, "stages");
     if (st && st->type != JSON_NULL) {
         if (st->type != JSON_ARR) { snprintf(err, errcap, "stages must be a list"); goto out; }
@@ -232,6 +233,7 @@ int setup_install_load(const char *game, SetupInstall *s) {
             if (code) snprintf(s->opt_code[i], sizeof s->opt_code[i], "%s", code);
             if (error) snprintf(s->opt_error[i], sizeof s->opt_error[i], "%s", error);
         }
+        s->companion_skipped = !s->done[ST_COMPANION] && json_bool(json_get(st, "companion"), "skipped");
         const Json *code = json_get(st, "code"), *rew = json_get(code, "rewritten_sha256");
         for (int i = 0; i < 3; i++) { char k[32]; snprintf(k, sizeof k, "%s.patched.bin", modules[i]); copy_sha(s->rewritten[i], json_str(rew, k)); }
         copy_sha(s->tables, json_str(code, "runtime_tables_sha256"));
@@ -277,6 +279,7 @@ void setup_install_json(Buf *b, const SetupInstall *s) {
     if (s->done[ST_FONTS]) { buf_puts(b, ",\"source\":"); buf_jstr(b, s->font_source); buf_printf(b, ",\"sha256\":\"%s\"", s->font_sha); }
     opt_fields(b, s, ST_FONTS);
     buf_printf(b, "},\"companion\":{\"done\":%s", s->done[ST_COMPANION] ? "true" : "false");
+    if (s->companion_skipped && !s->done[ST_COMPANION]) buf_puts(b, ",\"skipped\":true");
     opt_fields(b, s, ST_COMPANION);
     buf_printf(b, "},\"shaders\":{\"done\":%s,\"variants\":%lld", s->done[ST_SHADERS] ? "true" : "false", (long long)(s->done[ST_SHADERS] ? s->variants : 0));
     opt_fields(b, s, ST_SHADERS);
@@ -507,6 +510,7 @@ static void progress_now(SetupCtx *c, const char *stage, uint64_t done, uint64_t
    "skipped". */
 static int stage_outcome(Run *u, const SetupCtx *sc, int i, int rc) {
     SetupCtx *c = u->c; const SetupRequest *r = u->r;
+    if (i == ST_COMPANION) u->st.companion_skipped = 0;
     if (!rc) {
         u->st.done[i] = 1; u->st.opt_code[i][0] = u->st.opt_error[i][0] = 0;
         if (i == ST_CODE || i == ST_ROMFS) {
@@ -631,6 +635,32 @@ static void staging_cleanup(SetupCtx *c) {
     closedir(d);
 }
 static void keys_cleanup(SetupCtx *c) { if (c->keydir[0]) st_rmtree(c->keydir); }
+/* The merge pipe is outside .import: reclaim pipes left by a killed process only while setup.lock is held.
+   Do not follow links or remove shader scratch, regular files, or other users of setup-work. */
+static int romfs_fifo_cleanup(SetupCtx *c) {
+    char dir[SETUP_PATH];
+    if (!c->nobackup[0]) return 0;
+    if (st_path(dir, sizeof dir, "%s/setup-work", c->nobackup)) return st_io_fail(c, "open", "setup-work");
+    DIR *d = opendir(dir);
+    if (!d) return errno == ENOENT ? 0 : st_io_fail(c, "open", dir);
+    int rc = 0;
+    for (;;) {
+        errno = 0;
+        struct dirent *e = readdir(d);
+        if (!e) { if (errno) rc = st_io_fail(c, "read", dir); break; }
+        size_t n = strlen(e->d_name);
+        if (n <= 11 || strncmp(e->d_name, "romfs-", 6) || strcmp(e->d_name + n - 5, ".fifo")) continue;
+        char path[SETUP_PATH]; struct stat st;
+        if (st_path(path, sizeof path, "%s/%s", dir, e->d_name)) { rc = st_io_fail(c, "remove", e->d_name); break; }
+        if (lstat(path, &st)) {
+            if (errno == ENOENT) continue;
+            rc = st_io_fail(c, "stat", path); break;
+        }
+        if (S_ISFIFO(st.st_mode) && unlink(path) && errno != ENOENT) { rc = st_io_fail(c, "remove", path); break; }
+    }
+    closedir(d);
+    return rc;
+}
 
 static char *result_fail(const char *stage, const char *code, const char *msg) {
     Buf b = {0};
@@ -676,12 +706,24 @@ char *setup_run_json(const char *request, size_t len, SetupProgressFn progress, 
     if (flock(lock, LOCK_EX | LOCK_NB)) { setup_fail(c, "internal", "Setup is already running"); goto fail; }
     /* Stale key files of an interrupted run go first; the directory exists only while hactool needs it. */
     keys_cleanup(c);
+    if (romfs_fifo_cleanup(c)) goto fail;
     if (mkdir(c->keydir, 0700) && errno != EEXIST) { st_io_fail(c, "create", "import-keys"); goto fail; }
     setup_install_load(c->game, &u->st);
     int changed = 0;
     for (int i = 0; i < ST_COUNT; i++) if (u->st.done[i] && !outputs_present(c, &u->st, i)) { u->st.done[i] = 0; changed = 1; }
     int pending[ST_COUNT] = {0}, any = 0;
     for (int i = 0; i < ST_COUNT; i++) { pending[i] = (r->stage_mask >> i & 1) && (r->stages_explicit || !u->st.done[i]); any |= pending[i]; }
+    if (r->skip_companion && !r->stages_explicit) {
+        pending[ST_COMPANION] = 0;
+        if (!u->st.done[ST_COMPANION]) {
+            u->st.companion_skipped = 1;
+            u->st.opt_code[ST_COMPANION][0] = u->st.opt_error[ST_COMPANION][0] = 0;
+            changed = 1;
+            progress_now(c, "companion", 0, 0, "skipped");
+        }
+        any = 0;
+        for (int i = 0; i < ST_COUNT; i++) any |= pending[i];
+    }
     /* Fail before writing anything when a pending core stage has no usable input. */
     if (pending[ST_CODE] && !use_decrypted_code(r) && !(r->update.present && r->keys.present)) { failed_stage = ST_CODE;
         setup_fail(c, "missing_input", "Select the 1.4.3 ExeFS (main, sdk, subsdk0), or the 1.4.3 update NSP with prod.keys"); goto fail; }

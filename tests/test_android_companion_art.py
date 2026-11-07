@@ -1,6 +1,6 @@
 """Second-screen art from an older generator (android/java/.../setup/CompanionArt.java): the app's generator number equals
-the C and Python generators', and art whose index.json names an older generator, or an unreadable index, counts as out
-of date, so InstallState marks the companion stage not done and Home updates the art.
+the C and Python generators', and art whose index.json names an older generator, or an unreadable index, is not current.
+InstallState separately distinguishes missing art; Home updates old-but-present art only on dual-screen devices.
 """
 from pathlib import Path
 import json

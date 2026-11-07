@@ -1,6 +1,7 @@
 package com.aure.totk.companion;
 
 import android.app.Activity;
+import android.app.ActivityManager;
 import android.app.Application;
 import android.app.Presentation;
 import android.content.Context;
@@ -11,9 +12,11 @@ import android.hardware.display.DisplayManager;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.util.Log;
 import android.hardware.display.DeviceProductInfo;
 import android.view.Display;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.Window;
 import android.view.WindowManager;
@@ -30,13 +33,30 @@ public final class PresentationController implements DisplayManager.DisplayListe
     private int displayId = -1;
     private final int initialPage;
     private final Runnable changed;
-    private boolean closed, stopped, reported, reportQueued;
+    private boolean closed, stopped, resumed, topResumed, returnQueued, returnRequested, reported, reportQueued;
+    private ActivityManager.AppTask inputTask;
+    private long returnRequestedAt;
+    private int rapidAutoReturns;
+    private long autoReturnedAt = -1000;
+    private boolean autoReturnBlocked, touchInProgress;
+    private final Runnable autoReturnInput = () -> {
+        if (!autoReturnBlocked && !touchInProgress && shown != null && shown.isShowing() && returnInputToOwner())
+            autoReturnedAt = SystemClock.uptimeMillis();
+    };
+    private final Runnable returnInput = () -> { returnQueued = false; returnInputToOwner(); };
     private final Application.ActivityLifecycleCallbacks lifecycle = new Application.ActivityLifecycleCallbacks() {
         @Override public void onActivityStarted(Activity activity) { if (activity == owner && stopped) { stopped = false; refresh(); } }
         @Override public void onActivityStopped(Activity activity) { if (activity == owner) { stopped = true; dismiss(); } }
         @Override public void onActivityCreated(Activity activity, Bundle state) {}
-        @Override public void onActivityResumed(Activity activity) {}
-        @Override public void onActivityPaused(Activity activity) {}
+        @Override public void onActivityResumed(Activity activity) {
+            if (activity == owner) { resumed = true; resetAutoReturn(); }
+        }
+        @Override public void onActivityPaused(Activity activity) {
+            if (activity == owner) {
+                resumed = false; returnRequested = false;
+                main.removeCallbacks(autoReturnInput);
+            }
+        }
         @Override public void onActivitySaveInstanceState(Activity activity, Bundle state) {}
         @Override public void onActivityDestroyed(Activity activity) {}
     };
@@ -52,6 +72,22 @@ public final class PresentationController implements DisplayManager.DisplayListe
     }
     /** Whether the companion is currently presented on a secondary display. */
     public boolean showing() { return shown != null; }
+    /** Owners forward Activity.onTopResumedActivityChanged: window focus alone is per-display on multi-resume devices. */
+    public void ownerTopResumed(boolean top) {
+        topResumed = top;
+        main.removeCallbacks(autoReturnInput);
+        if (top) returnRequested = false;
+        else {
+            if (SystemClock.uptimeMillis() - autoReturnedAt < 1000) rapidAutoReturns++;
+            else rapidAutoReturns = 0;
+            if (rapidAutoReturns >= 3) autoReturnBlocked = true;
+            if (!autoReturnBlocked && !touchInProgress) main.postDelayed(autoReturnInput, 300);
+        }
+    }
+    private void resetAutoReturn() {
+        main.removeCallbacks(autoReturnInput);
+        rapidAutoReturns = 0; autoReturnedAt = -1000; autoReturnBlocked = false;
+    }
     /** Coalesced on the main thread: a display change dismisses and recreates the Presentation in one pass, which must
      * not flash the companion onto the owner's display. Stop/start is not reported: the owner's own display is not
      * visible then, and swapping its content would flash on return. */
@@ -79,9 +115,36 @@ public final class PresentationController implements DisplayManager.DisplayListe
                 | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
                 | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
     }
+    /** A non-focusable window on the companion display can still make it top-focused. Return our own task only while
+     * its activity remains resumed and window-focused. Repeated competing focus requests stop automatic recovery. */
+    private boolean returnInputToOwner() {
+        if (closed || stopped || !resumed || topResumed
+                || (returnRequested && SystemClock.uptimeMillis() - returnRequestedAt < 250)
+                || !owner.hasWindowFocus() || owner.isFinishing() || owner.isDestroyed()) return false;
+        try {
+            if (inputTask == null) {
+                ActivityManager manager = owner.getSystemService(ActivityManager.class);
+                if (manager == null) return false;
+                for (ActivityManager.AppTask task : manager.getAppTasks()) {
+                    if (task.getTaskInfo().taskId == owner.getTaskId()) { inputTask = task; break; }
+                }
+            }
+            if (inputTask == null || !owner.getComponentName().equals(inputTask.getTaskInfo().topActivity)) return false;
+            returnRequested = true;
+            returnRequestedAt = SystemClock.uptimeMillis();
+            inputTask.moveToFront();
+            return true;
+        } catch (IllegalArgumentException | SecurityException unavailable) {
+            returnRequested = false;
+            Log.w("TotkCompanion", "Could not return controller focus to the owner task", unavailable);
+            return false;
+        }
+    }
     private void dismiss() {
         Presentation previous = shown;
         shown = null; displayId = -1;
+        touchInProgress = false;
+        main.removeCallbacks(autoReturnInput);
         if (previous != null) { previous.setOnDismissListener(null); previous.dismiss(); }
         report();
     }
@@ -108,6 +171,12 @@ public final class PresentationController implements DisplayManager.DisplayListe
         if (displays == null) return DisplayClass.NONE;
         return DisplayClass.classify(screens(displays.getDisplays(DisplayManager.DISPLAY_CATEGORY_PRESENTATION), own), mainPnp(displays));
     }
+    /** Device capability, independent of the menu/game's current display. A menu on the second panel must still
+     * offer its art/settings and route play to the main panel. Presentation selection remains owner-relative. */
+    public static int deviceSecondScreen(Context context) {
+        DisplayManager displays = context.getSystemService(DisplayManager.class);
+        return displays == null ? DisplayClass.NONE : secondScreen(context, displays.getDisplay(Display.DEFAULT_DISPLAY));
+    }
     /** The built-in second panel the companion presents on, or null. */
     private static Display builtInDisplay(DisplayManager displays, Display own) {
         Display[] all = displays.getDisplays(DisplayManager.DISPLAY_CATEGORY_PRESENTATION);
@@ -122,6 +191,22 @@ public final class PresentationController implements DisplayManager.DisplayListe
         dismiss();
         if (selected == null) return;
         Presentation next = new Presentation(owner, selected) {
+            private boolean touching;
+            @Override public boolean dispatchTouchEvent(MotionEvent event) {
+                int action = event.getActionMasked();
+                if (action == MotionEvent.ACTION_DOWN) { touching = true; touchInProgress = true; resetAutoReturn(); }
+                boolean handled = super.dispatchTouchEvent(event);
+                if (action == MotionEvent.ACTION_CANCEL) { touching = false; touchInProgress = false; }
+                if (touching && action == MotionEvent.ACTION_UP) {
+                    touching = false; touchInProgress = false;
+                    // Let Android deliver the top-resumed change caused by DOWN before checking it.
+                    if (shown == this && isShowing() && !returnQueued) {
+                        returnQueued = true;
+                        main.post(returnInput);
+                    }
+                }
+                return handled;
+            }
             @Override protected void onCreate(Bundle state) {
                 super.onCreate(state);
                 immersive(getWindow(), true);

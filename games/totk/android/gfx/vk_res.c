@@ -28,6 +28,7 @@
 #include "nvn_hmap.h"
 #include "totk_lifelog.h"
 #include "../../third_party/d2r_gfx/gfx/tex/nvn_deswizzle.h"
+#include "vk_upload_pool.h"
 #include "../../runtime/frame_timeline.h"
 #ifdef __linux__
 #include <sys/syscall.h>
@@ -173,6 +174,8 @@ static VkFormatFeatureFlags fmt_features(VkFormat f) {
 typedef struct tex_generation { _Atomic uint64_t value; struct tex_generation *next; } tex_generation;
 typedef struct { tex_generation *cell; uint64_t value; } tex_stamp;
 static tex_generation *g_free_generations;
+/* Any texture or image identity bumped or dropped (TOTK_VK_TEX_MEMO: one load instead of two cells per lookup). */
+static _Atomic uint64_t g_tex_ident_rev = 1;
 static tex_stamp tex_stamp_new(void) {
     if (!g_free_generations) {
         tex_generation *page = calloc(256, sizeof *page);
@@ -187,9 +190,11 @@ static tex_stamp tex_stamp_new(void) {
 }
 static void tex_stamp_bump(tex_stamp *stamp) {
     stamp->value = atomic_fetch_add_explicit(&stamp->cell->value, 1, memory_order_release) + 1;
+    atomic_fetch_add_explicit(&g_tex_ident_rev, 1, memory_order_release);
 }
 static void tex_stamp_drop(tex_stamp stamp) {
     atomic_fetch_add_explicit(&stamp.cell->value, 1, memory_order_release);
+    atomic_fetch_add_explicit(&g_tex_ident_rev, 1, memory_order_release);
     stamp.cell->next = g_free_generations; g_free_generations = stamp.cell;
 }
 static int tex_stamp_current(tex_stamp stamp) {
@@ -222,6 +227,7 @@ struct vk_tex {
     uint64_t serial; tex_t t; vk_img *im;
     tex_stamp identity;
     int mirrored; uint64_t stamp, csub;   /* mirrored: dirty-page stamp of the uploaded content, last submission checked */
+    _Atomic uint64_t memo_sub;            /* TOTK_VK_TEX_MEMO: last submission whose tex_get_inner work for it is done */
     int cpu_pool;                         /* tex_mirrored at creation: GPU writes re-arm settled/opt-in invalidate write-back */
     int canvas_window;                   /* registration cached at object creation, not on every draw */
     VkBufferView tbv;                     /* TARGET_BUFFER textures */
@@ -520,6 +526,7 @@ static int img_upgrade_inner(vk_tex *x, VkFormat want) {
     }
     int in_pass = vk_in_pass();
     VkCommandBuffer cb = in_pass ? vk_pre_cb() : vk_cb();
+    if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "transfer");
     vk_barrier_all(cb);
     VkImageCopy rg[16]; uint32_t n = MINV(old->levels, 16u);
     for (uint32_t l = 0; l < n; l++)
@@ -527,6 +534,7 @@ static int img_upgrade_inner(vk_tex *x, VkFormat want) {
                               {MAXV(old->w >> l, 1u), MAXV(old->h >> l, 1u), old->type == VK_IMAGE_TYPE_3D ? MAXV(old->d >> l, 1u) : 1}};
     vkCmdCopyImage(cb, old->img, VK_IMAGE_LAYOUT_GENERAL, nu->img, VK_IMAGE_LAYOUT_GENERAL, n, rg);
     vk_barrier_all(cb);
+    if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
     if (totk_texcopy_match(&x->t))
         totk_texcopy_log(vk_submit_serial(), "phase=res event=image-upgrade ser=%llu old_image=%#llx new_image=%#llx in_pass=%d",
             (unsigned long long)x->serial, (unsigned long long)(uintptr_t)old->img, (unsigned long long)(uintptr_t)nu->img, in_pass);
@@ -547,6 +555,44 @@ static int img_upgrade_inner(vk_tex *x, VkFormat want) {
 }
 static int img_upgrade(vk_tex *x, VkFormat want) { return VK_REC_VALUE(VK_REC_S_RESOURCE, img_upgrade_inner(x, want)); }
 
+/* Upload cost per present window, any switch value: count, bytes and wall time of upload_inner on its caller. */
+static _Atomic uint64_t g_win_uploads, g_win_upload_bytes, g_win_upload_ns;
+/* TOTK_VK_UPLOAD_THREADS=<1..3> (default unset/0 = serial): block-linear uploads of at least UPLOAD_POOL_MIN_BYTES
+   deswizzle on that many helper threads plus the caller (vk_upload_pool.c); the copy is recorded after all runs.
+   Live (runtime/live_ctl.h): each upload takes the current value before it starts; helpers are still started by the
+   first parallel upload, and at 0 (or below their index) they sleep without work. */
+static int g_upload_launch;
+static totk_live_cache g_upload_live;
+static _Atomic int g_upload_configured;
+static pthread_mutex_t g_upload_config_mu = PTHREAD_MUTEX_INITIALIZER;
+static void upload_threads_refresh(void) {
+    if (atomic_load_explicit(&g_upload_configured, memory_order_relaxed) ==
+        totk_live_cached(&g_upload_live, "TOTK_VK_UPLOAD_THREADS", g_upload_launch)) return;
+    pthread_mutex_lock(&g_upload_config_mu);   /* re-read under the lock: the latest value is configured last */
+    int n = totk_live_cached(&g_upload_live, "TOTK_VK_UPLOAD_THREADS", g_upload_launch);
+    if (atomic_load_explicit(&g_upload_configured, memory_order_relaxed) != n) {
+        upload_pool_configure(n); atomic_store_explicit(&g_upload_configured, n, memory_order_relaxed);
+        LOGV("TOTK_VK_UPLOAD_THREADS=%d (live): from the next upload, %s", n,
+             n ? "large block-linear uploads deswizzle on helpers too" : "every deswizzle on the calling thread");
+    }
+    pthread_mutex_unlock(&g_upload_config_mu);
+}
+void vk_upload_threads_init(void) {
+    const char *e = getenv("TOTK_VK_UPLOAD_THREADS"); int n = e && *e ? atoi(e) : 0;
+    n = n < 0 ? 0 : n > UPLOAD_POOL_MAX_HELPERS ? UPLOAD_POOL_MAX_HELPERS : n;
+    g_upload_launch = n; atomic_store_explicit(&g_upload_configured, n, memory_order_relaxed);
+    upload_pool_configure(n);
+    if (n) LOGV("TOTK_VK_UPLOAD_THREADS=%d: block-linear uploads of %u KiB or more deswizzle on %d helper thread(s) plus the caller",
+                n, UPLOAD_POOL_MIN_BYTES >> 10, n);
+    else LOGV("TOTK_VK_UPLOAD_THREADS=0: texture deswizzle stays on the calling thread (default)");
+}
+void vk_upload_report(uint64_t frame) {
+    upload_pool_stats s; upload_pool_stats_take(&s);
+    uint64_t n = atomic_exchange(&g_win_uploads, 0), bytes = atomic_exchange(&g_win_upload_bytes, 0), ns = atomic_exchange(&g_win_upload_ns, 0);
+    LOGV("frame %llu, texture uploads: %llu (%.1f MiB) in %.1f ms, %.3f ms/frame; parallel deswizzles %llu (%llu runs, %llu on helpers) (TOTK_VK_UPLOAD_THREADS=%d)",
+         (unsigned long long)frame, (unsigned long long)n, bytes / 1048576.0, ns / 1e6, ns / 300e6,
+         (unsigned long long)s.jobs, (unsigned long long)s.runs, (unsigned long long)s.helper_runs, upload_pool_helpers());
+}
 /* Upload a mirrored texture from the guest's bytes (pre command buffer). */
 static void upload_inner(vk_tex *x) {
     const tex_t *t = &x->t; vk_img *im = x->im;
@@ -568,10 +614,12 @@ static void upload_inner(vk_tex *x) {
             VkDescriptorBufferInfo frozen;
             if (vk_lag_read((uint64_t)(uintptr_t)t->mem, stride * rows, 16, &frozen, VK_LAG_COPY)) { pb = frozen.buffer; po = frozen.offset; }
             VkBufferImageCopy c = {.bufferOffset = po, .bufferRowLength = (uint32_t)(stride / bpb * bw), .imageSubresource = {im->aspect, 0, 0, 1}, .imageExtent = {w, h, 1}};
+            if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "upload");
             vkCmdCopyBufferToImage(cb, pb, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
             vk_pso_life_external_write(x, 0, 0, 1, "upload");
             totk_ft_count(FT_COUNT_TEX_UPLOADS, 1);
-            vk_barrier_all(cb); g_stat_upload_bytes += stride * rows;
+            vk_barrier_all(cb); g_stat_upload_bytes += stride * rows; atomic_fetch_add(&g_win_upload_bytes, stride * rows);
+            if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
             return;
         }
     }
@@ -582,6 +630,11 @@ static void upload_inner(vk_tex *x) {
     }
     VkBuffer sb; VkDeviceSize so; uint8_t *stg = vk_transient(total ? total : 16, 16, &sb, &so);
     VkBufferImageCopy *regions = calloc((size_t)im->levels * im->layers, sizeof *regions); int nr = 0;
+    /* With helpers, block-linear subresources are only collected here and decoded together below. */
+    if (!linear) upload_threads_refresh();
+    int pooled = !linear && upload_pool_helpers();
+    upload_sub *subs = pooled ? malloc((size_t)im->levels * im->layers * sizeof *subs) : NULL; unsigned ns = 0;
+    if (!subs) pooled = 0;
     size_t off = 0;
     for (unsigned l = 0; l < im->levels; l++) {
         uint32_t w = MAXV(im->w >> l, 1u), h = MAXV(im->h >> l, 1u), z = is3d ? MAXV(im->d >> l, 1u) : 1;
@@ -589,13 +642,20 @@ static void upload_inner(vk_tex *x) {
         for (unsigned y = 0; y < (is3d ? 1u : im->layers); y++) {
             int bad;
             if (linear) { size_t stride = nvn_tex_linear_stride(&t->d); bad = 0; for (size_t r = 0; r < rows * z; r++) memcpy(stg + off + r * pitch, t->mem + r * stride, pitch); }
+            else if (pooled) { subs[ns++] = (upload_sub){l, y, stg + off, pitch}; bad = 0; }
             else bad = nvn_deswizzle(&t->d, l, y, t->mem, stg + off, pitch);
             if (bad) { RED(8, "deswizzle failed: format %#x target %d", t->d.format, t->d.target); free(regions); return; }
             regions[nr++] = (VkBufferImageCopy){.bufferOffset = so + off, .imageSubresource = {im->aspect, l, y, 1}, .imageExtent = {w, h, z}};
             off += (pitch * rows * z + 15) & ~(size_t)15;
         }
     }
+    if (pooled) {
+        int bad = upload_pool_deswizzle(&t->d, t->mem, subs, ns, UPLOAD_POOL_MIN_BYTES);
+        free(subs);
+        if (bad) { RED(8, "deswizzle failed: format %#x target %d", t->d.format, t->d.target); free(regions); return; }
+    }
     if (nr) {
+        if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "upload");
         vkCmdCopyBufferToImage(cb, sb, im->img, VK_IMAGE_LAYOUT_GENERAL, (uint32_t)nr, regions);
         for (unsigned level = 0; level < im->levels; level++)
             vk_pso_life_external_write(x, level, 0, im->layers, "upload");
@@ -603,9 +663,14 @@ static void upload_inner(vk_tex *x) {
     }
     free(regions);
     vk_barrier_all(cb);
-    g_stat_upload_bytes += total;
+    if (vk_gpuprof_on && nr) vk_gpuprof_scope_end(cb);
+    g_stat_upload_bytes += total; atomic_fetch_add(&g_win_upload_bytes, total);
 }
-static void upload(vk_tex *x) { VK_REC_DO(VK_REC_O_UPLOAD, upload_inner(x)); }
+static void upload(vk_tex *x) {
+    uint64_t started = host_now_ns();
+    VK_REC_DO(VK_REC_O_UPLOAD, upload_inner(x));
+    atomic_fetch_add(&g_win_uploads, 1); atomic_fetch_add(&g_win_upload_ns, host_now_ns() - started);
+}
 
 static void tex_drop_locked(vk_tex *x) {
     if (!x) return;
@@ -628,15 +693,18 @@ static vk_tex *tex_get_inner(const tex_t *t) {
         x->csub = sub;
         stor_key k; vk_img *g = NULL;
         if (mirshare_on() && stor_key_of(t, &k) && (g = nvn_hm_get(&g_by_storage, &k)) && g != x->im && g->gpu_written) {
-            retire_img(x->im); x->im = g; g->refs++; x->mirrored = 0; g_stat_switched++;   /* the GPU renders this storage now */
+            retire_img(x->im); x->im = g; g->refs++; __atomic_store_n(&x->mirrored, 0, __ATOMIC_RELAXED); g_stat_switched++;   /* the GPU renders this storage now */
             tex_stamp_bump(&x->identity);
             texcopy_resource("switch", x);
         } else if (!nvn_dirty_tracked(t->mem, t->L.size) || nvn_dirty_since(t->mem, t->L.size, x->stamp)) {
             texcopy_resource("reupload", x); upload(x); g_stat_reuploads++;
         }
     }
+    /* TOTK_VK_TEX_MEMO: whatever this submission needs for x (above) is done; memo hits on mirrored textures wait for it. */
+    if (x && vk_tex_memo_on() && atomic_load_explicit(&x->memo_sub, memory_order_relaxed) != sub)
+        atomic_store_explicit(&x->memo_sub, sub, memory_order_release);
     if (x) { pthread_mutex_unlock(&g_tex_mu); return x->im || x->tbv ? x : NULL; }
-    x = calloc(1, sizeof *x); x->serial = t->serial; x->t = *t; x->csub = sub;
+    x = calloc(1, sizeof *x); x->serial = t->serial; x->t = *t; x->csub = sub; atomic_init(&x->memo_sub, sub);
     x->identity = tex_stamp_new();
     if (vk_canvas_on) x->canvas_window = nvn_hm_get(&g_window_serials, &t->serial) != NULL;
     nvn_hm_put(&g_by_serial, &t->serial, x);
@@ -698,7 +766,7 @@ void vk_tex_pool_gone(uintptr_t lo, uintptr_t hi) {   /* nvn_vk.c: a pool was fi
     for (uint32_t i = 0; i < g_by_serial.cap; i++) {
         vk_tex *x = g_by_serial.vals ? g_by_serial.vals[i] : NULL;
         if (!x || (uintptr_t)x->t.mem >= hi || (uintptr_t)x->t.mem + x->t.L.size <= lo) continue;
-        tex_stamp_bump(&x->identity); x->csub = 0; x->stamp = 0;
+        tex_stamp_bump(&x->identity); x->csub = 0; x->stamp = 0; atomic_store_explicit(&x->memo_sub, 0, memory_order_relaxed);
     }
     for (uint32_t i = 0; i < g_by_storage.cap; i++) {
         vk_img *im = g_by_storage.vals ? g_by_storage.vals[i] : NULL;
@@ -1123,6 +1191,7 @@ static int wb_copy_inner(wb_ent *e) {
     e->allocation = req.size; g_set_staging += req.size;
     vk_tex alias = {.im = e->im}; vk_tex_native_read(&alias);
     VkCommandBuffer cb = vk_cb(); vk_barrier_all(cb);
+    if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "transfer");
     size_t o = 0;
     for (unsigned l = 0; l < s.levels; l++) for (unsigned y = 0; y < s.layers; y++) {
         VkBufferImageCopy c = {.bufferOffset = o, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, y, 1},
@@ -1132,6 +1201,7 @@ static int wb_copy_inner(wb_ent *e) {
         o += wb_level_size(e, s, l);
     }
     vk_barrier_all(cb); e->fence = mtl_last_fence() + 1;
+    if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
     return 1;
 }
 static int wb_copy(wb_ent *e) {
@@ -1567,7 +1637,7 @@ static void tex_mark_gpu_written_inner(vk_tex *x) {
     x->im->gpu_written = 1;
     stor_key k;
     if (x->mirrored && !x->im->shared && mirshare_on() && stor_key_of(&x->t, &k) && !nvn_hm_get(&g_by_storage, &k)) {
-        x->im->shared = 1; x->im->k = k; x->im->refs = 1; nvn_hm_put(&g_by_storage, &k, x->im); x->mirrored = 0; g_stat_published++;
+        x->im->shared = 1; x->im->k = k; x->im->refs = 1; nvn_hm_put(&g_by_storage, &k, x->im); __atomic_store_n(&x->mirrored, 0, __ATOMIC_RELAXED); g_stat_published++;
         texcopy_resource("publish", x);
     }
     if (x->cpu_pool || wb_tile_match(&x->t)) wb_note_locked(x);
@@ -1684,6 +1754,35 @@ int vk_tex_view_identity(vk_tex *x, VkImageView view, vk_canvas_image *image, Vk
     pthread_mutex_unlock(&g_tex_mu);
     return found;
 }
+/* TOTK_VK_FEEDBACK_CUT: the same cached view (format, type, aspect, swizzle, layers, base level) with only its first
+   `levels` levels, cached beside it. The original view when it is unknown or already that short. */
+VkImageView vk_tex_view_levels(vk_tex *x, VkImageView view, uint32_t levels) {
+    VkImageView result = view;
+    pthread_mutex_lock(&g_tex_mu);
+    vk_img *im = x ? x->im : NULL;
+    for (int i = 0; im && levels && i < im->nviews; i++) if (im->views[i].v == view) {
+        uint64_t k0 = im->views[i].k0, k1 = im->views[i].k1;
+        uint32_t l0 = (uint32_t)(k1 & 255), nl = (uint32_t)((k1 >> 8) & 255);
+        if (levels >= nl) break;
+        uint64_t cut = (k1 & ~(255ull << 8)) | (uint64_t)levels << 8;
+        for (int j = 0; j < im->nviews; j++) if (im->views[j].k0 == k0 && im->views[j].k1 == cut) { result = im->views[j].v; goto done; }
+        VkImageViewUsageCreateInfo uci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
+            .usage = (k0 >> 48 & 3) == 2 ? VK_IMAGE_USAGE_STORAGE_BIT : VK_IMAGE_USAGE_SAMPLED_BIT};
+        VkComponentMapping sw = {(VkComponentSwizzle)(k1 >> 40 & 7), (VkComponentSwizzle)(k1 >> 43 & 7),
+            (VkComponentSwizzle)(k1 >> 46 & 7), (VkComponentSwizzle)(k1 >> 49 & 7)};
+        VkImageViewCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, &uci, .image = im->img,
+            .viewType = (VkImageViewType)(k0 >> 32 & 0xff), .format = (VkFormat)(uint32_t)k0, .components = sw,
+            .subresourceRange = {(VkImageAspectFlags)(k0 >> 40 & 0xff), l0, levels, (uint32_t)(k1 >> 16 & 4095), (uint32_t)(k1 >> 28 & 4095)}};
+        VkImageView v;
+        if (vkCreateImageView(V.dev, &ci, NULL, &v)) { RED(16, "feedback-cut view failed (ser %llu)", (unsigned long long)x->serial); break; }
+        if (im->nviews == im->capviews) { im->capviews = im->capviews ? 2 * im->capviews : 4; im->views = realloc(im->views, (size_t)im->capviews * sizeof *im->views); }
+        im->views[im->nviews++] = (view_ent){k0, cut, v};
+        result = v; break;
+    }
+done:
+    pthread_mutex_unlock(&g_tex_mu);
+    return result;
+}
 int vk_xlate_texture_view_type(vk_tex *x, VkImageView view) {
     int type = -1;
     pthread_mutex_lock(&g_tex_mu);
@@ -1696,6 +1795,7 @@ int vk_xlate_texture_view_type(vk_tex *x, VkImageView view) {
     return type;
 }
 VkImageView vk_tex_view(vk_tex *x, const tex_t *t, const view_t *v, int attach) {
+    if (!attach) vk_draw_texture_read(0,t);
     if (!attach) vk_tex_native_read(x);
     (void)t;
     pthread_mutex_lock(&g_tex_mu); VkImageView r = x && x->im ? view_get(x, v, attach, -1) : VK_NULL_HANDLE; pthread_mutex_unlock(&g_tex_mu);
@@ -1809,7 +1909,11 @@ static int native_scene_seed(vk_tex *x, vk_img *host, uint32_t w, uint32_t h) {
     VkCommandBuffer cb=vk_cb(); int scope=vk_native_gpu_begin(cb,VK_NUI_CANVAS_SEED);
     int scaled=vk_scene_post_run(cb,source.view,source.w,source.h,0,0,w,h,&target,&scratch,aa);
     vk_native_gpu_end(cb,scope);
-    if (scaled) (void)vk_fg_capture_native_scene(cb,&target);
+    if (scaled) {
+        if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "framegen");
+        (void)vk_fg_capture_native_scene(cb,&target);
+        if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
+    }
     return scaled;
 }
 static vk_img *native_prepare(vk_tex *x, int preserve) {
@@ -1965,11 +2069,21 @@ void mtl_set_tex_pool_n(int n) { atomic_store_explicit(&g_tpool_n, n, memory_ord
 static _Atomic uint32_t g_samp_epoch = 1;
 uint64_t vk_record_sampler_revision(void) { return atomic_load_explicit(&g_samp_epoch, memory_order_acquire); }
 static int texcache_on(void) { static int on = -1; if (on < 0) on = !vk_off("texcache"); return on; }
+static _Atomic uint64_t g_treg_calls, g_treg_unchanged;   /* TOTK_VK_TEX_MEMO: registrations, of those identical */
 void mtl_reg_tex(int tid, const tex_t *t, const view_t *v) {
     if (tid < 0) return;
     pthread_mutex_lock(&g_reg_mu);
     if (tid >= g_ntreg) { int n = tid + 1024; g_treg = realloc(g_treg, (size_t)n * sizeof *g_treg); memset(g_treg + g_ntreg, 0, (size_t)(n - g_ntreg) * sizeof *g_treg); g_ntreg = n; }
     vk_treg *r = &g_treg[tid];
+    /* TOTK_VK_TEX_MEMO: the same object (its serial is in tex_t) and view written again change no lookup result, so
+       the revisions that retire every memo entry, stage signature and freeze key stay as they are. */
+    if (vk_tex_memo_on()) {
+        atomic_fetch_add_explicit(&g_treg_calls, 1, memory_order_relaxed);
+        if (t ? r->ok && r->has_v == (v != NULL) && !memcmp(&r->t, t, sizeof *t) && (!v || !memcmp(&r->v, v, sizeof *v)) : !r->ok) {
+            atomic_fetch_add_explicit(&g_treg_unchanged, 1, memory_order_relaxed);
+            pthread_mutex_unlock(&g_reg_mu); return;
+        }
+    }
     r->ok = t != NULL; if (t) r->t = *t; r->has_v = v != NULL;
     if (v) r->v = *v; else memset(&r->v, 0, sizeof r->v);
     if (vk_native_ui_enabled()) native_index_tid(tid, t);
@@ -2041,9 +2155,7 @@ static VkImageView tex_by_id_slow(int tid, int want, vk_tex **x_out, tidc_t *cac
     *x_out = x;
     return v;
 }
-VkImageView vk_tex_by_id(int tid, int *target_out, vk_tex **x_out) {
-    int want = target_out ? *target_out : -1;
-    TEX_LOOKUP_COUNT(0);
+static VkImageView tex_by_id_cached(int tid, int want, vk_tex **x_out) {
     if (!texcache_on() || tid <= 0 || tid >= TID_GEN_N) {
         TEX_LOOKUP_COUNT(1);
         vk_tex *x; VkImageView v = tex_by_id_slow(tid, want, &x, NULL); if (x_out) *x_out = x; return v;
@@ -2088,6 +2200,83 @@ VkImageView vk_tex_by_id(int tid, int *target_out, vk_tex **x_out) {
     }
     if (x_out) *x_out = c->x;
     return c->v;
+}
+/* TOTK_VK_TEX_MEMO=1 (default 0): a per-thread memo in front of the cache above. Every entry was filled under one
+   (registry revision, texture identity revision) pair, read before its lookup; while the current pair equals it, the
+   cache above would return the same view and object (its per-ID generation and pool bound are covered by the registry
+   revision, its texture/image stamps by the identity revision), so a hit costs one small direct-mapped probe instead of
+   the ID's generation, the cache entry and two stamp cells. A changed pair retires every entry at once (a new memo
+   generation). The cache's once-per-submission work is kept per entry: an empty result holds for its submission only,
+   and a CPU-mirrored texture only once tex_get_inner finished with it in the current submission (x->memo_sub, stored
+   after its content check; the check itself stays in the cache path). Other textures never need it: a texture is
+   mirrored only from its creation, so one seen unmirrored stays so. Live (runtime/live_ctl.h): each lookup reads it.
+   [tex-memo] reports hits, misses and retirements. */
+typedef struct { uint32_t gen, key; uint64_t sub; VkImageView v; vk_tex *x; } texmemo_ent;   /* sub: 0 = any submission */
+enum { TEXMEMO_N = 2048 };
+typedef struct {
+    uint64_t registry, identity; uint32_t gen;
+    uint64_t counts[3], published[3];   /* hits, misses, retirements; published to g_tex_memo_counts every 4096 */
+    texmemo_ent e[TEXMEMO_N];
+} texmemo_t;
+static __thread texmemo_t *T_texmemo;
+static int g_tex_memo_launch;
+static totk_live_cache g_tex_memo_live;
+static _Atomic uint64_t g_tex_memo_counts[3];
+void vk_tex_memo_init(void) {
+    const char *e = getenv("TOTK_VK_TEX_MEMO"); g_tex_memo_launch = e && atoi(e) == 1;
+    LOGV("TOTK_VK_TEX_MEMO=%d: %s", g_tex_memo_launch, g_tex_memo_launch ?
+         "texture ID lookups memoized per thread until the registry, a texture identity or the submission changes" :
+         "every texture ID lookup validates its cache entry (default)");
+}
+int vk_tex_memo_on(void) { return totk_live_cached(&g_tex_memo_live, "TOTK_VK_TEX_MEMO", g_tex_memo_launch); }
+void vk_tex_memo_counts(uint64_t out[5]) {
+    for (int i = 0; i < 3; i++) out[i] = atomic_load_explicit(&g_tex_memo_counts[i], memory_order_relaxed);
+    out[3] = atomic_load_explicit(&g_treg_calls, memory_order_relaxed);
+    out[4] = atomic_load_explicit(&g_treg_unchanged, memory_order_relaxed);
+}
+static void texmemo_publish(texmemo_t *m) {
+    for (int i = 0; i < 3; i++) {
+        atomic_fetch_add_explicit(&g_tex_memo_counts[i], m->counts[i] - m->published[i], memory_order_relaxed);
+        m->published[i] = m->counts[i];
+    }
+}
+VkImageView vk_tex_by_id(int tid, int *target_out, vk_tex **x_out) {
+    vk_draw_texture_read(tid,NULL); /* before either descriptor cache can bypass resource preparation */
+    int want = target_out ? *target_out : -1;
+    TEX_LOOKUP_COUNT(0);
+    texmemo_t *m = T_texmemo;
+    if (!vk_tex_memo_on() || tid <= 0 || tid >= TID_GEN_N || !texcache_on() ||
+        (!m && !(m = T_texmemo = calloc(1, sizeof *m))))
+        return tex_by_id_cached(tid, want, x_out);
+    uint64_t registry = vk_treg_revision(), identity = atomic_load_explicit(&g_tex_ident_rev, memory_order_acquire);
+    uint64_t sub = vk_submit_serial();
+    if (registry != m->registry || identity != m->identity) {
+        m->registry = registry; m->identity = identity; m->counts[2]++;
+        if (!++m->gen) { memset(m->e, 0, sizeof m->e); m->gen = 1; }
+    }
+    if (want < -2 || want >= 4094) return tex_by_id_cached(tid, want, x_out);   /* outside the packed key */
+    uint32_t key = (uint32_t)tid | (uint32_t)(want + 2) << 20;   /* tid < 2^20 */
+    texmemo_ent *e = &m->e[(key ^ key >> 11 ^ key >> 20) % TEXMEMO_N];
+    VkImageView v = VK_NULL_HANDLE; vk_tex *x = NULL;
+    int hit = e->gen == m->gen && e->key == key &&
+        (e->x ? e->sub != UINT64_MAX || atomic_load_explicit(&e->x->memo_sub, memory_order_acquire) == sub : e->sub == sub);
+    if (hit) {
+        v = e->v; x = e->x; m->counts[0]++;
+        if (texgen_check()) {   /* the cache above is the oracle while nothing it depends on moved */
+            vk_tex *oracle; VkImageView view = tex_by_id_cached(tid, want, &oracle);
+            if (registry == vk_treg_revision() && identity == atomic_load_explicit(&g_tex_ident_rev, memory_order_acquire) &&
+                sub == vk_submit_serial() && (view != v || oracle != x)) {
+                LOGV("texture memo mismatch: tid=%d target=%d", tid, want); abort();
+            }
+        }
+    } else {
+        v = tex_by_id_cached(tid, want, &x); m->counts[1]++;
+        /* An empty result: this submission only. A mirrored texture: UINT64_MAX, checked against x->memo_sub per hit. */
+        *e = (texmemo_ent){m->gen, key, !x ? sub : __atomic_load_n(&x->mirrored, __ATOMIC_RELAXED) ? UINT64_MAX : 0, v, x};
+    }
+    if (!((m->counts[0] + m->counts[1]) & 4095)) texmemo_publish(m);
+    if (x_out) *x_out = x;
+    return v;
 }
 static VkBufferView tbuf_by_id(int tid, int writable, VkDescriptorBufferInfo *live, uint32_t *reason) {
     vk_treg rc, *r = &rc;
@@ -2213,8 +2402,10 @@ VkImageView vk_dummy_view(int target, int is_int) {
         if (!vk_mem_alloc(&req, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &mems[slot][ii])) DIE("dummy texture memory");
         VKCHECK(vkBindImageMemory(V.dev, imgs[slot][ii], mems[slot][ii].mem, mems[slot][ii].off));
         VkCommandBuffer cb = vk_pre_cb(); image_barrier_init(cb, imgs[slot][ii], VK_IMAGE_ASPECT_COLOR_BIT);
+        if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "upload");
         VkClearColorValue z = {{0}}; VkImageSubresourceRange rr = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, VK_REMAINING_ARRAY_LAYERS};
         vkCmdClearColorImage(cb, imgs[slot][ii], VK_IMAGE_LAYOUT_GENERAL, &z, 1, &rr); vk_barrier_all(cb);
+        if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
         totk_ft_count(FT_COUNT_TEX_REALIZATIONS, 1);
     }
     VkImageViewType vt = t == 0 ? VK_IMAGE_VIEW_TYPE_1D : t == 3 ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : t == 4 || t == 6 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : cube ? (t == 9 ? VK_IMAGE_VIEW_TYPE_CUBE_ARRAY : VK_IMAGE_VIEW_TYPE_CUBE) : three ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D;
@@ -2275,6 +2466,7 @@ void vk_texcopy_readback(const char *op, const char *side, const tex_t *t, vk_te
     vk_tex_native_read(x);
     VkCommandBuffer cb = vk_cb(); VkBuffer buffer; VkDeviceSize offset;
     uint8_t *bytes = vk_transient((size_t)total, 16, &buffer, &offset);
+    if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "transfer");
     vk_barrier_all(cb);
     VkBufferImageCopy copy = {.bufferOffset = offset,
         .imageSubresource = {im->aspect, level, is3d ? 0 : layer + r->zoffset, is3d ? 1 : (unsigned)nz},
@@ -2283,6 +2475,7 @@ void vk_texcopy_readback(const char *op, const char *side, const tex_t *t, vk_te
     vkCmdCopyImageToBuffer(cb, image, VK_IMAGE_LAYOUT_GENERAL, buffer, 1, &copy);
     vk_pso_life_external_read(MAXV(x->im->w >> level, 1u), MAXV(x->im->h >> level, 1u), "diagnostic-readback");
     vk_barrier_all(cb);
+    if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
     vk_flush_wait();
     totk_texcopy_log(sub, "phase=readback op=%s side=%s ser=%llu mem=%p image=%#llx level=%u layer=%u region=%d,%d,%d:%dx%dx%d bytes=%zu nonzero=%zu sample=%u result=complete",
         op, side, (unsigned long long)serial, (void *)(uintptr_t)storage, (unsigned long long)(uintptr_t)image,
@@ -2411,6 +2604,7 @@ static void read_texels(const tex_t *t, unsigned level, unsigned layer0, const N
     vk_tex_native_read(x);
     VkCommandBuffer cb = vk_cb();
     VkBuffer sb; VkDeviceSize so; uint8_t *stg = vk_transient(wb * hb * nz, 16, &sb, &so);
+    if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "transfer");
     vk_barrier_all(cb);
     for (int z = 0; z < nz; z++) {
         VkBufferImageCopy c = {.bufferOffset = so + (VkDeviceSize)z * wb * hb, .imageSubresource = {x->im->aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT : x->im->aspect, level, is3d ? 0 : layer0 + r->zoffset + z, 1},
@@ -2418,6 +2612,7 @@ static void read_texels(const tex_t *t, unsigned level, unsigned layer0, const N
         vkCmdCopyImageToBuffer(cb, x->im->img, VK_IMAGE_LAYOUT_GENERAL, sb, 1, &c);
         vk_pso_life_external_read(MAXV(x->im->w >> level, 1u), MAXV(x->im->h >> level, 1u), "cpu-texel-read");
     }
+    if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
     texel_flush(s);
     for (int z = 0; z < nz; z++) for (size_t y = 0; y < hb; y++) memcpy(dst + z * img + y * row, stg + (size_t)z * wb * hb + y * wb, wb);
 }
@@ -2443,6 +2638,7 @@ static void write_texels(const tex_t *t, unsigned level, unsigned layer0, const 
     VkCommandBuffer cb = vk_cb();
     VkBuffer sb; VkDeviceSize so; uint8_t *stg = vk_transient(wb * hb * nz, 16, &sb, &so);
     for (int z = 0; z < nz; z++) for (size_t y = 0; y < hb; y++) memcpy(stg + (size_t)z * wb * hb + y * wb, src + z * img + y * row, wb);
+    if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "upload");
     vk_barrier_all(cb);
     for (int z = 0; z < nz; z++) {
         VkBufferImageCopy c = {.bufferOffset = so + (VkDeviceSize)z * wb * hb, .imageSubresource = {x->im->aspect, level, is3d ? 0 : layer0 + r->zoffset + z, 1},
@@ -2451,6 +2647,7 @@ static void write_texels(const tex_t *t, unsigned level, unsigned layer0, const 
         vk_pso_life_external_write(x, level, is3d ? 0 : layer0 + r->zoffset + z, 1, "cpu-texel-upload");
         totk_ft_count(FT_COUNT_TEX_UPLOADS, 1);
     }
+    if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
     vk_tex_native_patch(x, level, layer0, r);
     texel_flush(s);
 }

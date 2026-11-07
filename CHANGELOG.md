@@ -3,6 +3,80 @@
 All notable changes to TotK Native for Android (`com.aure.totk`). The app follows [semantic versioning](https://semver.org);
 the game version it runs is shown separately. versionCode = major × 10000 + minor × 100 + patch.
 
+## Unreleased
+
+### Developer tools
+- Add opt-in rooted-device CPU profiling with NDK simpleperf frame-pointer stacks,
+  exact-build symbol checks, shell-accessible staging, and verified perf-control restoration.
+  Per-thread period-weighted self/inclusive reports separate walker, recorder, submit and game CPU.
+- Give newly linked `libtotk.so` a SHA-1 GNU build ID retained in the packaged library,
+  so native profiles can identify matching unstripped symbols without relying on source revision alone.
+
+### Runtime
+- Keep `totk.log` as the direct primary log, but make its duplicate logcat mirror opt-in (`TOTK_LOGCAT=1`).
+  Normal launches no longer start its tail thread or wake logd for every frame log. Crash reports remain enabled.
+- Let the live-control reader sleep when `totk.ctl` is absent, including after unrelated files are created or deleted.
+  Keep its directory watch until the control file appears instead of repeatedly waking on its own watch removals.
+- Keep the stall watchdog enabled, but reuse the present timestamp/frame instead of reading a second clock and
+  incrementing an atomic counter every frame; publish immutable stage names only when they change.
+
+### Menu
+- **Keep the GPU busy** in Graphics → Performance feeds smaller batches earlier and requests clocks that keep up.
+  On by default only on Snapdragon 8 Elite-class chips (Odin 3), independently of the chosen preset; it uses a
+  little more GPU and CPU clock, power and heat. Restart-based Odin 3 tests raised Hateno from 46.5 to 57.3 fps
+  and Lookout from 52.2 to 57.1 fps (4/4 pairs); Rotsumamu stayed at the 60 fps cap. At the 60 fps preset the
+  Duo's p95 worsened by 4–5 ms (4/4 pairs), while Thor was neutral, so both keep it off.
+  Upgrades without a stored choice adopt the chip default; explicit choices survive. Presets no longer change
+  or match this option. Thor and Duo defaults retain 1.0.1's settings.env bytes for every preset, and frame
+  generation leaves the option inactive.
+- Make controller hysteresis part of the Odin / Snapdragon 8 Elite-class native 60-fps menu profile:
+  `TOTK_FPS60_HYSTERESIS=1` is generated only for `CQ8725S`/`SM8750` at 60 fps without frame generation,
+  including existing stores and custom mixes, independently of GPU busy. No extra visible option or stored
+  preference is added. Runtime unset remains native/off; developer `totk.env` `=0` overrides the menu.
+  Other chips and every non-60 preset keep their previous settings.env bytes. Device validation is required
+  before this branch is merged.
+
+## 1.0.1 (versionCode 10001), game 1.4.3
+
+Fixes for the first reports, plus a few improvements.
+
+- Updates: when the game starts, the app checks GitHub for a newer version (one tiny request, only when online, never delays the game) and offers to download and install it; a setup step and a menu switch turn it off.
+- Update safety: other apps cannot authorize an update through the exported menu; downloads stop if they stall or exceed ten minutes, and the exact bytes handed to Android are checked again before installation.
+
+### Game
+- The game pauses, with its sound, while it's in the background or the recent-apps screen is open (on dual-screen
+  devices, using the other screen doesn't pause it).
+
+### Setup
+- The container route (XCI/NSP + update + `prod.keys`) no longer fails with "Could not create romfs.fifo" when the
+  game data goes to the SD card or to a folder you picked. The merge pipe now always lives in the app's private
+  storage; an interrupted merge's leftover pipe is removed on the next run.
+- Setup errors name the call that failed and its real reason (1.0.0 could report "No such file or directory" for a
+  different error).
+- Time estimates match measured runs: about 2–3 minutes from decrypted files, about 15 minutes from containers, plus the
+  copy time to an SD card.
+- Setup stopped: a **Share details** button sends the error and the setup logs (no game files or keys) through any
+  app, for bug reports.
+- Setup skips the second-screen art on devices with one screen; on dual-screen devices that don't have it yet, Start
+  game offers to prepare it.
+
+### Menu
+- The menu no longer reports "The game is running" when it isn't: its own background checks are no longer mistaken
+  for the game.
+- When the game really is still running in the background, the affected actions say so, and a **Close the game**
+  button closes it safely (waiting for an in-progress save) and then carries on with what you chose. This also works
+  after Android freezes the background game: a temporary menu binding wakes it without bringing its task forward.
+- Graphics driver: Turnip drivers can be picked as the .zip they're distributed in (AdrenoTools format), not only as
+  a .so.
+
+### Second screen
+- On dual-screen devices the game always opens on the main screen, with the companion on the second one, even when started from the second screen.
+- The controller keeps working after you touch the companion or an overlay on the second screen (such as AYN's
+  performance overlay): Android sends the buttons to the last-touched screen, so the game now takes them back.
+- Fused materials use the game's own names (for example "Armor Shard" instead of "Obj Armor Spike B"), including world
+  objects that are not pouch items and the Russian names. Existing second-screen art updates automatically on the next
+  start; unknown objects fall back to readable text.
+
 ## 1.0.0 (versionCode 10000), game 1.4.3
 
 The first public release: one generic, signed APK for arm64 Android 13+ devices with an Adreno GPU. It contains no

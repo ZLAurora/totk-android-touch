@@ -63,8 +63,47 @@ static void launch(unsigned phase) {
     CHECK(!error, "create placement test thread"); if (!error) CHECK(!pthread_join(thread, NULL), "join placement test thread");
 }
 static void options_clear(void) {
-    const char *keys[] = {"TOTK_AFFINITY_WALK", "TOTK_AFFINITY_RECW", "TOTK_AFFINITY_GAME", "TOTK_PRIO_WALK", "TOTK_UCLAMP_WALK"};
+    const char *keys[] = {"TOTK_AFFINITY_WALK", "TOTK_AFFINITY_RECW", "TOTK_AFFINITY_GAME", "TOTK_PRIO_WALK", "TOTK_UCLAMP_WALK",
+        "TOTK_PRIO_RENDER", "TOTK_TIMER_SLACK_NS"};
     for (unsigned i = 0; i < sizeof keys / sizeof *keys; i++) unsetenv(keys[i]);
+}
+/* TOTK_PRIO_RENDER: frame-critical host threads only; compile/seed/cache workers and guests keep their nice. */
+typedef struct { const char *name; int expected_delta; } render_case;
+static void *render_worker(void *arg) {
+    const render_case *c = arg; int nice = getpriority(PRIO_PROCESS, 0);
+    errno = EDOM;
+    if (!strcmp(c->name, "totk-walk")) totk_thread_walk(); else totk_thread_start(c->name, NULL);
+    CHECK(errno == EDOM, "render priority preserves errno");
+    int result = getpriority(PRIO_PROCESS, 0);
+    if (result != nice + c->expected_delta) {
+        failures++; fprintf(stderr, "FAIL: %s nice %d, expected %d\n", c->name, result, nice + c->expected_delta);
+    }
+    checks++; return NULL;
+}
+static void render_launch(const char *name, int expected_delta) {
+    render_case c = {name, expected_delta}; pthread_t thread;
+    int error = pthread_create(&thread, NULL, render_worker, &c);
+    CHECK(!error, "create render test thread"); if (!error) CHECK(!pthread_join(thread, NULL), "join render test thread");
+}
+static void render_tests(int initial_nice) {
+    if (initial_nice > 17) return;   /* needs two unprivileged nice steps */
+    char value[16]; options_clear();
+    snprintf(value, sizeof value, "%d", initial_nice + 1); setenv("TOTK_PRIO_RENDER", value, 1);
+    const char *frame[] = {"totk-walk", "totk-recw0", "totk-recw1", "totk-submit", "totk-gpufence", "totk-post",
+        "totk-present", "totk-vsync"};
+    for (unsigned i = 0; i < sizeof frame / sizeof *frame; i++) render_launch(frame[i], 1);
+    const char *other[] = {"totk-pipe0", "totk-compute", "totk-pcache", "totk-seed-io", "totk-prewarm", "totk-audio",
+        "g-main", "g-90"};
+    for (unsigned i = 0; i < sizeof other / sizeof *other; i++) render_launch(other[i], 0);
+    snprintf(value, sizeof value, "%d", initial_nice + 2); setenv("TOTK_PRIO_WALK", value, 1);
+    render_launch("totk-walk", 2);   /* the walker's own setting is applied last */
+    render_launch("totk-submit", 1);
+    const char *invalid[] = {"20", "-21", "", "+", "1x"};
+    unsetenv("TOTK_PRIO_WALK");
+    for (unsigned i = 0; i < sizeof invalid / sizeof *invalid; i++) {
+        setenv("TOTK_PRIO_RENDER", invalid[i], 1); render_launch("totk-submit", 0);
+    }
+    options_clear();
 }
 static void fixture_file(const char *root, const char *relative, const char *text) {
     char path[PATH_MAX]; snprintf(path, sizeof path, "%s/%s", root, relative);
@@ -208,6 +247,7 @@ int main(void) {
     CHECK(!memcmp(&cached, &totk_game_affinity_mask, sizeof cached), "main and created guests share immutable startup mask");
     setenv("TOTK_AFFINITY_GAME", "all", 1); launch(7);
     setenv("TOTK_AFFINITY_GAME", "", 1); launch(8); options_clear();
+    render_tests(initial_nice);
     check_mask(&original); CHECK(getpriority(PRIO_PROCESS, 0) == initial_nice, "other threads' nice settings do not affect parent");
     printf("ok: thread placement %u checks, %u failed\n", atomic_load(&checks), atomic_load(&failures)); return atomic_load(&failures) != 0;
 }

@@ -14,6 +14,7 @@
 #include "vk_pcache_store.h"
 #define PSO_KEY_LIMIT 16384u
 #define PSO_STATE_WORDS 155u
+/* The stage word at byte 160: early-tests bit 0, alpha comparison (0=off, 1..7) bits 1..3. */
 #define PSO_KEY_BYTES (160u + 4u + 4u * PSO_STATE_WORDS)
 #define PSO_REC_BYTES (PSO_KEY_BYTES + 8u)
 #define PSO_HEADER_BYTES 64u
@@ -40,7 +41,7 @@ static inline int pso_name(const uint8_t *p, int optional) {
     return 1;
 }
 static inline int pso_valid(const pso_record *r) {
-    if (!pso_name(r->key, 0) || !pso_name(r->key + 80, 1) || pso_u32(r->key + 160) > 1 || !r->frequency || r->capture > 1) return 0;
+    if (!pso_name(r->key, 0) || !pso_name(r->key + 80, 1) || pso_u32(r->key + 160) > 15 || !r->frequency || r->capture > 1) return 0;
     const uint8_t *s = r->key + 164;
     uint32_t n = pso_u32(s + 10*4), samples = pso_u32(s + 11*4);
     if (n > 8 || samples > 64 || (samples && (samples & (samples - 1))) || pso_u32(s+12*4) > 255 ||

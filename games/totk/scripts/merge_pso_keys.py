@@ -43,7 +43,8 @@ def name(raw, optional=False):
 def validate(key, frequency, capture):
     name(key[:80]); name(key[80:160], True)
     early, *s = struct.unpack_from('<156I', key, 160)
-    if early > 1 or not frequency or capture > 1:
+    # Stage word: bit 0 early-tests, bits 1..3 alpha comparison (zero is off).
+    if early > 15 or not frequency or capture > 1:
         raise ValueError('invalid metadata')
     samples = s[11]
     if (s[10] > 8 or samples > 64 or samples & (samples - 1) or s[12] > 255 or
@@ -130,7 +131,7 @@ def decode_tsv(data):
         if len(words) != WORDS:
             raise ValueError('invalid PSO TSV state word count')
         # Width checks precede integer conversion; never accept unbounded decimal/hex inputs.
-        if (early not in (b'0', b'1') or capture not in (b'0', b'1') or
+        if (not re.fullmatch(rb'[0-9]|1[0-5]', early) or capture not in (b'0', b'1') or
                 not re.fullmatch(rb'[1-9][0-9]{0,9}', frequency) or
                 any(not re.fullmatch(rb'0|[1-9a-f][0-9a-f]{0,7}', word) for word in words)):
             raise ValueError('invalid PSO TSV integer')

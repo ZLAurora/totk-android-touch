@@ -37,6 +37,8 @@
 #include "../../../../runtime/fps_auto_runtime.h"
 #include "../../../../runtime/frame_lag.h"
 #include "../../../../runtime/android_perf.h"
+#include "../../../../runtime/android_pause.h"
+#include "../../../../runtime/live_ctl.h"   /* TOTK_NVN_CALL_NOCOPY */
 #include <mach/mach_time.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -907,7 +909,8 @@ static void cb_check(const cmd_t *o, const char *where) {
 NVN(nvnCommandBufferInitialize, NVNboolean, NVNcommandBuffer *c, NVNdevice *d) {
     memset(c, 0, sizeof(cmd_t)); CB(c)->magic = MAGIC('C', 'M', 'D', 'B'); CB(c)->dev = d; CB(c)->inline_cur = ~0ull; CB(c)->inline_end = 0; return 1;
 }
-NVN(nvnCommandBufferFinalize, void, NVNcommandBuffer *c) { free(CB(c)->seg); CB(c)->seg = CB(c)->cur = CB(c)->end = NULL; CB(c)->magic = 0; }
+static void seg_release_calls(const cmd_t *o);   /* TOTK_NVN_CALL_NOCOPY: an abandoned recording's markers */
+NVN(nvnCommandBufferFinalize, void, NVNcommandBuffer *c) { seg_release_calls(CB(c)); free(CB(c)->seg); CB(c)->seg = CB(c)->cur = CB(c)->end = NULL; CB(c)->magic = 0; }
 NVN(nvnCommandBufferSetMemoryCallback, void, NVNcommandBuffer *c, PFNNVNCOMMANDBUFFERMEMORYCALLBACKPROC cb) { CB(c)->cb = cb; }
 NVN(nvnCommandBufferSetMemoryCallbackData, void, NVNcommandBuffer *c, void *d) { CB(c)->cb_data = d; }
 static uint8_t *align8(uint8_t *p) { return (uint8_t *)(((uintptr_t)p + 7) & ~(uintptr_t)7); }
@@ -1051,7 +1054,7 @@ static void hw_fix(cmd_t *o, size_t bytes) { o->hw_used += bytes; o->hw_used -= 
 static int reclog_limit(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_RECLOG"); v = e ? atoi(e) : 0; } return v; }
 NVN(nvnCommandBufferBeginRecording, void, NVNcommandBuffer *c) {
     cmd_t *o = CB(c);
-    if (o->recording) LOG("【红】BeginRecording 重入");
+    if (o->recording) { LOG("【红】BeginRecording 重入"); seg_release_calls(o); }
     o->recording = 1; o->cur = o->seg;   /* the previous recording was copied at EndRecording */
 #ifdef GAME_BOTW
     cb_seen_set(o);
@@ -1093,23 +1096,60 @@ static copy_bucket *cbk_get(uintptr_t page, int create) {   // g_copy_mu held
 static pthread_mutex_t g_copy_mu = PTHREAD_MUTEX_INITIALIZER;
 /* The opaque handle points past this host-only validation and accounting prefix. */
 #define COPY_MAGIC 0x59504f43444d43ull   /* "CMDCOPY" */
+/* refs: the handle's own reference (dropped when the copy is released) plus one per recording in progress whose
+   TOTK_NVN_CALL_NOCOPY marker still names it (dropped once that recording's EndRecording copied the body, or the
+   recording was abandoned). The memory goes with the last reference; the handle itself dies at its release as before. */
 #ifdef GAME_BOTW
-typedef struct { uint64_t magic; _Atomic uint64_t used_at; uint64_t made_at; uint32_t body_bytes, last_size; _Atomic uint32_t used; uint32_t pad_; } copy_prefix;   // used: called or submitted at least once (NVN 53 lifetime, release_copies)
+typedef struct { uint64_t magic; _Atomic uint64_t used_at; uint64_t made_at; uint32_t body_bytes, last_size; _Atomic uint32_t used; _Atomic uint32_t refs; } copy_prefix;   // used: called or submitted at least once (NVN 53 lifetime, release_copies)
 #else
-typedef struct { uint64_t magic; _Atomic uint64_t used_at; uint64_t made_at; uint32_t body_bytes, last_size; } copy_prefix;
+typedef struct { uint64_t magic; _Atomic uint64_t used_at; uint64_t made_at; uint32_t body_bytes, last_size; _Atomic uint32_t refs; uint32_t pad_; } copy_prefix;
 #endif
 static _Atomic uint64_t g_copy_bytes;   /* live recording-copy bytes (logged with the copy count) */
 static copy_prefix *copy_of(NVNcommandHandle h) { copy_prefix *c = (copy_prefix *)(uintptr_t)h - 1; return c; }
+static void copy_unref(copy_prefix *pf) {   /* any thread, no lock: the last reference frees the memory */
+    if (atomic_fetch_sub_explicit(&pf->refs, 1, memory_order_acq_rel) == 1) { g_copy_bytes -= malloc_size(pf); free(pf); }
+}
+/* TOTK_NVN_CALL_NOCOPY (default 0 = off): CallCommands / CopyCommands copy each called body into the caller's recording
+   buffer, and the caller's EndRecording copies the whole recording, those bodies included, a second time. On: the call
+   records a host-only marker naming the called copy (holding a reference), and EndRecording copies the body straight from
+   that copy into the caller's copy, once. The caller's copy has the same bytes, and the reported command memory use
+   (cmd_used / hw_used / last_rec) moves exactly as the inline copy moved it; only the recording buffer and the replay never
+   see the marker. The one byte-level difference: if the called recording is submitted between the call and the caller's
+   EndRecording, its deferred binds were re-read at that submit (resolve_deferred) and the caller copies those values; the
+   caller's own submit reads every deferred bind again, so the replay sees the same handles. Live (runtime/live_ctl.h) at
+   each call; a recording holding markers always expands them. Breath of the Wild (handles resolved by position) keeps
+   copying at the call. */
+#define CALL_MARKER_MAGIC 0x4c4c41434d4b524dull   /* "MRKMCALL" */
+typedef struct { op_hdr h; uint64_t copy, magic; } call_marker;
+_Static_assert(sizeof(call_marker) == 24, "call marker is one 24-byte record");
+static const copy_prefix *call_marker_target(const uint8_t *p, op_hdr h) {
+    if (h.op != OP_CALL || h.size != sizeof(call_marker)) return NULL;
+    call_marker m; memcpy(&m, p, sizeof m);
+    return m.magic == CALL_MARKER_MAGIC ? copy_of((NVNcommandHandle)m.copy) : NULL;
+}
+static void seg_release_calls(const cmd_t *o) {   /* an abandoned recording: drop the references its markers hold */
+    if (!o->seg || !o->recording) return;
+    for (const uint8_t *p = o->seg; p + sizeof(op_hdr) <= o->cur; ) {
+        op_hdr h; memcpy(&h, p, sizeof h);
+        if (h.size < 8 || (h.size & 7)) break;
+        const copy_prefix *t = call_marker_target(p, h); if (t) copy_unref((copy_prefix *)(uintptr_t)t);
+        p += h.size;
+    }
+}
+static _Atomic uint64_t g_call_markers, g_call_marker_bytes;   /* calls recorded as markers / body bytes not copied at the call */
 /* Two passes: size the copy exactly from the record headers, then allocate once and copy each contiguous run between
    jumps with one memcpy. The old doubling realloc re-copied the recording at every growth and again when trimming
-   (realloc memcpy on the game's main thread, plus fresh-page faults for the large frame recordings). */
+   (realloc memcpy on the game's main thread, plus fresh-page faults for the large frame recordings). A
+   TOTK_NVN_CALL_NOCOPY marker counts as its called body, which is copied in its place (and its reference dropped). */
 static uint8_t *flatten_recording(const uint8_t *p0) {
     size_t n = sizeof(copy_prefix);
-    int bulk_ok = 1, jumped = 0; uint32_t last_size = 0, end_size = 0;
+    int bulk_ok = 1, jumped = 0, called = 0; uint32_t last_size = 0, end_size = 0;
     for (const uint8_t *p = p0;;) {
         op_hdr h; memcpy(&h, p, sizeof h);
         if (h.size < 8 || (h.size & 7)) die("corrupt recording at %p (op %u size %u)", (const void *)p, h.op, h.size);
         if (h.op == OP_JUMP) { memcpy(&p, p + 8, 8); jumped = 1; continue; }
+        const copy_prefix *t = call_marker_target(p, h);
+        if (t) { n += t->body_bytes; last_size = t->last_size; called = 1; p += h.size; continue; }   /* checked bulk records */
         if (h.op >= OP_COUNT_ || h.size > (64u << 20)) bulk_ok = 0;
         if (n == sizeof(copy_prefix)) { if (h.op != OP_BEGIN || h.size != 8) bulk_ok = 0; }
         else if (h.op == OP_BEGIN) bulk_ok = 0;
@@ -1121,18 +1161,25 @@ static uint8_t *flatten_recording(const uint8_t *p0) {
     uint8_t *out = malloc(n);
     if (!out) die("command copy allocation");
     size_t at = sizeof(copy_prefix);
-    if (!jumped) { memcpy(out + at, p0, n - at); at = n; }   /* the usual case: one contiguous span, no second header walk */
+    if (!jumped && !called) { memcpy(out + at, p0, n - at); at = n; }   /* the usual case: one contiguous span, no second header walk */
     else for (const uint8_t *p = p0, *run = p0;;) {
         op_hdr h; memcpy(&h, p, sizeof h);
         if (h.op == OP_JUMP) {
             memcpy(out + at, run, (size_t)(p - run)); at += (size_t)(p - run);
             memcpy(&p, p + 8, 8); run = p; continue;
         }
+        const copy_prefix *t = call_marker_target(p, h);
+        if (t) {
+            memcpy(out + at, run, (size_t)(p - run)); at += (size_t)(p - run);
+            memcpy(out + at, (const uint8_t *)(t + 1) + 8, t->body_bytes); at += t->body_bytes;   /* past its BEGIN */
+            copy_unref((copy_prefix *)(uintptr_t)t);
+            p += h.size; run = p; continue;
+        }
         if (h.op == OP_END) { memcpy(out + at, run, (size_t)(p + h.size - run)); at += (size_t)(p + h.size - run); break; }
         p += h.size;
     }
     if (at != n) die("recording copy size changed while copying (%zu of %zu bytes)", at, n);
-    copy_prefix *c = (copy_prefix *)out; c->magic = COPY_MAGIC; c->used_at = 0; c->made_at = g_submits;
+    copy_prefix *c = (copy_prefix *)out; c->magic = COPY_MAGIC; c->used_at = 0; c->made_at = g_submits; atomic_init(&c->refs, 1);
 #ifdef GAME_BOTW
     c->used = 0;
 #endif
@@ -1164,7 +1211,7 @@ static void copy_drop(copy_bucket *b, uint32_t i, int by_token) {   /* g_copy_mu
     copy_prefix *pf = (copy_prefix *)(c->copy - sizeof(copy_prefix));
     if (cmdlog_env()) LOG("[cmd] free copy=%p%s", (void *)c->copy, by_token ? " (its mark in the control memory is gone)" : "");
     g_freed[g_nfreed++ % FREED_RING] = (typeof(g_freed[0])){(uintptr_t)c->copy, g_submits, c->stale_at, pf->used_at, pf->made_at, c->ctl_lo};
-    pf->magic = 0; g_copy_bytes -= malloc_size(pf); free(pf); b->v[i] = b->v[--b->n]; g_ncopies--;
+    pf->magic = 0; copy_unref(pf); b->v[i] = b->v[--b->n]; g_ncopies--;   /* a recording's call marker may keep the memory a while */
     if (by_token) g_copy_drop_token++; else g_copy_drop_readd++;
     if (!b->n && !b->empty) { b->empty = 1; g_cbk_empty++; }
 }
@@ -1266,9 +1313,10 @@ NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
       if (b->n == b->cap) { b->cap = b->cap ? b->cap * 2 : 8; b->v = realloc(b->v, b->cap * sizeof *b->v); if (!b->v) die("command copy table"); }
       b->v[b->n++] = (cmd_copy){lo, hi, copy, 0, (uint32_t)token}; g_ncopies++; }
     { static uint64_t made; if (++made % 20000 == 0)
-        LOG("[cmd] recording copies: %llu made, %zu live, %.1f MiB, submit %llu; released %llu at a re-added control memory, %llu whose mark there was gone (%llu unmapped); index %zu buckets (%zu empty) of %zu, compacted %llu times",
+        LOG("[cmd] recording copies: %llu made, %zu live, %.1f MiB, submit %llu; released %llu at a re-added control memory, %llu whose mark there was gone (%llu unmapped); index %zu buckets (%zu empty) of %zu, compacted %llu times; TOTK_NVN_CALL_NOCOPY markers %llu, %.1f MiB not copied at the call",
             (unsigned long long)made, g_ncopies, g_copy_bytes / 1048576.0, (unsigned long long)g_submits, (unsigned long long)g_copy_drop_readd, (unsigned long long)g_copy_drop_token, (unsigned long long)g_copy_mark_faults,
-            g_cbk_used, g_cbk_empty, g_cbk_cap, (unsigned long long)g_cbk_compactions); }
+            g_cbk_used, g_cbk_empty, g_cbk_cap, (unsigned long long)g_cbk_compactions,
+            (unsigned long long)atomic_load_explicit(&g_call_markers, memory_order_relaxed), atomic_load_explicit(&g_call_marker_bytes, memory_order_relaxed) / 1048576.0); }
     pthread_mutex_unlock(&g_copy_mu);
     if (cmdlog_env()) LOG("[cmd] EndRecording cb=%p recorded=%p copy=%p ctl=%p", (void *)c, (void *)o->seg, (void *)copy, o->ctl);
     if (totk_life_on() && totk_life_cb_take(c)) { totk_life_log("end cb=%p handle=%p", (void *)c, (void *)copy); totk_life_handle_add((uint64_t)(uintptr_t)copy); }
@@ -1348,6 +1396,28 @@ void dm_nvn_inline_bulk_set(int v) {
     atomic_store_explicit(&g_inline_bulk_on, v != 0, memory_order_relaxed);
     LOG("[flag] inline_bulk = %d", v != 0);
 }
+/* TOTK_NVN_CALL_NOCOPY (see call_marker above): the launch value, read at the first call, and the value in use. */
+#ifdef GAME_BOTW
+static int call_nocopy_on(void) { return 0; }   /* handles are positions whose copy a later recording replaces: copy at the call */
+#else
+static _Atomic int g_call_nocopy_launch = -1;
+static totk_live_cache g_call_nocopy_live;
+static int call_nocopy_on(void) {
+    int v = atomic_load_explicit(&g_call_nocopy_launch, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("TOTK_NVN_CALL_NOCOPY"); int on = e && atoi(e) == 1, expected = -1;
+        if (atomic_compare_exchange_strong(&g_call_nocopy_launch, &expected, on))
+            LOG("[nvn] TOTK_NVN_CALL_NOCOPY=%d: %s", on, on ? "called recordings are copied once, into the caller's copy at its EndRecording" :
+                "called recordings are copied into the caller at the call and again at its EndRecording (default)");
+        v = atomic_load_explicit(&g_call_nocopy_launch, memory_order_relaxed);
+    }
+    return totk_live_cached(&g_call_nocopy_live, "TOTK_NVN_CALL_NOCOPY", v);
+}
+void dm_nvn_call_nocopy_set(int v) {   /* probes and host tests: both arms in one process */
+    atomic_store_explicit(&g_call_nocopy_launch, v == 1, memory_order_relaxed);
+    LOG("[flag] call_nocopy = %d", v == 1);
+}
+#endif
 static void inline_recording(NVNcommandBuffer *c, NVNcommandHandle hd) {
     const uint8_t *p = (const uint8_t *)(uintptr_t)hd;
     if (!p) die("CallCommands/CopyCommands with a null handle");
@@ -1357,9 +1427,19 @@ static void inline_recording(NVNcommandBuffer *c, NVNcommandHandle hd) {
        its bytes now, at exactly the original call position. Deferred bindings
        remain deferred; source handle retirement cannot affect the caller.
        CMDSTAT retains the record-by-record path and its exact counters. */
-    const copy_prefix *meta = copy_of(hd);
+    copy_prefix *meta = copy_of(hd);
     if (inline_bulk_on() && !cs_on() && meta->body_bytes && meta->last_size) {
         cmd_t *o = CB(c);
+        if (call_nocopy_on()) {   /* a marker now, the body at EndRecording; usage moves as if it were copied here */
+            atomic_fetch_add_explicit(&meta->refs, 1, memory_order_relaxed);   /* the handle is live: the game calls it */
+            call_marker m = {{OP_CALL, sizeof m}, (uint64_t)(uintptr_t)hd, CALL_MARKER_MAGIC};
+            memcpy(cmd_alloc(o, sizeof m), &m, sizeof m);
+            o->cmd_used = o->cmd_used - sizeof m + meta->body_bytes; o->hw_used = o->hw_used - sizeof m + meta->body_bytes;
+            o->last_rec = meta->last_size;
+            atomic_fetch_add_explicit(&g_call_markers, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&g_call_marker_bytes, meta->body_bytes, memory_order_relaxed);
+            return;
+        }
         uint8_t *dst = cmd_alloc(o, meta->body_bytes);
         memcpy(dst, p + 8, meta->body_bytes);
         o->last_rec = meta->last_size;
@@ -1863,13 +1943,17 @@ void dm_nvn_probe_inline_bulk(void) {
         }
         cmd_t *a = CB(&cb[1]), *b = CB(&cb[2]);
         size_t used = a->cur - a->seg;
-        if ((size_t)(b->cur - b->seg) != used || memcmp(a->seg, b->seg, used)) die("inline bulk probe: copied bytes differ"); checks++;
+        /* TOTK_NVN_CALL_NOCOPY holds markers in the recording buffer: the finished copies are compared below instead. */
+        if (!call_nocopy_on() && ((size_t)(b->cur - b->seg) != used || memcmp(a->seg, b->seg, used))) die("inline bulk probe: copied bytes differ"); checks++;
         if (a->cmd_used != b->cmd_used || a->hw_used != b->hw_used || a->last_rec != b->last_rec) die("inline bulk probe: accounting differs"); checks++;
         // An operation after the call must still fix up its own hardware size.
         hw_fix(a, 12); hw_fix(b, 12);
         if (a->hw_used != b->hw_used || a->last_rec != b->last_rec) die("inline bulk probe: hardware fix differs"); checks++;
         NVNcommandHandle reference = h_nvnCommandBufferEndRecording(&cb[1]);
         NVNcommandHandle fast = h_nvnCommandBufferEndRecording(&cb[2]);
+        if (copy_of(reference)->body_bytes != copy_of(fast)->body_bytes || copy_of(reference)->last_size != copy_of(fast)->last_size ||
+            memcmp((const void *)(uintptr_t)reference, (const void *)(uintptr_t)fast, copy_of(reference)->body_bytes + 16))
+            die("inline bulk probe: finished copies differ"); checks++;
         h_nvnCommandBufferBeginRecording(&cb[3]);
         h_nvnCommandBufferCallCommands(&cb[3], 1, &fast);
         NVNcommandHandle nested = h_nvnCommandBufferEndRecording(&cb[3]);
@@ -2146,7 +2230,16 @@ static ptrdiff_t texcopy_recorded_row(const NVNcommandBuffer *c, int *known) {
         if (left < sizeof(op_hdr)) { *known = -1; break; }
         op_hdr h; memcpy(&h, p, sizeof h);
         if (h.size < 8 || (h.size & 7) || h.size > left || h.op == OP_JUMP) { *known = -1; break; }
-        if (h.op == OP_COPY_STRIDE && h.size >= 8 + sizeof(p_copy_stride)) {
+        const copy_prefix *t = call_marker_target(p, h);
+        if (t) {   /* TOTK_NVN_CALL_NOCOPY: the called body, as if it were inlined here */
+            const uint8_t *q = (const uint8_t *)(t + 1) + 8, *e = q + t->body_bytes;
+            for (op_hdr g; q < e; q += g.size) {
+                memcpy(&g, q, sizeof g);
+                if (g.op == OP_COPY_STRIDE && g.size >= 8 + sizeof(p_copy_stride)) {
+                    p_copy_stride s; memcpy(&s, q + 8, sizeof s); row = (ptrdiff_t)s.stride; *known = 1;
+                }
+            }
+        } else if (h.op == OP_COPY_STRIDE && h.size >= 8 + sizeof(p_copy_stride)) {
             p_copy_stride s; memcpy(&s, p + 8, sizeof s); row = (ptrdiff_t)s.stride; *known = 1;
         }
         p += h.size;
@@ -2198,6 +2291,7 @@ NVN(nvnCommandBufferCopyTextureToTexture, void, NVNcommandBuffer *c, const NVNte
 }
 NVN(nvnCommandBufferSetCopyRowStride, void, NVNcommandBuffer *c, ptrdiff_t st) { REC(c, OP_COPY_STRIDE, p_copy_stride)->stride = st; }
 NVN(nvnCommandBufferSetBlendColor, void, NVNcommandBuffer *c, const float *v) { memcpy(REC(c, OP_BLEND_COLOR, p_blend_color)->rgba, v, 16); }
+NVN(nvnCommandBufferSetAlphaRef, void, NVNcommandBuffer *c, float r) { REC(c, OP_ALPHA_REF, p_alpha_ref)->value = r; }
 
 // ---------- 状态对象：就地打包（nvn_obj.h） ----------
 // ---------- State objects: packed in place (nvn_obj.h) ----------
@@ -2421,6 +2515,7 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
 #if defined(TOTK_GAME_V143)
     if (g_game_sys) origin_ticks = *(const volatile uint64_t *)(uintptr_t)(g_game_sys + 0xe0);
 #endif
+    totk_perf_submit(origin_ticks);   /* TOTK_ADPF_GPU: the first submit after a present fixes the frame's start */
     uint64_t ft_begin = 0, ft_cpu = 0, ft_frame = 0;
     if (totk_ft_on()) {
         runtime_frame_timeline_walking();
@@ -2848,6 +2943,8 @@ extern float runtime_frame_step_seconds(void) __attribute__((weak_import));
 extern unsigned runtime_cutscene_present_ticks(unsigned ticks, uint64_t refresh_ns) __attribute__((weak_import));
 extern void movie_host_tick(void) __attribute__((weak_import));   /* TOTK runtime/movie_host.c: pre-rendered cutscenes at their own frame rate */
 extern int movie_host_active(void) __attribute__((weak_import)); /* started host decoders, atomically observed without taking movie locks */
+extern void runtime_progress_mark(uint64_t at_ns, uint64_t frame, const char *stage, int held) __attribute__((weak_import)); /* TOTK runtime/threads.c: the stall watchdog's progress (absent in graphics unit tests) */
+extern void runtime_live_frame(uint64_t frame) __attribute__((weak_import)); /* TOTK runtime/live_ctl.h via frontend_android.c: staged live switches (Android app only) */
 __attribute__((weak)) void dm_main_yield_stats(uint64_t *n, uint64_t *ns) { *n = 0; *ns = 0; }   // 宿主 hle_thread.c 提供真值；图形单测里为 0 | The host's hle_thread.c provides the ground truth; 0 in graphics unit tests
 __attribute__((weak)) uint32_t dm_guest_work_qos(unsigned *count) { if (count) *count = 0; return QOS_CLASS_UNSPECIFIED; }
 extern uint32_t mtl_present_qos(void);
@@ -2858,6 +2955,9 @@ uint64_t dm_nvn_frame_count(void) { return g_frame; }
 extern uint64_t g_t0_ns;   // 宿主进程起点（main.c；UIMSG 时间戳同基） | Host process start point (main.c; same base as the UIMSG timestamps)
 NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsync *s, int *idx) {
     NVN_BLOCKING();
+#if defined(__ANDROID__) && defined(TOTK_ANDROID_APP)
+    runtime_android_game_pause_wait();
+#endif
     game_controller_tick(g_frame + 1, 0);
     uint64_t ft_begin = totk_ft_on() ? totk_ft_now() : 0;
     uint64_t ft_frame = ft_begin ? totk_ft_current() : 0;
@@ -2874,8 +2974,8 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
     // Vsync blocks here (real-device NVN: when all textures in the swapchain are waiting for display, wait for the next one to be released), not in present -- the game often calls present while holding a lock
     uint64_t at = 0, wait = 0;
     int fixed_clock = 0, credit_clock = 0;
-    int adpf_full = totk_perf_full();
-    uint64_t ft_pace_begin = ft_begin || adpf_full ? totk_ft_now() : 0;
+    int adpf_pacing = totk_perf_full() || totk_perf_span();
+    uint64_t ft_pace_begin = ft_begin || adpf_pacing ? totk_ft_now() : 0;
     if (!dm_detclock_enabled()) {   // 取图线程登记为时间约束线程（不再只在「来早了」时才登记：热态一直落后时也要声明） | Register the acquire thread as a time-constraint thread (no longer registered only when it "arrived early": it must also declare itself when it is constantly behind in the hot state)
         static uint64_t rt_period; uint64_t period = present_period(o);
         fixed_clock = acquire_clock_on();
@@ -2913,14 +3013,21 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
         if (pace) { if (last && now_ns() < last + step) sleep_until_ns(last + step); last = now_ns(); }
     }
     uint64_t ft_pace_end = ft_pace_begin ? totk_ft_now() : 0;
-    if (adpf_full && ft_pace_end > ft_pace_begin) g_adpf_pacing_ns += ft_pace_end - ft_pace_begin;
+    if (adpf_pacing && ft_pace_end > ft_pace_begin) {
+        g_adpf_pacing_ns += ft_pace_end - ft_pace_begin;
+        totk_perf_pacing(ft_pace_begin, ft_pace_end);
+    }
     uint64_t auto_release_ns = auto_pacing_begin ? now_ns() : 0;
     g_acq_wait_ns += wait;
     trow(g_frame, "@late_ms", !fixed_clock && !credit_clock && wait ? (now_ns() - at) / 1e6 : 0);   /* Callback/credit pacing has no synthetic deadline-lateness metric. */
     // 该张上一次出图还没被出图线程处理完（显示跟不上、落后一整轮交换链）：等它归还，再交给游戏画
     // The previous present of this texture has not yet been processed by the present thread (display cannot keep up, a whole swapchain round behind): wait for it to be returned, then hand it to the game to draw
     uint64_t ft_texture_begin = ft_begin ? totk_ft_now() : 0;
-    if (async_replay() && *idx < 4 && g_xp_win == o) x_wait_job(g_xp_job[*idx]);   // TOTK: that image's last present has run (its ticket is set)
+    if (async_replay() && *idx < 4 && g_xp_win == o) {
+        uint64_t begin = totk_perf_wait_begin();
+        x_wait_job(g_xp_job[*idx]);   /* that image's last present has run */
+        totk_perf_wait_end(begin);
+    }
     /* The old async present must take its observation before same-texture
      * replacement. Keep the pre-wait release so only pacing, not replay or
      * texture/resource delay, is excluded from FPSauto demand. */
@@ -2928,7 +3035,11 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
         runtime_android_fps_auto_begin((uintptr_t)o->tex[*idx], present_ticks(o),
             auto_release_ns, auto_release_ns - auto_pacing_begin);
     uint64_t tk = *idx < 4 ? o->ticket[*idx] : 0;
-    if (tk) { uint64_t w0 = now_ns(); mtl_present_wait(tk); g_pq_wait_ns += now_ns() - w0; }
+    if (tk) {
+        uint64_t begin = totk_perf_wait_begin(), w0 = now_ns();
+        mtl_present_wait(tk); g_pq_wait_ns += now_ns() - w0;
+        totk_perf_wait_end(begin);
+    }
     if (ft_begin) totk_ft_acquire_wait(ft_frame, ft_pace_end - ft_pace_begin,
                                        totk_ft_now() - ft_texture_begin);
     /* TOTK: the acquire sync means "this swapchain texture is no longer read by the display path". mtl_present_wait above
@@ -3427,7 +3538,9 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
       auto_scene_draws = this_draws;
       last_draws = draws;
       if (!gate && ((g_nvn_loadscreen_up && g_nvn_loadscreen_up()) || this_draws > 2000)) {
-          gate = 1; extern void mtl_note_world(void); mtl_note_world(); int ms = mtl_warm_wait(15000);
+          gate = 1; extern void mtl_note_world(void); mtl_note_world();
+          if (runtime_progress_mark) runtime_progress_mark(game_present_ns, g_frame + 1, "first-world pipeline warm-up", 1);   /* up to 15 s without a frame: not a stall */
+          int ms = mtl_warm_wait(15000);
           if (ms) LOG("[nvn] 首次进局等管线预热 %d ms（本帧绘制 %llu）", ms, (unsigned long long)this_draws);
       } }
     present_cfg(o);
@@ -3439,7 +3552,11 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
               runtime_android_fps_auto_active(), g_display_mode, uncapped_now(), mfx_enabled());
       have = 1; last_guest = o->interval; last_effective = ticks; }
     uint64_t t0 = now_ns();
-    totk_perf_frame(t0, present_period(o), g_adpf_pacing_ns);
+    if (runtime_progress_mark) {   /* reuse the present timestamp / frame; loading screens and host movies are held */
+        int loading = g_nvn_loadscreen_up && g_nvn_loadscreen_up(), movie = movie_host_active && movie_host_active();
+        runtime_progress_mark(t0, g_frame + 1, loading ? "loading screen" : movie ? "host movie" : "present", loading || movie);
+    }
+    totk_perf_frame(t0, present_period(o), g_adpf_pacing_ns, o->interval);
     runtime_fps_hybrid_present(t0,auto_scene_draws,
         (g_nvn_loadscreen_up && g_nvn_loadscreen_up()) || (movie_host_active && movie_host_active()));
     if (runtime_fps_adaptive_selected())
@@ -3594,6 +3711,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         uint64_t g0, g1; if (frame_rec() && mtl_gpu_span(f - 8, &g0, &g1)) { trow(f - 8, "@gpu_beg_ms", (g0 - g_t0_ns) / 1e6); trow(f - 8, "@gpu_end_ms", (g1 - g_t0_ns) / 1e6); } }
     prev_in = t0; prev_pass = ps; prev_draw = dr;
     dump_frame();
+    if (runtime_live_frame) runtime_live_frame(g_frame);   /* TOTK: live switches apply here; frames after g_frame (the timing frame) run with them */
     if (g_frame % TWIN == 0) tsummary(g_frame);
     if (call_stats_on() && g_frame % 300 == 0) {
         static uint64_t pd; uint64_t ps2, dr2; mtl_stats(&ps2, &dr2); uint64_t all = dr2 - pd; pd = dr2;

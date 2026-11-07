@@ -5,7 +5,6 @@ import android.content.SharedPreferences;
 import android.os.Build;
 import android.os.LocaleList;
 import android.util.Log;
-import android.view.Display;
 import com.aure.totk.companion.DisplayClass;
 import com.aure.totk.companion.PresentationController;
 import java.io.IOException;
@@ -29,7 +28,7 @@ final class SettingsStore {
             save(context, first);
             return first;
         }
-        return new Settings(prefs.getAll());
+        return new Settings(prefs.getAll(), soc());
     }
     /** Store every value and rewrite settings.env (on every change, so a game started any other way sees it too). */
     static void save(Context context, Settings settings) {
@@ -57,8 +56,8 @@ final class SettingsStore {
         }
     }
 
-    /** The second screen as the companion sees it (DisplayClass: NONE, BUILT_IN or EXTERNAL), never from the SoC. */
-    static int secondScreen(Context context, Display own) { return PresentationController.secondScreen(context, own); }
+    /** The second panel relative to the main display, even when this menu was opened on the second one. */
+    static int secondScreen(Context context) { return PresentationController.deviceSecondScreen(context); }
     /** A built-in second panel the companion uses (external, cast and overlay displays are ignored). */
-    static boolean secondaryDisplay(Context context, Display own) { return secondScreen(context, own) == DisplayClass.BUILT_IN; }
+    static boolean secondaryDisplay(Context context) { return secondScreen(context) == DisplayClass.BUILT_IN; }
 }

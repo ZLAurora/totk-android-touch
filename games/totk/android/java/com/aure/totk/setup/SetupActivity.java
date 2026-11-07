@@ -2,9 +2,13 @@ package com.aure.totk.setup;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.ActivityManager;
+import android.app.ActivityOptions;
 import android.content.ActivityNotFoundException;
+import android.content.ComponentName;
 import android.content.ContentResolver;
 import android.content.Intent;
+import android.content.ServiceConnection;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ShortcutInfo;
@@ -20,6 +24,7 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
+import android.os.IBinder;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.os.storage.StorageManager;
@@ -39,7 +44,10 @@ import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
-import com.aure.totk.TotkActivity;
+import com.aure.totk.GameLaunch;
+import com.aure.totk.GameControlService;
+import com.aure.totk.UpdateRules;
+import com.aure.totk.Updates;
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -71,12 +79,14 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     static final String EXTRA_SETTINGS = "com.aure.totk.setup.SETTINGS";
     /** Why the game process stopped (TotkActivity.showGameError, just before it aborted): Home says so until the next start. */
     public static final String EXTRA_GAME_ERROR = "com.aure.totk.setup.GAME_ERROR";
+    public static final String EXTRA_UPDATE = "com.aure.totk.setup.UPDATE";
+    static final String EXTRA_UPDATE_AUTH = "com.aure.totk.setup.UPDATE_AUTH";
     private static final String[] ALL_ROLES = {"romfs", "exefs", "base", "update", "keys"};
     private static final int REQ_PICK = 100, REQ_DRIVER = 900, REQ_NOTIFY = 901, REQ_EXPORT = 902, REQ_IMPORT_ZIP = 903, REQ_IMPORT_TREE = 904, REQ_MIRROR = 905,
             REQ_DATA_FOLDER = 906, REQ_ACCESS = 907;
     private static final String[] TABS = {Settings.PERFORMANCE, Settings.PICTURE, Settings.SCREEN};
 
-    private enum Screen { WELCOME, SETUP_STORAGE, ROUTE, FILES, INSTALL, ERROR, INTERRUPTED, HOME, GRAPHICS, CONTROLS, DATA, STORAGE, ABOUT, LICENSES,
+    private enum Screen { WELCOME, SETUP_STORAGE, ROUTE, FILES, UPDATES, UPDATE_DOWNLOAD, INSTALL, ERROR, INTERRUPTED, HOME, GRAPHICS, CONTROLS, DATA, STORAGE, ABOUT, LICENSES,
         LICENSE_TEXT, CONFIRM_DELETE, SAVE_ERROR, SAVES, BACKUPS, SAVE_IMPORT, SAVE_CONFLICT, CHOICE }
 
     private final Handler main = new Handler(Looper.getMainLooper());
@@ -92,6 +102,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     /** Graphics opened as setup's last step ("Choose graphics"). */
     private boolean setupFinished;
     private boolean ui, playAfterStop, busy;
+    private boolean sharingDetails;
     private String note = "", licence = "";
     private String gameError;
     /** D-pad focus to restore when navigating back to a screen (by view tag). */
@@ -165,14 +176,397 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     private InstallState installSnapshot;
     private String snapshotStage = "";
     private long snapshotAt;
+    private GameLock.Result gameState = new GameLock.Result(GameLock.State.FREE, "");
+    private final List<View> gameControls = new ArrayList<>();
+    private Runnable blockedAction;
+    private String blockedNeed = "Installing";
+    private boolean closingGame, closeSent;
+    private long closeDeadline, closeStartedAt, gameCheckedAt;
+    private String closeId = "";
+    private ServiceConnection closeConnection;
+    private TextView gameNotice;
+    private boolean started, uiStarted;
+    private Widgets.Action closeGameAction;
+    private UpdateInstaller updater;
+    private TextView updateProgress;
+    private boolean pendingAsked;
+
+    private String pendingUpdate() { return UpdateRules.pending(getFilesDir(), Updates.version(this)); }
+    private void offerPendingUpdate() {
+        if (pendingAsked || screen != Screen.HOME || getIntent().getBooleanExtra(EXTRA_UPDATE, false)) return;
+        String version = pendingUpdate();
+        if (version == null) return;
+        pendingAsked = true;
+        openChoice("about", Strings.UPDATES, Strings.updateAvailable(version), Strings.UPDATE_MENU_BODY,
+                new Object[]{"update:now", "Update", Strings.UPDATE_CLOSE_HINT, false, (Runnable) this::startAppUpdate},
+                new Object[]{"update:later", "Not now", "Keep this update for next launch", false, (Runnable) () -> replace(Screen.HOME)});
+    }
+    private void requestedUpdate() {
+        if (!started || !getIntent().getBooleanExtra(EXTRA_UPDATE, false)) return;
+        String authorization = getIntent().getStringExtra(EXTRA_UPDATE_AUTH);
+        getIntent().removeExtra(EXTRA_UPDATE);
+        getIntent().removeExtra(EXTRA_UPDATE_AUTH);
+        if (UpdateAuthorization.consume(authorization)) {
+            pendingAsked = true;
+            startAppUpdate();
+        } else if (updater == null && !SetupService.status.running && pendingUpdate() != null) {
+            // This activity is exported. An external UPDATE intent is only a request to show the user's choice.
+            pendingAsked = false;
+            if (screen != Screen.HOME) replace(Screen.HOME);
+            offerPendingUpdate();
+        }
+    }
+    private void startAppUpdate() {
+        String version = pendingUpdate();
+        if (version == null || updater != null) return;
+        if (SetupService.status.running) { showNote("Finish preparing the game before updating the app."); return; }
+        if (!needGameClosed("Updating the app", this::startAppUpdate)) { closeGame(); return; }
+        updater = new UpdateInstaller(this, new UpdateInstaller.Listener() {
+            @Override public void changed() { if (!isDestroyed()) replace(Screen.UPDATE_DOWNLOAD); }
+            @Override public void permission() {
+                openChoice("about", Strings.UPDATES, Strings.UPDATE_ALLOW, Strings.UPDATE_ALLOW_BODY,
+                        new Object[]{"update:allow", "Open Android settings", "Allow from this source, then return", false, (Runnable) () -> updater.openPermission()},
+                        new Object[]{"update:cancel", "Not now", "Keep the update for next launch", false, (Runnable) () -> updater.cancel()});
+            }
+            @Override public void finished(String message) { finishAppUpdate(message); }
+        });
+        updater.begin(version);
+    }
+    private void finishAppUpdate(String message) {
+        if (updater != null) { updater.dispose(); updater = null; }
+        replace(InstallState.read(this).installed() ? Screen.HOME : Screen.WELCOME);
+        note = message; noteOk = false; render();
+    }
+    private void updateInstallResult() {
+        String message = UpdateReceiver.takeResult(this);
+        if (!message.isEmpty()) finishAppUpdate(message);
+    }
+    private Widgets.Row updateSwitch(LinearLayout parent) {
+        Widgets.Row row = new Widgets.Row(this, Strings.UPDATE_CHECK, "On by default · no uploads or automatic installation", 26, 18);
+        row.setTag("update:checks");
+        Widgets.Toggle toggle = new Widgets.Toggle(this);
+        toggle.set(UpdateRules.enabled(getFilesDir()));
+        LinearLayout value = Widgets.row(this);
+        TextView state = Theme.text(this, UpdateRules.enabled(getFilesDir()) ? "On" : "Off", false, 22, Theme.TEXT2);
+        value.addView(state, Widgets.margins(Widgets.size(-2, -2), 0, 0, 18, 0));
+        value.addView(toggle, Widgets.size(58, 30));
+        row.value(value);
+        Runnable change = () -> {
+            try {
+                UpdateRules.enabled(getFilesDir(), !UpdateRules.enabled(getFilesDir()));
+                boolean on = UpdateRules.enabled(getFilesDir());
+                toggle.set(on); state.setText(on ? "On" : "Off");
+            }
+            catch (IOException failed) { showNote("Could not save the update setting: " + failed.getMessage()); }
+        };
+        row.setOnClickListener(v -> change.run());
+        row.adjust(direction -> change.run());
+        parent.addView(row, Widgets.rowParams(108, 18));
+        return row;
+    }
+    private void updates() {
+        setupHeader(Strings.SETUP_TITLE); rail(3, false);
+        Widgets.Panel box = setupMain();
+        heading(box, Strings.UPDATES, 36);
+        lead(box, Strings.UPDATE_PRIVACY, 20);
+        primary = updateSwitch(box);
+        Widgets.Action next = new Widgets.Action(this, "Prepare", true, v -> requestNotificationsThen(() -> startSetup(null)));
+        board.put(next, 1790, 880, Widgets.Board.WRAP, Widgets.Board.WRAP, Widgets.Board.END, Widgets.Board.END);
+        prompts(prompt("A", Strings.P_SELECT, v -> selectFocused()), backPrompt(), prompt("+", "Prepare", v -> next.performClick()));
+    }
+    private void appUpdateDownload() {
+        header("about", Strings.UPDATES, 0, null);
+        Widgets.Panel box = panel(340, 240, 1240, 560, true, 50, 44);
+        heading(box, updater == null ? Strings.UPDATES : "TotK Native " + updater.version, 36);
+        updateProgress = Theme.paragraph(this, "", 26, Theme.TEXT2);
+        box.addView(updateProgress, Widgets.margins(Widgets.size(-1, -2), 0, 32, 0, 32));
+        updateDownloadProgress();
+        Widgets.Row cancel = new Widgets.Row(this, "Cancel", "Your installed app, saves and game data are unchanged", 27, 18);
+        cancel.setOnClickListener(v -> { if (updater != null) updater.cancel(); });
+        box.addView(cancel, Widgets.rowParams(100, 0));
+        primary = cancel;
+        prompts(prompt("A", Strings.P_SELECT, v -> selectFocused()), prompt("B", Strings.P_CANCEL, v -> { if (updater != null) updater.cancel(); }));
+    }
+    private void updateDownloadProgress() {
+        if (updater != null && updateProgress != null) updateProgress.setText(updater.status + "\n\n"
+                + Strings.bytes(updater.bytes) + (updater.total > 0 ? " / " + Strings.bytes(updater.total) + " · " + (updater.bytes * 100 / updater.total) + "%" : ""));
+    }
+
+    /** Gated controls remain focusable on handhelds; activation records the intended retry, never the mutation. */
+    private void gameControl(View view, String need, Runnable retry) {
+        if (gameState.free()) {
+            if (gameControls.contains(view)) {
+                if (view instanceof Widgets.Row) ((Widgets.Row) view).dimmed(false);
+                else view.setAlpha(1);
+            }
+            return;
+        }
+        if (!gameControls.contains(view)) {
+            if (view instanceof Widgets.Row && ((Widgets.Row) view).dimmed() || !view.isEnabled()) return;
+            gameControls.add(view);
+            View.OnFocusChangeListener previous = view.getOnFocusChangeListener();
+            view.setOnFocusChangeListener((v, has) -> {
+                if (previous != null) previous.onFocusChange(v, has);
+                if (has && !gameState.free()) { blockedAction = retry; blockedNeed = need; updateGameNotice(); }
+            });
+            view.setOnClickListener(v -> {
+                if (!closingGame && needGameClosed(need, retry)) retry.run();
+            });
+        }
+        if (view instanceof Widgets.Row) ((Widgets.Row) view).dimmed(true);
+        else view.setAlpha(.42f);
+    }
+    private boolean needGameClosed(String need, Runnable retry) {
+        gameState = InstallState.gameState(this);
+        if (gameState.free()) return true;
+        blockedNeed = need; blockedAction = retry;
+        render();
+        return false;
+    }
+    private void gameBanner() {
+        if ((gameControls.isEmpty() && blockedAction == null) || gameState.free()) return;
+        if (blockedAction == null) blockedNeed = screen == Screen.FILES || screen == Screen.ERROR || screen == Screen.INTERRUPTED ? "Installing"
+                : screen == Screen.STORAGE ? "Moving game data" : screen == Screen.DATA ? "Changing game data" : "Changing saves";
+        gameNotice = Theme.paragraph(this, "", 18, Theme.AMBER);
+        board.put(gameNotice, 80, 930, 1360, 70);
+        closeGameAction = new Widgets.Action(this, Strings.CLOSE_GAME, false, v -> closeGame());
+        closeGameAction.setTag("close-game");
+        board.put(closeGameAction, 1840, 930, Widgets.Board.WRAP, Widgets.Board.WRAP, Widgets.Board.END, Widgets.Board.START);
+        if (blockedAction == null && screen == Screen.FILES) { blockedAction = () -> go(Screen.UPDATES); blockedNeed = "Installing"; }
+        updateGameNotice();
+    }
+    private void updateGameNotice() {
+        if (gameNotice != null) gameNotice.setText(closingGame ? (closeSent ? Strings.CLOSING_GAME : Strings.WAITING_SAVE)
+                : gameState.state == GameLock.State.ERROR ? Strings.gameLockError(gameState.reason) : Strings.gameRunning(blockedNeed));
+        if (closeGameAction != null) {
+            closeGameAction.setVisibility(gameState.state == GameLock.State.GAME ? View.VISIBLE : View.GONE);
+            closeGameAction.setEnabled(!closingGame);
+        }
+    }
+    private void refreshGameState() {
+        GameLock.Result next = InstallState.gameState(this);
+        boolean changed = next.state != gameState.state || next.state == GameLock.State.ERROR && !next.reason.equals(gameState.reason);
+        gameState = next;
+        if (changed && ui && screen != Screen.INSTALL) {
+            if (next.free() && !closingGame) blockedAction = null;
+            render();
+        }
+    }
+    /** A foreground binding thaws a cached game before waiting for its save. Only the lock decides whether it closed;
+     * binding can create an empty default process if the game dies between the check and bindService. */
+    private void closeGame() {
+        if (closingGame || !started) return;
+        closingGame = true; closeSent = false;
+        closeStartedAt = SystemClock.uptimeMillis();
+        closeDeadline = closeStartedAt + 30_000;
+        closeId = android.os.Process.myPid() + ":" + System.nanoTime();
+        gameState = InstallState.gameState(this);
+        if (gameState.state == GameLock.State.GAME) {
+            closeConnection = new ServiceConnection() {
+                private void changed() {
+                    if (closeConnection != this || !closingGame) return;
+                    main.removeCallbacks(closePoll);
+                    main.post(closePoll);
+                }
+                @Override public void onServiceConnected(ComponentName name, IBinder service) { changed(); }
+                // Android reports remote binder death here. A disconnect alone is not proof that the lock is free.
+                @Override public void onServiceDisconnected(ComponentName name) { changed(); }
+                @Override public void onBindingDied(ComponentName name) { changed(); }
+                @Override public void onNullBinding(ComponentName name) { changed(); }
+            };
+            try {
+                // The ordinary binding inherits the visible client's importance; no ABOVE_CLIENT/IMPORTANT, activity
+                // start, foreground service or notification is needed, and the service never starts the runtime.
+                if (!bindService(new Intent(this, GameControlService.class), closeConnection, BIND_AUTO_CREATE)) {
+                    closeFailed(Strings.gameLockError("Could not bind the game control service"));
+                    return;
+                }
+            } catch (RuntimeException failed) { closeFailed(Strings.gameLockError(failed.toString())); return; }
+        }
+        updateGameNotice();
+        main.post(closePoll);
+    }
+    private void releaseCloseBinding() {
+        ServiceConnection connection = closeConnection;
+        closeConnection = null;
+        if (connection != null) {
+            try { unbindService(connection); }
+            catch (IllegalArgumentException absent) { /* A refused/failed bind may not have registered the connection. */ }
+        }
+    }
+    /** Stopping/recreating the menu abandons the pending action, not the game's save-safe native close protocol. */
+    private void cancelClose() {
+        main.removeCallbacks(closePoll);
+        if (closingGame) {
+            try { GameLock.clearClose(getFilesDir(), closeId); }
+            catch (IOException failed) { android.util.Log.w("TotkSetup", "close game: request cleanup failed", failed); }
+            closingGame = false; blockedAction = null;
+        }
+        releaseCloseBinding();
+        updateGameNotice();
+    }
+    private final Runnable closePoll = new Runnable() {
+        @Override public void run() {
+            if (!closingGame || !started || isDestroyed()) return;
+            GameLock.Result state = InstallState.gameState(SetupActivity.this);
+            if (state.free()) {
+                try { GameLock.clearClose(getFilesDir(), closeId); }
+                catch (IOException failed) { closeFailed(Strings.gameLockError(failed.toString())); return; }
+                Runnable retry = blockedAction;
+                closingGame = false; blockedAction = null; gameState = state;
+                main.removeCallbacks(closePoll);
+                releaseCloseBinding();
+                render();
+                if (retry != null) retry.run();
+                return;
+            }
+            if (state.state == GameLock.State.ERROR) { closeFailed(Strings.gameLockError(state.reason)); return; }
+            boolean saving;
+            try {
+                java.nio.file.Files.readAttributes(new File(getFilesDir(), "state/save-busy").toPath(), java.nio.file.attribute.BasicFileAttributes.class);
+                saving = true;
+            } catch (java.nio.file.NoSuchFileException idle) { saving = false; }
+            catch (IOException | SecurityException failed) { closeFailed(Strings.gameLockError(failed.toString())); return; }
+            try {
+                String response = GameLock.closeResponse(getFilesDir(), closeId);
+                if (response.equals("saving")) { GameLock.clearClose(getFilesDir(), closeId); closeSent = false; saving = true; }
+                else if (response.startsWith("error:")) { closeFailed(Strings.gameLockError(response)); return; }
+            } catch (IOException | SecurityException failed) { closeFailed(Strings.gameLockError(failed.toString())); return; }
+            if (SystemClock.uptimeMillis() >= closeDeadline) { closeFailed(saving ? Strings.SAVE_WAIT_TIMEOUT : Strings.CLOSE_GAME_TIMEOUT); return; }
+            if (!saving && !closeSent) {
+                try {
+                    GameLock.requestClose(getFilesDir(), closeId);
+                    closeSent = true;
+                    closeDeadline = Math.min(SystemClock.uptimeMillis() + 35_000, closeStartedAt + 65_000);
+                } catch (IOException | RuntimeException failed) { closeFailed(Strings.gameLockError(failed.toString())); return; }
+            }
+            updateGameNotice();
+            main.postDelayed(this, 200);
+        }
+    };
+    private void closeFailed(String message) {
+        try { GameLock.clearClose(getFilesDir(), closeId); }
+        catch (IOException failed) { android.util.Log.w("TotkSetup", "close game: request cleanup failed", failed); }
+        closingGame = false; blockedAction = null;
+        main.removeCallbacks(closePoll);
+        releaseCloseBinding();
+        note = message; noteOk = false;
+        render();
+        if (gameNotice != null) gameNotice.setText(message);
+    }
 
     // ---------- lifecycle ----------
+    private boolean settingsMoving;
+    private static final String EXTRA_COLD_SETTINGS = "com.aure.totk.setup.COLD_SETTINGS_HANDOFF";
+    private static final String EXTRA_GAME_TASK = "com.aure.totk.setup.IN_GAME_TASK";
+    private static java.lang.ref.WeakReference<SetupActivity> menuActivity = new java.lang.ref.WeakReference<>(null);
+    private ActivityManager.AppTask menuTask;
+    /** A game-rooted task may still contain the menu after native exit. Cross-display launcher matching
+     * cannot find that menu by base Intent, so forward to its exact task before drawing another one. */
+    private boolean reuseMenuTask(Intent intent) {
+        if (!SettingsStore.secondaryDisplay(this)) return false;
+        try {
+            ActivityManager manager = getSystemService(ActivityManager.class);
+            if (manager == null) return false;
+            // Cache our task handle while it is visible in recents. Android 16 hides the old same-affinity
+            // task from getAppTasks as soon as a cross-display launcher creates the undrawn new entry.
+            for (ActivityManager.AppTask task : manager.getAppTasks())
+                if (task.getTaskInfo().taskId == getTaskId()) { menuTask = task; break; }
+            SetupActivity previous = menuActivity.get();
+            if (previous != null && previous != this && !previous.isFinishing() && !previous.isDestroyed()
+                    && previous.menuTask != null) {
+                previous.startActivity(new Intent(intent)
+                                .setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT),
+                        ActivityOptions.makeBasic().setLaunchDisplayId(android.view.Display.DEFAULT_DISPLAY).toBundle());
+                previous.menuTask.moveToFront();
+                finish();
+                overridePendingTransition(0, 0);
+                return true;
+            }
+            menuActivity = new java.lang.ref.WeakReference<>(this);
+        } catch (RuntimeException failed) {
+            android.util.Log.w("TotkSetup", "Could not return to the existing menu task", failed);
+        }
+        return false;
+    }
+    /** Keep the Settings shortcut visible, rather than underneath the game's companion on the bottom panel.
+     * Bind the start to this task: a normal cross-display search cannot find a menu above the singleTask game. */
+    private boolean moveSettingsToMain(Intent intent) {
+        if (!intent.getBooleanExtra(EXTRA_SETTINGS, false) || closingGame || !SettingsStore.secondaryDisplay(this)) return false;
+        if (getDisplay() == null || getDisplay().getDisplayId() == android.view.Display.DEFAULT_DISPLAY) {
+            settingsMoving = false;
+            return false;
+        }
+        if (settingsMoving) return false;
+        try {
+            settingsMoving = true;
+            ActivityManager manager = getSystemService(ActivityManager.class);
+            if (manager == null) throw new IllegalStateException("Activity manager unavailable");
+            for (ActivityManager.AppTask task : manager.getAppTasks()) {
+                if (task.getTaskInfo().taskId == getTaskId()) {
+                    task.startActivity(this,
+                            new Intent(intent).putExtra(EXTRA_COLD_SETTINGS, !ui)
+                                    .setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+                            ActivityOptions.makeBasic().setLaunchDisplayId(android.view.Display.DEFAULT_DISPLAY).toBundle());
+                    return true;
+                }
+            }
+            throw new IllegalStateException("Settings task unavailable");
+        } catch (RuntimeException failed) {
+            settingsMoving = false;
+            android.util.Log.w("TotkSetup", "Could not move Settings to the main display", failed);
+            return false;
+        }
+    }
+    /** AppTask can move the task before the Activity receives its new display configuration or Intent. */
+    private void completeSettingsMove() {
+        if (!settingsMoving || getDisplay() == null
+                || getDisplay().getDisplayId() != android.view.Display.DEFAULT_DISPLAY) return;
+        settingsMoving = false;
+        if (!ui) showUi();
+    }
+    /** A launcher tap returns to a live game; the explicit Settings VIEW shortcut always remains a menu entry.
+     * This is a direct task return, not another startup/save sync, and must not cancel a pending safe close. */
+    private boolean returnToRunningGame(Intent intent) {
+        if (closingGame || !Intent.ACTION_MAIN.equals(intent.getAction()) || !intent.hasCategory(Intent.CATEGORY_LAUNCHER)
+                || intent.getBooleanExtra(EXTRA_SETTINGS, false) || intent.hasExtra(EXTRA_GAME_ERROR) || intent.hasExtra(EXTRA_UPDATE)
+                || pendingUpdate() != null || !SettingsStore.secondaryDisplay(this)
+                || InstallState.gameState(this).state != GameLock.State.GAME) return false;
+        try {
+            GameLaunch.start(this);
+            finish();
+            overridePendingTransition(0, 0);
+            return true;
+        } catch (RuntimeException failed) {
+            android.util.Log.w("TotkSetup", "Could not return to the running game", failed);
+            return false;
+        }
+    }
+    /** Called only by the live, main-display game: its caller token keeps Settings in that same task. */
+    public static void openOnGame(android.app.Activity game) {
+        game.startActivity(new Intent(game, SetupActivity.class).setAction(Intent.ACTION_VIEW)
+                .putExtra(EXTRA_SETTINGS, true).putExtra(EXTRA_GAME_TASK, true));
+    }
+    private boolean settingsOverGame(Intent intent) {
+        if (!intent.getBooleanExtra(EXTRA_SETTINGS, false) || intent.getBooleanExtra(EXTRA_GAME_TASK, false)
+                || !SettingsStore.secondaryDisplay(this)
+                || InstallState.gameState(this).state != GameLock.State.GAME) return false;
+        GameLaunch.startSettings(this);
+        finish();
+        overridePendingTransition(0, 0);
+        return true;
+    }
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
         boolean settingsShortcut = getIntent().getBooleanExtra(EXTRA_SETTINGS, false);
         gameError = getIntent().getStringExtra(EXTRA_GAME_ERROR);
+        if (reuseMenuTask(getIntent())) return;
+        if (settingsOverGame(getIntent())) return;
+        if (moveSettingsToMain(getIntent())) return;
+        if (returnToRunningGame(getIntent())) return;
         // After a game error the menu is shown (with the reason) even when it is set to start the game directly.
-        if (gameError == null && !settingsShortcut && !SetupService.status.running && !SetupService.jobActive(this) && InstallState.read(this).playable()
+        if (gameError == null && !settingsShortcut && !getIntent().getBooleanExtra(EXTRA_UPDATE, false) && pendingUpdate() == null
+                && !SetupService.status.running && !SetupService.jobActive(this) && InstallState.read(this).playable()
                 && SettingsStore.skipMenu(this) && StorageLocation.available(this) && !StorageLocation.migrationPending(this, true)) {
             // translucent theme + no content: nothing flashes before the game. A save folder is synced first (newer
             // saves from it are brought in); a conflict needs the player, so it opens the menu instead.
@@ -191,18 +585,32 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     }
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
+        boolean hadUi = ui && !intent.getBooleanExtra(EXTRA_COLD_SETTINGS, false);
         setIntent(intent);
-        if (ui && intent.getBooleanExtra(EXTRA_SETTINGS, false) && screen != Screen.INSTALL)
+        if (moveSettingsToMain(intent)) return;
+        if (!ui && intent.getBooleanExtra(EXTRA_SETTINGS, false)) showUi();
+        if (returnToRunningGame(intent)) return;
+        if (hadUi && intent.getBooleanExtra(EXTRA_SETTINGS, false) && screen != Screen.INSTALL
+                && !closingGame && blockedAction == null)
             replace(InstallState.read(this).installed() ? Screen.HOME : Screen.WELCOME);
         String error = intent.getStringExtra(EXTRA_GAME_ERROR);
         if (error != null) {
             gameError = error;
             if (!ui) showUi(); else if (screen == Screen.HOME) render();
         }
+        if (intent.getBooleanExtra(EXTRA_UPDATE, false)) { if (!ui) showUi(); requestedUpdate(); }
+        else if (Intent.ACTION_MAIN.equals(intent.getAction()) && ui) { pendingAsked = false; offerPendingUpdate(); }
     }
     @Override protected void onStart() {
         super.onStart();
-        if (!ui) return;
+        started = true;
+        startUi();
+        requestedUpdate();
+    }
+    /** showUi can finish after onStart (a save-folder conflict while skipping the menu). Register exactly once. */
+    private void startUi() {
+        if (!started || !ui || uiStarted) return;
+        uiStarted = true;
         SetupService.listen(this);
         onStatus();
         main.postDelayed(refresh, REFRESH_MS);
@@ -213,10 +621,23 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         StorageManager storage = getSystemService(StorageManager.class);
         if (storage != null) storage.registerStorageVolumeCallback(getMainExecutor(), volumeChanged);
     }
+    @Override protected void onResume() {
+        super.onResume();
+        completeSettingsMove();
+        if (ui) refreshGameState();
+        if (ui) updateInstallResult();
+    }
     @Override protected void onStop() {
-        StorageManager storage = getSystemService(StorageManager.class);
-        if (storage != null) storage.unregisterStorageVolumeCallback(volumeChanged);
-        SetupService.unlisten(this); main.removeCallbacks(refresh); super.onStop();
+        started = false;
+        cancelClose();
+        if (uiStarted) {
+            uiStarted = false;
+            StorageManager storage = getSystemService(StorageManager.class);
+            if (storage != null) storage.unregisterStorageVolumeCallback(volumeChanged);
+            SetupService.unlisten(this);
+            main.removeCallbacks(refresh);
+        }
+        super.onStop();
     }
     /** A card mounted, unmounted or removed while the menu is visible: the screens that show where the game data is
      * (Home's missing-card state and Start game, Game data, the storage choices) are rebuilt from the new state. */
@@ -233,18 +654,28 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     private static final long REFRESH_MS = 500;
     private final Runnable refresh = new Runnable() {
         @Override public void run() {
+            if (!uiStarted) return;
             if (screen == Screen.INSTALL) onStatus();
+            if (screen == Screen.UPDATE_DOWNLOAD) updateDownloadProgress();
+            if (updater != null) updateInstallResult();
             if (cancelArmedAt != 0 && SystemClock.uptimeMillis() - cancelArmedAt > 3000) disarmCancel();
-            main.postDelayed(this, REFRESH_MS);
+            if (SystemClock.uptimeMillis() - gameCheckedAt >= 1000) {
+                gameCheckedAt = SystemClock.uptimeMillis();
+                refreshGameState();
+            }
+            if (uiStarted) main.postDelayed(this, REFRESH_MS);
         }
     };
     @Override protected void onDestroy() {
+        cancelClose();
+        if (updater != null) updater.dispose();
         worker.shutdownNow();
         saveWorker.shutdown();   // never interrupted: an upload or swap in progress finishes (FileChannels close on interrupt)
         super.onDestroy();
     }
     @Override public void onConfigurationChanged(Configuration config) {
         super.onConfigurationChanged(config);
+        completeSettingsMove();
         if (ui) render();
     }
 
@@ -263,6 +694,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             bars.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
         }
         inputs = Inputs.load(this);
+        UpdateReceiver.clean(this);
         settings = SettingsStore.load(this);
         publishShortcut();
         InstallState install = InstallState.read(this);
@@ -282,6 +714,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             result = new JSONObject();
         }
         if (SetupService.status.running) screen = Screen.INSTALL;
+        else if (result.has("ok") && Inputs.prefs(this).getBoolean(ArtPolicy.START_AFTER_BUILD, false)) screen = Screen.INSTALL;
         else if (moveNote != null) { history.push(install.installed() ? Screen.HOME : Screen.WELCOME); screen = Screen.DATA; }
         else if (SetupService.jobActive(this)) screen = Screen.INTERRUPTED;
         // A stopped second-screen art stage on an installed game is not a reason to keep the player away from the menu on
@@ -296,10 +729,14 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         else if (!inputs.route.isEmpty() && !inputs.items.isEmpty()) { history.push(Screen.WELCOME); history.push(Screen.ROUTE); screen = Screen.FILES; }
         else screen = Screen.WELCOME;
         loadSaves();
-        if (screen == Screen.HOME) updateOutdatedArt(install);
+        if (screen == Screen.HOME && pendingUpdate() == null) updateOutdatedArt(install);
         pulledChip = SaveMirror.takePulled(this);
         if (moveNote != null) { note = moveNote; noteOk = moveOk; }
+        if (screen == Screen.INSTALL && !SetupService.status.running && result.has("ok")) main.post(this::finished);
         render();
+        startUi();
+        offerPendingUpdate();
+        updateInstallResult();
     }
     /** A move killed after its copy was committed (the folder choice switched or not, settings.env written or not, the
      * old copy partly removed) is made consistent again: settings.env is rewritten from the folder choice, and when the
@@ -314,8 +751,8 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             File game = StorageLocation.gameDir(this);
             for (File dir : StorageLocation.knownFolders(this)) {
                 if (dir.getPath().equals(game.getPath()) || !StorageLocation.holdsGameData(dir)) continue;
-                try (java.io.Closeable held = SaveManager.holdGame(getFilesDir())) {
-                    if (held == null) return;  // the game or a move is running: leave everything as it is
+                try (GameLock.Hold held = GameLock.hold(getFilesDir())) {
+                    if (!held.result.free()) return;
                     android.util.Log.i("TotkSetup", "interrupted move: removing the unused game data in " + dir + ": "
                             + NativeSetup.removeGameData(dir.getPath()));
                 } catch (IOException | RuntimeException | LinkageError failed) {
@@ -328,9 +765,10 @@ public final class SetupActivity extends Activity implements SetupService.Listen
      * made again on its own when Home opens, once per launch: the companion stage is optional, so Play now on the install
      * screen stops it and starts the game with the current art, and a failed update stays on Game data's Update row. */
     private void updateOutdatedArt(InstallState install) {
-        if (artUpdateStarted || !install.playable() || !install.artOutdated() || !install.errorCode(InstallState.OPTIONAL).isEmpty()
+        if (artUpdateStarted || !install.playable() || !ArtPolicy.updateAutomatically(SettingsStore.secondaryDisplay(this), install.artState())
+                || !install.errorCode(InstallState.OPTIONAL).isEmpty()
                 || !InstallState.libraryAvailable() || SetupService.status.running || SetupService.jobActive(this)
-                || !StorageLocation.available(this) || StorageLocation.migrationPending(this, true) || InstallState.gameRunning(this)) return;
+                || !StorageLocation.available(this) || StorageLocation.migrationPending(this, true) || !InstallState.gameState(this).free()) return;
         artUpdateStarted = true;
         main.post(() -> { if (screen == Screen.HOME && !SetupService.status.running) buildStage(InstallState.OPTIONAL, true); });
     }
@@ -348,6 +786,20 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             replace(Screen.HOME);
             return;
         }
+        if (ArtPolicy.offerBeforePlay(SettingsStore.secondaryDisplay(this), InstallState.read(this).artState(),
+                Inputs.prefs(this).getBoolean(ArtPolicy.DECLINED, false))) {
+            if (!ui) showUi();
+            openChoice("data", Strings.COMPANION_ROW, Strings.ART_OFFER_TITLE, Strings.ART_OFFER_BODY,
+                    new Object[]{"art:prepare", Strings.PREPARE_ART, Strings.ART_PREPARE_HINT, false, (Runnable) () -> {
+                        Inputs.prefs(this).edit().putBoolean(ArtPolicy.START_AFTER_BUILD, true).apply();
+                        buildStage(InstallState.OPTIONAL, true);
+                    }},
+                    new Object[]{"art:without", Strings.PLAY_WITHOUT_ART, Strings.ART_DECLINE_HINT, false, (Runnable) () -> {
+                        Inputs.prefs(this).edit().putBoolean(ArtPolicy.DECLINED, true).apply();
+                        launchGame(anyway);
+                    }});
+            return;
+        }
         if (settings == null) settings = SettingsStore.load(this);
         String failed = SettingsStore.writeEnv(this, settings);
         if (failed != null && !anyway) {
@@ -357,11 +809,18 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             return;
         }
         gameError = null;
-        startActivity(new Intent(this, TotkActivity.class));
+        try { GameLock.start(getFilesDir(), System.currentTimeMillis(), android.os.Process.myPid(),
+                () -> GameLaunch.start(this)); }
+        catch (IOException | RuntimeException failedStart) {
+            if (!ui) showUi();
+            showNote(Strings.gameLockError(failedStart.toString()));
+            return;
+        }
         finish();
         overridePendingTransition(0, 0);
     }
     private void startGame() {
+        if (closingGame) return;
         if (SetupService.status.running) { if (screen == Screen.INSTALL) playNow(); return; }
         if (!StorageLocation.available(this) || !InstallState.read(this).playable()) return;
         // A sync with the save folder in progress may be bringing in newer saves: start once it is done.
@@ -371,6 +830,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     /** One of the last two stages alone, from Game data or (shaders, fromHome) Home's Build shaders; a finished build
      * returns to where it was started. */
     private void buildStage(String stage, boolean fromHome) {
+        if (InstallState.OPTIONAL.equals(stage)) Inputs.prefs(this).edit().remove(ArtPolicy.DECLINED).apply();
         homeAfterBuild = fromHome;
         requestNotificationsThen(() -> startSetup(new String[]{stage}));
     }
@@ -379,8 +839,12 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     private void publishShortcut() {
         ShortcutManager shortcuts = getSystemService(ShortcutManager.class);
         if (shortcuts == null) return;
-        for (ShortcutInfo existing : shortcuts.getDynamicShortcuts()) if (existing.getId().equals("menu")) return;
-        Intent intent = new Intent(this, SetupActivity.class).setAction(Intent.ACTION_VIEW).putExtra(EXTRA_SETTINGS, true);
+        int flags = Intent.FLAG_ACTIVITY_REORDER_TO_FRONT | Intent.FLAG_ACTIVITY_SINGLE_TOP;
+        for (ShortcutInfo existing : shortcuts.getDynamicShortcuts())
+            if (existing.getId().equals("menu") && existing.getIntent() != null
+                    && (existing.getIntent().getFlags() & flags) == flags) return;
+        Intent intent = new Intent(this, SetupActivity.class).setAction(Intent.ACTION_VIEW)
+                .putExtra(EXTRA_SETTINGS, true).addFlags(flags);
         ShortcutInfo info = new ShortcutInfo.Builder(this, "menu").setShortLabel(Strings.SHORTCUT_SETTINGS)
                 .setIcon(Icon.createWithBitmap(shortcutGlyph())).setIntent(intent).build();
         try { shortcuts.setDynamicShortcuts(Arrays.asList(info)); } catch (RuntimeException rateLimited) { }
@@ -398,6 +862,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
 
     // ---------- navigation ----------
     private void go(Screen next) {
+        if (!closingGame) blockedAction = null;
         // Dialogs (confirmations, the import preview, the conflict choice) are never returned to with Back.
         boolean dialog = screen == Screen.CONFIRM_DELETE || screen == Screen.CHOICE || screen == Screen.SAVE_IMPORT || screen == Screen.SAVE_CONFLICT;
         if (screen != null && screen != next && !dialog) {
@@ -411,6 +876,9 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     }
     private void replace(Screen next) { history.clear(); if (next != Screen.GRAPHICS) setupFinished = false; screen = next; note = ""; noteOk = false; restoreFocus = PRIMARY; render(); }
     private void back() {
+        if (!closingGame) blockedAction = null;
+        if (updater != null && (screen == Screen.UPDATE_DOWNLOAD || screen == Screen.CHOICE)) { updater.cancel(); return; }
+        if (screen == Screen.UPDATES) { if (!history.isEmpty()) history.pop(); screen = Screen.FILES; render(); return; }
         if (screen == Screen.INSTALL && SetupService.status.running) { moveTaskToBack(true); return; }
         if (history.isEmpty()) { finish(); return; }
         setupFinished = false;
@@ -459,6 +927,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     private void plus() {
         if (menuScreen()) startGame();
         else if (screen == Screen.FILES && installAction != null && installAction.isEnabled()) installAction.performClick();
+        else if (screen == Screen.UPDATES) requestNotificationsThen(() -> startSetup(null));
         else if (screen == Screen.INSTALL && playPrompt != null && playPrompt.getVisibility() == View.VISIBLE) playNow();
     }
     private void defaults() {
@@ -489,11 +958,13 @@ public final class SetupActivity extends Activity implements SetupService.Listen
 
     // ---------- layout scaffolding ----------
     private void clearLive() {
+        gameControls.clear(); gameNotice = null; closeGameAction = null;
         settingRows.clear(); presetCards.clear(); slotCards.clear(); stageRows.clear(); dataRows.clear();
         statusChip = null; statusLine = storageText = extrasNote = null;
         storageBar = null; ring = null; installAction = null; installPrompt = cancelPrompt = playPrompt = otherPrompt = null; skipToggle = null;
         detailFacts = null; detailTitle = detailText = detailConstraint = null; detailDiagram = null; detailNote = null; detailId = "";
         slotGrid = null; slotLine = null;
+        updateProgress = null;
         primary = null; cancelArmedAt = 0;
     }
     private int seed() {
@@ -516,6 +987,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         Object focusTag = restoreFocus != null ? restoreFocus : focused == null ? null : focused.getTag();
         restoreFocus = null;
         clearLive();
+        gameState = InstallState.gameState(this);
         Rect bounds = getWindowManager().getCurrentWindowMetrics().getBounds();
         Theme.fit(bounds.width(), bounds.height());
         FrameLayout root = new FrameLayout(this);
@@ -526,6 +998,8 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             case WELCOME: welcome(); break;
             case ROUTE: route(); break;
             case FILES: files(); break;
+            case UPDATES: updates(); break;
+            case UPDATE_DOWNLOAD: appUpdateDownload(); break;
             case INSTALL: install(); break;
             case ERROR: error(); break;
             case INTERRUPTED: interrupted(); break;
@@ -546,6 +1020,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             case SAVE_CONFLICT: conflictScreen(); break;
             case CHOICE: choice(); break;
         }
+        gameBanner();
         getWindow().getDecorView().setKeepScreenOn(screen == Screen.INSTALL);
         setContentView(root);
         View target = focusTag == null || focusTag == PRIMARY ? null : root.findViewWithTag(focusTag);
@@ -641,7 +1116,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             chips.add(new Widgets.Chip(this).set(Widgets.Chip.OK, Strings.INSTALLED_CHIP));
             chips.add(!noSeed ? new Widgets.Chip(this).set(Widgets.Chip.OK, Strings.shadersReady(install.shaderVariants()))
                     : new Widgets.Chip(this).set(Widgets.Chip.WARN, Strings.SHADERS_NONE));
-            if (install.done("companion") && SettingsStore.secondaryDisplay(this, getDisplay()))
+            if (install.done("companion") && SettingsStore.secondaryDisplay(this))
                 chips.add(new Widgets.Chip(this).set(Widgets.Chip.OK, Strings.SECOND_READY));
         }
         if (pulledChip) chips.add(new Widgets.Chip(this).set(Widgets.Chip.OK, Strings.SAVES_UPDATED));
@@ -669,6 +1144,11 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             why.setGravity(Gravity.CENTER_HORIZONTAL);
             ready.addView(why, Widgets.margins(Widgets.size(-1, -2), 0, 18, 0, 0));
         }
+        if (!note.isEmpty()) {
+            TextView why = Theme.paragraph(this, note, 19, Theme.AMBER);
+            why.setGravity(Gravity.CENTER_HORIZONTAL);
+            ready.addView(why, Widgets.margins(Widgets.size(-1, -2), 0, 18, 0, 0));
+        }
         board.put(ready, 440, 700, 700, Widgets.Board.WRAP, Widgets.Board.CENTER, Widgets.Board.START);
 
         Widgets.Panel menu = panel(880, 150, 920, 740, true, 56, 50);
@@ -693,7 +1173,8 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         homeItem(menu, "home:saves", "save", Strings.SAVES, Strings.savesSummary(liveSlots == null ? 0 : liveSlots.size(),
                 liveSlots == null ? 0 : SaveManager.newest(liveSlots), folderSummary()), v -> go(Screen.SAVES), 88, 8);
         homeItem(menu, "home:data", "data", Strings.GAME_DATA, missing ? StorageLocation.label(this) + " · " + Strings.NOT_AVAILABLE
-                : Strings.dataSummary(Strings.size(dataBytes()), install.done("companion"), install.artOutdated(), install.done("shaders")), v -> go(Screen.DATA), 88, 8);
+                : Strings.dataSummary(Strings.size(dataBytes()), SettingsStore.secondaryDisplay(this),
+                        install.done("companion"), install.artOutdated(), install.done("shaders")), v -> go(Screen.DATA), 88, 8);
         homeItem(menu, "home:about", "about", Strings.ABOUT, Strings.ABOUT_HINT, v -> go(Screen.ABOUT), 88, 0);
         primary = start;
         // The one-time move of an install made before private storage existed: asked once per visit to the menu.
@@ -731,10 +1212,10 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     /** "Snapdragon 8 Gen 2 class (QCS8550) · dual screen": the profile family and the second screen, both detected. */
     private String detected() {
         String soc = SettingsStore.soc();
-        return Strings.detected(Settings.socClass(soc), soc, SettingsStore.secondScreen(this, getDisplay()));
+        return Strings.detected(Settings.socClass(soc), soc, SettingsStore.secondScreen(this));
     }
     private String screenChip() {
-        int second = SettingsStore.secondScreen(this, getDisplay());
+        int second = SettingsStore.secondScreen(this);
         return second == com.aure.totk.companion.DisplayClass.BUILT_IN ? Strings.SECOND_DETECTED
                 : second == com.aure.totk.companion.DisplayClass.EXTERNAL ? Strings.EXTERNAL_ONLY : Strings.ONE_SCREEN;
     }
@@ -780,11 +1261,11 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         Widgets.Panel list = panel(80, listTop, 1040, 906 - listTop, false, 28, 28);
         List<String> keys = new ArrayList<>();
         switch (tab) {
-            case Settings.PERFORMANCE: keys.addAll(Arrays.asList("frame_rate", "frame_gen", "render_res", "latency")); break;
+            case Settings.PERFORMANCE: keys.addAll(Arrays.asList("frame_rate", "frame_gen", "render_res", "latency", "gpu_feed")); break;
             case Settings.PICTURE: keys.addAll(Arrays.asList("upscaler", "sharpness", "aa", "shadows")); break;
             default:
                 keys.addAll(Arrays.asList("console_mode", "native_hud", "overlay", "overlay_pos"));
-                if (SettingsStore.secondaryDisplay(this, getDisplay())) keys.add("second_screen");
+                if (SettingsStore.secondaryDisplay(this)) keys.add("second_screen");
         }
         for (String key : keys) settingRow(list, key);
         detailPanel();
@@ -813,7 +1294,9 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     /** One option row: a ‹ value › selector, or the sharpness slider bound to the current upscaler's value. */
     private void settingRow(LinearLayout parent, String key) {
         String labelKey = key.equals("sharpness") ? "sharpness_fsr" : key;
-        Widgets.Row row = listRow(parent, "opt:" + key, Strings.optionLabel(labelKey), Strings.optionHint(labelKey), 92, 18);
+        // Five Performance rows share the space below the preset cards; keep the last selector inside the panel.
+        float gap = Settings.option(labelKey).tab.equals(Settings.PERFORMANCE) ? 6 : 18;
+        Widgets.Row row = listRow(parent, "opt:" + key, Strings.optionLabel(labelKey), Strings.optionHint(labelKey), 92, gap);
         row.setFocusableInTouchMode(true);   // a tap selects the row (and shows its detail); the arrows change it
         if (key.equals("sharpness")) {
             Widgets.Slider slider = new Widgets.Slider(this, row, value -> {
@@ -904,6 +1387,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         switch (key) {
             case "frame_rate": return value.equals("60") ? 4 : 2;
             case "frame_gen": return value.equals("on") ? 3 : 0;
+            case "gpu_feed": return value.equals("on") ? 1 : 0;
             case "render_res": return value.equals("960x540") ? 1 : value.equals("1152x648") ? 2 : 3;
             case "upscaler": return value.equals("off") ? 0 : 1;
             case "sharpness_fsr": case "sharpness_sgsr": return 1;
@@ -941,7 +1425,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             detailTitle.setText(Strings.optionLabel(key));
             detailText.setText(Strings.optionText(key));
             detailDiagram.setVisibility(View.VISIBLE);
-            detailDiagram.show(key, settings, SettingsStore.secondaryDisplay(this, getDisplay()));
+            detailDiagram.show(key, settings, SettingsStore.secondaryDisplay(this));
             if (!Settings.option(key).tab.equals(Settings.CONTROLS)) fact(Strings.GPU_COST, new Widgets.Meter(this).set(cost(key, value)));
             switch (key) {
                 case "frame_rate":
@@ -950,6 +1434,10 @@ public final class SetupActivity extends Activity implements SetupService.Listen
                 case "frame_gen":
                     fact(Strings.ADDED_LATENCY, Strings.addedLatency(key, value));
                     fact(Strings.WORKS_WITH, "30 fps only");
+                    break;
+                case "gpu_feed":
+                    fact(Strings.WORKS_WITH, "Frame generation off");
+                    if (settings.latencyLocked()) constraint = Strings.LOCKED_FRAMEGEN;
                     break;
                 case "latency":
                     fact(Strings.ADDED_LATENCY, settings.latencyLocked() ? Strings.LOCKED_FRAMEGEN : Strings.addedLatency(key, value));
@@ -1038,31 +1526,30 @@ public final class SetupActivity extends Activity implements SetupService.Listen
                     if (!missing && install.anyDone() && !installed) { showNote(Strings.MOVE_PARTIAL); return; }
                     go(Screen.STORAGE);
                 });
+        boolean secondScreen = SettingsStore.secondaryDisplay(this);
         boolean companion = install.done("companion"), shaders = install.done("shaders") && !seedRefused;
-        Widgets.Row companionRow = dataRow(list, "companion", Strings.COMPANION_ROW, Strings.COMPANION_HINT,
-                companion ? Strings.READY + " · " + Strings.REBUILD : !installed ? Strings.NEEDS_SETUP
+        Widgets.Row companionRow = dataRow(list, "companion", Strings.COMPANION_ROW, secondScreen ? Strings.COMPANION_HINT : Strings.ART_NOT_NEEDED_HINT,
+                !secondScreen ? Strings.ART_NOT_NEEDED + " · " + (companion || install.artOutdated() ? Strings.REBUILD : Strings.BUILD)
+                        : companion ? Strings.READY + " · " + Strings.REBUILD : !installed ? Strings.NEEDS_SETUP
                         : install.artOutdated() ? Strings.OUT_OF_DATE + " · " + Strings.UPDATE : Strings.NOT_PREPARED + " · " + Strings.BUILD,
-                companion ? Theme.ZONAI : Theme.AMBER, v -> buildStage("companion", false));
+                !secondScreen ? Theme.TEXT3 : companion ? Theme.ZONAI : Theme.AMBER, v -> buildStage("companion", false));
         // The shader seed is required: without it Start game is replaced by Build shaders on Home.
         Widgets.Row shaderRow = dataRow(list, "shaders", Strings.SHADERS_ROW, Strings.SHADERS_HINT,
                 shaders ? Strings.variants(install.shaderVariants()) + " · " + Strings.REBUILD : !installed ? Strings.NEEDS_SETUP : Strings.NOT_BUILT + " · " + Strings.BUILD,
                 shaders ? Theme.ZONAI : Theme.WARN, v -> buildStage("shaders", false));
         companionRow.dimmed(!installed || busy); shaderRow.dimmed(!installed || busy);
+        gameControl(companionRow, "Preparing game data", () -> buildStage("companion", false));
+        gameControl(shaderRow, "Preparing shaders", () -> buildStage("shaders", false));
         File driver = gameFile("driver.so");
         String driverName = Inputs.prefs(this).getString("driverName", "driver.so");
         Widgets.Row driverRow = dataRow(list, "driver", Strings.DRIVER, Strings.DRIVER_HINT,
                 driver.isFile() ? Strings.DRIVER_CUSTOM_SHORT + driverName + " · " + Strings.bytes(driver.length()) : Strings.DRIVER_BUNDLED,
-                driver.isFile() ? Theme.AMBER : Theme.ZONAI, v -> {
-                    Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*");
-                    try { startActivityForResult(intent, REQ_DRIVER); } catch (ActivityNotFoundException noPicker) { showNote(Strings.PICKER_MISSING); }
-                });
-        Widgets.Row reset = dataRow(list, "driver-reset", Strings.DRIVER_RESET_ROW, Strings.DRIVER_RESET_HINT, "", Theme.TEXT3, v -> {
-            if (InstallState.gameRunning(this)) { showNote(Strings.error("game_running")); return; }
-            gameFile("driver.so").delete();
-            render();
-        });
+                driver.isFile() ? Theme.AMBER : Theme.ZONAI, v -> pickDriver());
+        Widgets.Row reset = dataRow(list, "driver-reset", Strings.DRIVER_RESET_ROW, Strings.DRIVER_RESET_HINT, "", Theme.TEXT3, v -> resetDriver());
         driverRow.dimmed(missing);
         reset.dimmed(missing || !driver.isFile());
+        gameControl(driverRow, "Changing the driver", this::pickDriver);
+        gameControl(reset, "Changing the driver", this::resetDriver);
         if (missing && StorageLocation.accessLost(this))
             dataRow(list, "access", Strings.ACCESS_FIX_ROW, Strings.ACCESS_FIX_HINT, Strings.ACCESS_OFF, Theme.WARN, v -> openAccessSettings());
         else if (missing) dataRow(list, "again", Strings.SETUP_AGAIN_ROW, Strings.SETUP_AGAIN_HINT, "", Theme.TEXT3, v -> go(Screen.STORAGE));
@@ -1070,6 +1557,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         Widgets.Row delete = dataRow(list, "delete", busy ? Strings.DELETING : Strings.DELETE_ROW, Strings.DELETE_HINT, "", Theme.WARN, v -> go(Screen.CONFIRM_DELETE));
         delete.labelColor(Theme.WARN);
         delete.dimmed(busy || !(install.anyDone() || gameFile("extracted").exists() || gameFile(".import").exists()));
+        gameControl(delete, "Deleting game data", () -> go(Screen.CONFIRM_DELETE));
         detailPanel();
         detailNote.setVisibility(View.GONE);
         primary = installedRow;
@@ -1106,7 +1594,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
                 break;
             }
             case "access": detailText.setText(Strings.ACCESS_TEXT); break;
-            case "companion": detailText.setText(Strings.COMPANION_TEXT); break;
+            case "companion": detailText.setText((SettingsStore.secondaryDisplay(this) ? "" : Strings.ART_NOT_NEEDED + ". ") + Strings.COMPANION_TEXT); break;
             case "shaders": detailText.setText(Strings.SHADERS_TEXT); break;
             case "driver": case "driver-reset": detailText.setText(Strings.DRIVER_TEXT); break;
             case "rerun": detailText.setText(Strings.RERUN_TEXT); break;
@@ -1118,29 +1606,39 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         }
     }
 
+    private void pickDriver() {
+        if (!needGameClosed("Changing the driver", this::pickDriver)) return;
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*");
+        try { startActivityForResult(intent, REQ_DRIVER); } catch (ActivityNotFoundException noPicker) { showNote(Strings.PICKER_MISSING); }
+    }
+
+    private void resetDriver() {
+        if (!needGameClosed("Changing the driver", this::resetDriver)) return;
+        try (GameLock.Hold held = GameLock.hold(getFilesDir())) {
+            held.requireFree();
+            gameFile("driver.so").delete();
+        } catch (IOException failed) { showNote(Strings.gameLockError(failed.toString())); return; }
+        render();
+    }
+
     /** Copy a user-chosen Turnip build to <game>/driver.so (the runtime prefers it over the bundled libtotk_turnip.so). */
     private void installDriver(Uri uri) {
-        if (InstallState.gameRunning(this)) { showNote(Strings.error("game_running")); return; }
+        if (!needGameClosed("Changing the driver", () -> installDriver(uri))) return;
         ContentResolver resolver = getContentResolver();
         worker.execute(() -> {
             String name = Inputs.describe(resolver, uri).name, outcome = null;
-            File target = gameFile("driver.so"), temp = gameFile("driver.so.tmp");
+            File target = gameFile("driver.so");
             File direct = FileAccess.directFile(this, uri, -1);   // by its real path with All files access, else the picker's stream
-            try (InputStream in = direct != null ? new java.io.FileInputStream(direct) : resolver.openInputStream(uri)) {
+            try (GameLock.Hold held = GameLock.hold(getFilesDir())) {
+                held.requireFree();
+                InputStream in = direct != null ? new java.io.FileInputStream(direct) : resolver.openInputStream(uri);
                 if (in == null) throw new IOException("unreadable");
-                byte[] header = in.readNBytes(64);
-                // ELF, 64-bit, little-endian, e_machine EM_AARCH64 (183)
-                boolean elf = header.length == 64 && header[0] == 0x7f && header[1] == 'E' && header[2] == 'L' && header[3] == 'F'
-                        && header[4] == 2 && header[5] == 1 && (header[18] & 0xff) == 183 && header[19] == 0;
-                if (!elf) outcome = Strings.DRIVER_BAD;
-                else {
-                    try (OutputStream out = new FileOutputStream(temp)) { out.write(header); in.transferTo(out); }
-                    if (!temp.renameTo(target)) throw new IOException("rename failed");
-                    Inputs.prefs(this).edit().putString("driverName", name).apply();
-                }
+                String label = DriverImport.install(in, target, new File(getCacheDir(), "driver-import.zip.tmp"), name);
+                Inputs.prefs(this).edit().putString("driverName", label).apply();
+            } catch (DriverImport.Invalid failed) {
+                outcome = failed.zip ? Strings.DRIVER_ZIP_BAD : Strings.DRIVER_BAD;
             } catch (IOException | SecurityException failed) {
-                temp.delete();
-                outcome = Strings.error("io");
+                outcome = Strings.gameLockError(failed.toString());
             }
             String message = outcome;
             main.post(() -> { note = message == null ? "" : message; if (screen == Screen.DATA) render(); });
@@ -1158,6 +1656,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         Widgets.Row delete = listRow(box, "delete", Strings.DELETE, null, 76, 0);
         delete.labelColor(Theme.WARN);
         delete.setOnClickListener(v -> deleteData());
+        gameControl(delete, "Deleting game data", this::deleteData);
         primary = keep;
         prompts(prompt("A", Strings.P_SELECT, v -> selectFocused()), backPrompt());
     }
@@ -1176,18 +1675,24 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         prompts(prompt("A", Strings.P_SELECT, v -> selectFocused()), backPrompt());
     }
     private void deleteData() {
-        if (SetupService.status.running || InstallState.gameRunning(this)) { screen = Screen.DATA; note = Strings.error("game_running"); render(); return; }
+        if (SetupService.status.running || !needGameClosed("Deleting game data", this::deleteData)) return;
         busy = true; screen = Screen.DATA; note = Strings.DELETING; render();
         File game = InstallState.gameDir(this);
         worker.execute(() -> {
-            // install.json first: an interrupted delete must never leave something that still looks playable.
-            new File(game, "install.json").delete();
-            for (String name : new String[]{".import", "rewritten", "game-data", "extracted", "shaders", "companion"}) delete(new File(game, name));
+            try (GameLock.Hold held = GameLock.hold(getFilesDir())) {
+                held.requireFree();
+                // install.json first: an interrupted delete must never leave something that still looks playable.
+                new File(game, "install.json").delete();
+                for (String name : new String[]{".import", "rewritten", "game-data", "extracted", "shaders", "companion"}) delete(new File(game, name));
+            } catch (IOException failed) {
+                main.post(() -> { busy = false; showNote(Strings.gameLockError(failed.toString())); });
+                return;
+            }
             main.post(() -> {
                 busy = false; DataSize.invalidate();
                 inputs.clear(getContentResolver());
                 SetupService.clearResult(this);
-                Inputs.prefs(this).edit().remove("jobStages").apply();
+                Inputs.prefs(this).edit().remove("jobStages").remove(ArtPolicy.DECLINED).remove(ArtPolicy.START_AFTER_BUILD).apply();
                 inspection = null;
                 // Nothing playable is left: the menu has nothing to start, so continue on the welcome screen.
                 history.clear(); history.push(Screen.WELCOME);
@@ -1259,6 +1764,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             else if (v == recommended) card.state(Strings.RECOMMENDED_SHORT, Theme.ZONAI, null);
             else card.state(Strings.CHOOSE_STATE, Theme.TEXT2, null);
             box.addView(card, Widgets.margins(Widgets.size(-1, height), 0, i == 0 ? 30 : gap, 0, 0));
+            if (moving && !inUse && room) gameControl(card, "Moving game data", () -> chooseVolume(v, setup, true, need));
             if (first == null) first = card;
             if (primary == null && (setup ? v == recommended : inUse)) primary = card;
         }
@@ -1267,6 +1773,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         folder.stateWidth(300);
         folder.state(granted ? Strings.CHOOSE_STATE : Strings.NEEDS_ACCESS, granted ? Theme.TEXT2 : Theme.AMBER, null);
         box.addView(folder, Widgets.margins(Widgets.size(-1, height), 0, volumes.isEmpty() ? 30 : gap, 0, 0));
+        if (moving) gameControl(folder, "Moving game data", () -> chooseFolder(setup, true, need));
         if (first == null) first = folder;
         // The optional permission step: in setup below the cards, on Game data under the facts.
         access = listRow(setup ? box : detailFacts, "access", Strings.ACCESS_ROW, Strings.ACCESS_HINT, 76, 0);
@@ -1282,7 +1789,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         if (!missing && v.same(StorageLocation.gameDir(this)) && !setup) { back(); return; }
         if (v.free < need) { showNote(Strings.NOT_ENOUGH + " · " + Strings.volumeLine(v.free, need)); return; }
         if (moving) {
-            if (InstallState.gameRunning(this)) { showNote(Strings.error("game_running")); return; }
+            if (!needGameClosed("Moving game data", () -> chooseVolume(v, setup, true, need))) return;
             requestNotificationsThen(() -> {
                 SetupService.clearResult(this);
                 installSnapshot = null;
@@ -1480,6 +1987,8 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         saveRow(list, "folder", "folder", Strings.SAVES_FOLDER, Strings.SAVES_FOLDER_HINT, folderText(), folderColor(), v -> folderAction());
         Widgets.Row sync = saveRow(list, "sync", "refresh", Strings.SAVES_SYNC, Strings.SAVES_SYNC_HINT, syncing ? Strings.SYNCING : "", Theme.AMBER, v -> syncMirror(true));
         sync.dimmed(!mirror);
+        gameControl(importRow, "Importing saves", this::chooseImport);
+        gameControl(sync, "Synchronizing saves", () -> syncMirror(true));
         saveRow(list, "backups", "clock", Strings.SAVES_BACKUPS, Strings.SAVES_BACKUPS_HINT, Strings.backupCount(backupList.size()), Theme.TEXT2, v -> go(Screen.BACKUPS));
         savesDetail();
         primary = slots == 0 ? importRow : export;
@@ -1551,8 +2060,8 @@ public final class SetupActivity extends Activity implements SetupService.Listen
                 new Object[]{"import:tree", Strings.IMPORT_TREE, Strings.IMPORT_TREE_HINT, false, (Runnable) () -> pickImport(true)});
     }
     private void pickImport(boolean tree) {
-        back();
-        if (InstallState.gameRunning(this)) { saveNote(Strings.error("game_running"), false); return; }
+        if (!needGameClosed("Importing saves", () -> pickImport(tree))) return;
+        if (screen == Screen.CHOICE) back();
         Intent intent = tree ? new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
                 : new Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*");
         intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
@@ -1560,7 +2069,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     }
     /** Check a picked zip or folder and stage its save set, then show what was found before anything changes. */
     private void stageImport(Uri uri, boolean tree) {
-        if (InstallState.gameRunning(this)) { saveNote(Strings.error("game_running"), false); return; }
+        if (!needGameClosed("Importing saves", () -> stageImport(uri, tree))) return;
         String source = tree ? treeName(uri) : Inputs.describe(getContentResolver(), uri).name;
         saveBusy = true; saveNote(Strings.CHECKING_SAVES, true);
         File staged = SaveManager.staging(getFilesDir(), "import");
@@ -1604,6 +2113,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         Widgets.Row replace = listRow(box, "import:replace", Strings.REPLACE_SAVES, Strings.REPLACE_SAVES_HINT, 86, 10);
         replace.labelColor(Theme.AMBER);
         replace.setOnClickListener(v -> confirmImport());
+        gameControl(replace, "Replacing saves", this::confirmImport);
         Widgets.Row keep = listRow(box, "import:keep", Strings.KEEP_SAVES, Strings.KEEP_SAVES_HINT, 86, 0);
         keep.setOnClickListener(v -> discardImport());
         savesDetail();
@@ -1620,7 +2130,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     private void confirmImport() {
         File staged = importStaged;
         if (staged == null || saveBusy) return;
-        if (InstallState.gameRunning(this)) { showNote(Strings.error("game_running")); return; }
+        if (!needGameClosed("Replacing saves", this::confirmImport)) return;
         int slots = importSlots.size();
         importStaged = null;
         saveBusy = true;
@@ -1668,7 +2178,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         syncing = true; saveNote(Strings.SYNCING, true);
         saveWorker.execute(() -> {
             SaveMirror.Result r;
-            try { SaveMirror.setFolder(this, tree); r = SaveMirror.sync(this, !InstallState.gameRunning(this)); }
+            try { SaveMirror.setFolder(this, tree); r = SaveMirror.sync(this, true); }
             catch (IOException failed) { r = new SaveMirror.Result(SaveMirror.UNAVAILABLE); r.error = String.valueOf(failed.getMessage()); }
             SaveMirror.Result result = r;
             main.post(() -> synced(result, true));
@@ -1677,10 +2187,11 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     /** Sync with the save folder in the background; manual = Sync now (reports every outcome). */
     private void syncMirror(boolean manual) {
         if (!SaveMirror.enabled(this) || syncing) return;
+        if (manual && !needGameClosed("Synchronizing saves", () -> syncMirror(true))) return;
         syncing = true;
         if (manual) saveNote(Strings.SYNCING, true);
         saveWorker.execute(() -> {
-            SaveMirror.Result r = SaveMirror.sync(this, !InstallState.gameRunning(this));
+            SaveMirror.Result r = SaveMirror.sync(this, true);
             main.post(() -> synced(r, manual));
         });
     }
@@ -1723,6 +2234,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
                 Strings.side(c.folderSlots, c.folderTime, c.folderDevice), v -> resolveConflict(false));
         folder.setTag("conflict:folder"); folder.stateWidth(260); folder.state(Strings.KEEP_THIS, Theme.ZONAI, null);
         box.addView(folder, Widgets.margins(Widgets.size(-1, 140), 0, 18, 0, 0));
+        gameControl(folder, "Replacing saves", () -> resolveConflict(false));
         box.addView(Widgets.space(this), new LinearLayout.LayoutParams(-1, 0, 1));
         Widgets.Row later = listRow(box, "conflict:later", Strings.DECIDE_LATER, Strings.DECIDE_LATER_HINT, 80, 0);
         later.setOnClickListener(v -> back());
@@ -1733,7 +2245,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
      * saves replace this device's (backed up first). */
     private void resolveConflict(boolean keepDevice) {
         if (saveBusy) return;
-        if (!keepDevice && InstallState.gameRunning(this)) { showNote(Strings.error("game_running")); return; }
+        if (!keepDevice && !needGameClosed("Replacing saves", () -> resolveConflict(false))) return;
         saveBusy = true; syncing = true;
         if (screen == Screen.SAVE_CONFLICT) back();
         saveNote(Strings.SYNCING, true);
@@ -1764,6 +2276,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
                     Strings.reason(b.reason) + " · " + Strings.slotCount(Math.max(0, b.slots)), 86, 8);
             row.setOnClickListener(v -> { if (!saveBusy) confirmRestore(b); });
             row.setOnFocusChangeListener((v, has) -> { if (has) { chosenBackup = b; backupDetail(b); } });
+            gameControl(row, "Restoring saves", () -> confirmRestore(b));
             if (primary == null) primary = row;
         }
         prompts(prompt("A", Strings.P_RESTORE, v -> selectFocused()), prompt("X", Strings.P_DELETE, v -> extra()), backPrompt(), startPrompt());
@@ -1797,8 +2310,8 @@ public final class SetupActivity extends Activity implements SetupService.Listen
                 }});
     }
     private void restoreBackup(SaveManager.Backup b) {
-        back();
-        if (InstallState.gameRunning(this)) { saveNote(Strings.error("game_running"), false); return; }
+        if (!needGameClosed("Restoring saves", () -> restoreBackup(b))) return;
+        if (screen == Screen.CHOICE) back();
         saveBusy = true; saveNote(Strings.RESTORING, true);
         saveWorker.execute(() -> {
             String failed = null; boolean backedUp = false;
@@ -1855,6 +2368,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         Widgets.Row licencesRow = listRow(list, "about:licences", Strings.LICENCES_ROW, Strings.LICENCES_HINT, 92, 18);
         licencesRow.setOnClickListener(v -> go(Screen.LICENSES));
         Widgets.Row project = listRow(list, "about:project", Strings.PROJECT_ROW, Strings.PROJECT_URL, 92, 18);
+        Widgets.Row updateRow = updateSwitch(list);
         detailPanel();
         detailNote.setVisibility(View.GONE);
         View.OnFocusChangeListener detail = (v, has) -> {
@@ -1871,6 +2385,8 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             } else if (v == licencesRow) {
                 detailTitle.setText(Strings.LICENCES_ROW); detailText.setText(Strings.LICENCES_TEXT);
                 fact("Files", String.valueOf(licenceFiles().size()));
+            } else if (v == updateRow) {
+                detailTitle.setText(Strings.UPDATES); detailText.setText(Strings.UPDATE_PRIVACY);
             } else {
                 detailTitle.setText(Strings.PROJECT_ROW); detailText.setText(Strings.PROJECT_TEXT);
                 fact(Strings.UPSTREAM_ROW, Strings.UPSTREAM_BY);
@@ -1878,6 +2394,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             }
         };
         versionRow.setOnFocusChangeListener(detail); licencesRow.setOnFocusChangeListener(detail); project.setOnFocusChangeListener(detail);
+        updateRow.setOnFocusChangeListener(detail);
         primary = versionRow;
         prompts(prompt("A", Strings.P_SELECT, v -> selectFocused()), backPrompt(), startPrompt());
     }
@@ -1954,21 +2471,21 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     }
 
     // ---------- setup: shared ----------
-    /** The step rail (05-setup-files): 1 storage (private storage, an SD card or a folder, and the optional All files
-     * access), 2 what you have, 3 files, 4 prepare, 5 graphics. current: 0 = storage, 1..4 the others. */
+    /** Setup rail: Storage, What you have, Files, Updates, Prepare, Graphics. */
     private void rail(int current, boolean failed) {
         Widgets.Panel steps = panel(80, 186, 470, 720, false, 40, 44);
         List<String[]> items = new ArrayList<>();
         items.add(new String[]{Strings.STEP_STORAGE, current > 0 ? StorageLocation.label(this) : Strings.STEP_STORAGE_TEXT});
         items.add(new String[]{Strings.STEP_ROUTE, Strings.routeName(current > 1 ? inputs.route : "")});
         items.add(new String[]{Strings.STEP_FILES, Strings.STEP_FILES_TEXT});
-        items.add(new String[]{Strings.STEP_PREPARE, Strings.STEP_PREPARE_TEXT});
+        items.add(new String[]{Strings.UPDATES, "Choose automatic version checks"});
+        items.add(new String[]{Strings.STEP_PREPARE, Strings.prepareEstimate(inputs.route)});
         items.add(new String[]{Strings.STEP_GRAPHICS, Strings.STEP_GRAPHICS_TEXT});
         int at = current + 1;
         for (int i = 0; i < items.size(); i++) {
             int n = i + 1;
             int state = n < at ? Widgets.Step.DONE : n == at ? (failed ? Widgets.Step.FAILED : Widgets.Step.CURRENT) : Widgets.Step.TODO;
-            steps.addView(new Widgets.Step(this, n, items.get(i)[0], items.get(i)[1], state, i == items.size() - 1), Widgets.size(-1, 126));
+            steps.addView(new Widgets.Step(this, n, items.get(i)[0], items.get(i)[1], state, i == items.size() - 1), Widgets.size(-1, 104));
         }
     }
     /** Begin setup: the Storage step first when nothing has been imported anywhere yet. */
@@ -2078,7 +2595,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         alt.setClickable(true);
         alt.setOnClickListener(v -> { history.pop(); screen = Screen.ROUTE; chooseRoute(containers ? Inputs.DECRYPTED : Inputs.CONTAINERS); });
         board.put(alt, 640, 870, Widgets.Board.WRAP, Widgets.Board.WRAP, Widgets.Board.START, Widgets.Board.END);
-        installAction = new Widgets.Action(this, Strings.INSTALL, true, v -> requestNotificationsThen(() -> startSetup(null)));
+        installAction = new Widgets.Action(this, "Continue", true, v -> go(Screen.UPDATES));
         installAction.setTag("install");
         board.put(installAction, 1790, 880, Widgets.Board.WRAP, Widgets.Board.WRAP, Widgets.Board.END, Widgets.Board.END);
         if (primary == null) primary = installAction;
@@ -2173,8 +2690,15 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         else if (ready) { statusLine.setText(Strings.ALL_SET); statusLine.setTextColor(Theme.ZONAI); }
         else if (problems) { statusLine.setText(Strings.FIX_MARKED); statusLine.setTextColor(Theme.WARN); }
         else statusLine.setText("");
+        gameState = InstallState.gameState(this);
+        if (!gameState.free()) {
+            statusLine.setText(gameState.state == GameLock.State.GAME ? Strings.gameRunning("Installing") : Strings.gameLockError(gameState.reason));
+            statusLine.setTextColor(Theme.AMBER);
+        }
         installAction.setEnabled(ready);
         if (installPrompt != null) installPrompt.setEnabled(ready);
+        gameControl(installAction, "Installing", () -> go(Screen.UPDATES));
+        if (installPrompt != null) gameControl(installPrompt, "Installing", () -> go(Screen.UPDATES));
     }
     private boolean lostRoles(String role) {
         JSONArray lost = inspection == null ? null : inspection.optJSONArray("lost");
@@ -2216,6 +2740,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     }
     @Override protected void onActivityResult(int request, int code, Intent data) {
         super.onActivityResult(request, code, data);
+        if (request == UpdateInstaller.REQUEST_SOURCES) { if (updater != null) updater.permissionReturned(); return; }
         if (code != RESULT_OK || data == null) return;
         if (request == REQ_DRIVER) { if (data.getData() != null) installDriver(data.getData()); return; }
         if (request == REQ_EXPORT) { if (data.getData() != null) writeExport(data.getData()); return; }
@@ -2265,7 +2790,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         if (request == REQ_NOTIFY && action != null) action.run();
     }
     private void startSetup(String[] stages) {
-        if (InstallState.gameRunning(this)) { SetupService.clearResult(this); showNote(Strings.error("game_running")); return; }
+        if (!needGameClosed("Installing", () -> startSetup(stages))) return;
         if (!needsInputs(stages)) { launchService(stages); return; }
         // Re-open every persisted pick before starting: a revoked or moved document goes back to Files with a clear
         // message instead of failing deep inside the import.
@@ -2287,6 +2812,10 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         return pending && (stages == null || !Arrays.asList(InstallState.PAIR).containsAll(Arrays.asList(stages)));
     }
     private void launchService(String[] stages) {
+        if (stages == null && !InstallState.read(this).anyDone())
+            Inputs.prefs(this).edit().remove(ArtPolicy.DECLINED).apply();
+        if (stages == null || stages.length != 1 || !InstallState.OPTIONAL.equals(stages[0]))
+            Inputs.prefs(this).edit().remove(ArtPolicy.START_AFTER_BUILD).apply();
         SetupService.clearResult(this);
         installSnapshot = null;
         SetupService.start(this, stages);
@@ -2372,6 +2901,8 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     private void playNow() {
         if (!SetupService.status.running) { if (InstallState.read(this).playable()) launchGame(); return; }
         if (playPrompt == null || playPrompt.getVisibility() != View.VISIBLE || !playPrompt.isEnabled()) return;
+        if (!InstallState.read(this).done(InstallState.OPTIONAL) && !InstallState.read(this).artOutdated())
+            Inputs.prefs(this).edit().putBoolean(ArtPolicy.DECLINED, true).remove(ArtPolicy.START_AFTER_BUILD).apply();
         playAfterStop = true;
         playPrompt.text.setText(Strings.STOPPING); playPrompt.setEnabled(false);
         SetupService.cancel(this);
@@ -2409,6 +2940,8 @@ public final class SetupActivity extends Activity implements SetupService.Listen
                 row.set(Widgets.StageRow.ACTIVE, fraction, known ? Math.round(fraction * 100) + "%" : "…", detail);
             } else if (install.done(stage) || (status.running && currentIndex >= 0 && i < currentIndex && !isPair(stage))) {
                 row.set(Widgets.StageRow.DONE, 1, Strings.DONE, stage.equals("shaders") && install.shaderVariants() > 0 ? Strings.variants(install.shaderVariants()) : Strings.stageDone(stage));
+            } else if (install.skipped(stage)) {
+                row.set(Widgets.StageRow.SKIPPED, 0, Strings.ART_SKIPPED, Strings.ART_NOT_NEEDED);
             } else if (!install.errorCode(stage).isEmpty() && (currentIndex < 0 || i < currentIndex || !status.running || lane != null)) {
                 // A failed shader stage fails setup; the companion stage is only skipped.
                 String why = install.errorText(stage).isEmpty() ? Strings.error(install.errorCode(stage)) : install.errorText(stage);
@@ -2472,6 +3005,14 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             if (install.playable()) { SetupService.clearResult(this); launchGame(); return; }
         }
         if (!result.has("ok")) return;  // service not finished yet (status listener fired before the result was stored)
+        if (Inputs.prefs(this).getBoolean(ArtPolicy.START_AFTER_BUILD, false)) {
+            Inputs.prefs(this).edit().remove(ArtPolicy.START_AFTER_BUILD).apply();
+            SetupService.clearResult(this);
+            if (result.optBoolean("ok") && install.done(InstallState.OPTIONAL) && install.playable()) { launchGame(); return; }
+            replace(Screen.HOME);
+            showNote(Strings.ART_OFFER_FAILED);
+            return;
+        }
         if (SetupService.moving() || "move".equals(result.optString("stage"))) {
             // Back to Game data with the outcome; a failed or cancelled move left the data where it was.
             SetupService.clearResult(this);
@@ -2527,8 +3068,8 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         JSONObject result = SetupService.lastResult(this);
         String code = result.optString("code", "internal");
         setupHeader(Strings.SETUP_TITLE);
-        rail(3, true);
-        Widgets.Panel box = setupMain();
+        rail(4, true);
+        Widgets.Panel box = panel(590, 186, 1250, 720, true, 50, 32);
         heading(box, Strings.ERROR_TITLE, 36);
         String stage = result.optString("stage", "");
         if (!stage.isEmpty()) {
@@ -2540,28 +3081,97 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         String message = result.optString("message", "");
         if (!message.isEmpty()) {
             TextView details = add(box, Theme.paragraph(this, Strings.DETAILS + message, 17, Theme.TEXT3), 8);
-            details.setMaxLines(4); details.setEllipsize(TextUtils.TruncateAt.END);
+            details.setMaxLines(2); details.setEllipsize(TextUtils.TruncateAt.END);
         }
+        add(box, Theme.paragraph(this, SetupDetails.PRIVACY, 16, Theme.TEXT3), 8);
         if (!note.isEmpty()) add(box, Theme.paragraph(this, note, 18, Theme.AMBER), 8);
         box.addView(Widgets.space(this), new LinearLayout.LayoutParams(-1, 0, 1));
-        boolean filesProblem = Arrays.asList("hash_mismatch", "bad_keys", "unsupported_version", "permission", "missing_input").contains(code);
-        Widgets.Row resume = resumeRows(box, filesProblem);
+        Widgets.Row resume = resumeRows(box);
+        Widgets.Row share = new Widgets.Row(this, Strings.SHARE_DETAILS,
+                sharingDetails ? Strings.SHARE_DETAILS_BUSY : Strings.SHARE_DETAILS_HINT, 27, 18).icon("export", 56, 28);
+        share.setTag("share-details");
+        share.dimmed(sharingDetails);
+        share.setOnClickListener(v -> { if (!sharingDetails) shareDetails(); });
+        box.addView(share, Widgets.rowParams(76, 8));
         if (code.equals("library")) resume.dimmed(true);
     }
-    /** Resume / Change files / Game data rows; the likelier fix comes first and is focused. */
-    private Widgets.Row resumeRows(LinearLayout box, boolean filesFirst) {
+    /** Resume remains the primary action; sharing details never retries or changes setup. */
+    private Widgets.Row resumeRows(LinearLayout box) {
         Widgets.Row resume = new Widgets.Row(this, Strings.RESUME, Strings.RESUME_HINT, 27, 18).icon("refresh", 56, 28);
         resume.setTag("resume");
-        resume.setOnClickListener(v -> { if (!resume.dimmed()) requestNotificationsThen(() -> startSetup(SetupService.jobStages(this))); });
+        resume.setOnClickListener(v -> { if (!sharingDetails && !resume.dimmed()) requestNotificationsThen(() -> startSetup(SetupService.jobStages(this))); });
+        gameControl(resume, "Installing", () -> { if (!sharingDetails) requestNotificationsThen(() -> startSetup(SetupService.jobStages(this))); });
         Widgets.Row change = new Widgets.Row(this, Strings.CHANGE_FILES, Strings.CHANGE_FILES_HINT, 27, 18).icon("folder", 56, 28);
-        change.setTag("change"); change.setOnClickListener(v -> changeFiles());
+        change.setTag("change"); change.setOnClickListener(v -> { if (!sharingDetails) changeFiles(); });
         Widgets.Row data = new Widgets.Row(this, Strings.GAME_DATA, Strings.WELCOME_DATA_HINT, 27, 18).icon("data", 56, 28);
-        data.setTag("data"); data.setOnClickListener(v -> go(Screen.DATA));
-        for (Widgets.Row row : filesFirst ? new Widgets.Row[]{change, resume, data} : new Widgets.Row[]{resume, change, data})
-            box.addView(row, Widgets.rowParams(92, 10));
-        primary = filesFirst ? change : resume;
+        data.setTag("data"); data.setOnClickListener(v -> { if (!sharingDetails) go(Screen.DATA); });
+        for (Widgets.Row row : new Widgets.Row[]{resume, change, data}) {
+            row.dimmed(sharingDetails);
+            box.addView(row, Widgets.rowParams(screen == Screen.ERROR ? 76 : 92, screen == Screen.ERROR ? 8 : 10));
+        }
+        primary = resume;
         prompts(prompt("A", Strings.P_SELECT, v -> selectFocused()), prompt("B", Strings.P_QUIT, v -> finish()));
         return resume;
+    }
+    /** Snapshot on the worker before another setup run can clear .import; only the chooser runs on the UI thread. */
+    private void shareDetails() {
+        if (sharingDetails || SetupService.status.running) return;
+        sharingDetails = true;
+        render();
+        worker.execute(() -> {
+            JSONObject result = SetupService.lastResult(this);
+            Inputs picked = Inputs.load(this);
+            File game = StorageLocation.gameDir(this);
+            List<String> excluded = new ArrayList<>();
+            StringBuilder metadata = new StringBuilder();
+            String version = "?"; long versionCode = 0;
+            try {
+                PackageInfo info = getPackageManager().getPackageInfo(getPackageName(), 0);
+                version = info.versionName; versionCode = info.getLongVersionCode();
+            } catch (PackageManager.NameNotFoundException impossible) { }
+            metadata.append("App: ").append(version).append(" (versionCode ").append(versionCode).append(")\n")
+                    .append("Build commit: ").append(buildCommit()).append('\n')
+                    .append("Device: ").append(Build.MANUFACTURER).append(' ').append(Build.MODEL).append('\n')
+                    .append("Android: ").append(Build.VERSION.RELEASE).append(" (SDK ").append(Build.VERSION.SDK_INT).append(")\n")
+                    .append("SoC: ").append(SettingsStore.soc()).append('\n')
+                    .append("Failed stage: ").append(result.optString("stage", "setup")).append('\n')
+                    .append("Route: ").append(picked.route).append('\n');
+            StoragePaths.Kind kind = StorageLocation.kind(this);
+            metadata.append("Destination: ").append(kind == StoragePaths.Kind.PRIVATE ? "private"
+                    : kind == StoragePaths.Kind.APP ? "SD app folder" : "picked folder").append('\n');
+            metadata.append("Destination free bytes: ").append(game.getUsableSpace()).append('\n')
+                    .append("Private storage free bytes: ").append(getFilesDir().getUsableSpace()).append('\n');
+            for (String role : picked.roles()) {
+                int index = 0;
+                for (Inputs.Item item : picked.get(role)) {
+                    File direct = FileAccess.directFile(this, item.uri, item.size);
+                    excluded.add(item.uri.toString());
+                    excluded.add(item.name);
+                    if (direct != null) excluded.add(direct.getPath());
+                    metadata.append("Source ").append(role).append('[').append(++index).append("]: ")
+                            .append(direct != null ? "direct path" : "provider authority " + item.uri.getAuthority())
+                            .append("; extension ").append(SetupDetails.extension(item.name))
+                            .append("; bytes ").append(direct != null ? direct.length() : item.size).append('\n');
+                }
+                if (index == 0) metadata.append("Source ").append(role).append(": not selected\n");
+            }
+            // Longest first so a filename cannot leave the rest of a containing path or URI behind.
+            excluded.sort((a, b) -> Integer.compare(b.length(), a.length()));
+            // Scrub the message before JSON encoding, not the structural stage/code or source summaries.
+            metadata.append("Result JSON: ").append(SetupService.failure(result.optString("stage"), result.optString("code"),
+                    SetupDetails.scrub(result.optString("message"), excluded))).append('\n');
+            String report = SetupDetails.build(metadata.toString(), game, result.optString("stage"), excluded);
+            main.post(() -> {
+                sharingDetails = false;
+                if (isDestroyed() || screen != Screen.ERROR) return;
+                render();
+                Intent send = new Intent(Intent.ACTION_SEND).setType("text/plain")
+                        .putExtra(Intent.EXTRA_SUBJECT, "TotK Native setup details")
+                        .putExtra(Intent.EXTRA_TEXT, report);
+                try { startActivity(Intent.createChooser(send, Strings.SHARE_DETAILS)); }
+                catch (ActivityNotFoundException unavailable) { showNote(Strings.SHARE_DETAILS_MISSING); }
+            });
+        });
     }
     private void changeFiles() {
         SetupService.clearResult(this);
@@ -2573,12 +3183,12 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     }
     private void interrupted() {
         setupHeader(Strings.SETUP_TITLE);
-        rail(3, false);
+        rail(4, false);
         Widgets.Panel box = setupMain();
         heading(box, Strings.INTERRUPTED_TITLE, 36);
         lead(box, Strings.INTERRUPTED_BODY, 14);
         if (!note.isEmpty()) add(box, Theme.paragraph(this, note, 18, Theme.AMBER), 8);
         box.addView(Widgets.space(this), new LinearLayout.LayoutParams(-1, 0, 1));
-        resumeRows(box, false);
+        resumeRows(box);
     }
 }

@@ -81,7 +81,7 @@ static int copy_file(Move *m, Item *it) {
     if (in < 0) return st_io_fail(m->c, "open", src);
     struct stat st;
     if (fstat(in, &st) || (uint64_t)st.st_size != it->size) { close(in); setup_fail(m->c, "io", "%s changed while the game data was being moved", it->rel); return -1; }
-    if ((out = open(dst, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644)) < 0) { close(in); return st_io_fail(m->c, "create", dst); }
+    if ((out = open(dst, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644)) < 0) { rc = st_io_fail(m->c, "create", dst); close(in); return rc; }
     Sha256 sha; sha256_init(&sha); StCache cache = {0, 0, 0};
     for (uint64_t pos = 0; pos < it->size && !rc;) {
         if ((rc = cancelled(m))) break;
@@ -167,15 +167,17 @@ static int verify(Move *m) {
 }
 /* The game data of dir, install.json first so that a folder half-way through removal is never playable. */
 static int remove_game_data(const char *dir, int with_staging) {
-    char p[SETUP_PATH]; int rc = 0;
-    if (st_path(p, sizeof p, "%s/install.json", dir) || (unlink(p) && errno != ENOENT)) rc = -1;
+    char p[SETUP_PATH]; int e = 0;
+    if (st_path(p, sizeof p, "%s/install.json", dir) || (unlink(p) && errno != ENOENT)) e = errno;
     st_fsync_dir(dir);
-    for (int i = 0; i < NENTRIES; i++) if (st_path(p, sizeof p, "%s/%s", dir, entries[i]) || st_rmtree(p)) rc = -1;
+    for (int i = 0; i < NENTRIES; i++)
+        if (st_path(p, sizeof p, "%s/%s", dir, entries[i]) || st_rmtree(p)) { if (!e) e = errno; }
     if (with_staging) {
-        if (st_path(p, sizeof p, "%s/.import", dir) || st_rmtree(p)) rc = -1;
-        if (st_path(p, sizeof p, "%s/.move", dir) || st_rmtree(p)) rc = -1;
+        if (st_path(p, sizeof p, "%s/.import", dir) || st_rmtree(p)) { if (!e) e = errno; }
+        if (st_path(p, sizeof p, "%s/.move", dir) || st_rmtree(p)) { if (!e) e = errno; }
     }
-    return rc;
+    if (e) { errno = e; return -1; }
+    return 0;
 }
 /* The game lock (runtime/frontend_android.c holds it while the game runs): an open-file-description lock, so it also
    conflicts with the launcher's FileChannel.tryLock. -1 with errno EAGAIN when the game holds it. */
@@ -226,7 +228,10 @@ char *setup_move_json(const char *request, size_t len, SetupProgressFn progress_
     snprintf(c->staging, sizeof c->staging, "%s", m->stage);
     setup_progress(c, "move", 0, 0, "checking");
 
-    lock = game_lock(priv);
+    /* Android SetupService holds the JVM's shared record-lock lease throughout this call and the folder switch.
+       Do not even open this inode in that case: closing any descriptor here would release its POSIX lock. Standalone
+       callers (including host tests) still own an OFD lock for the entire move. */
+    lock = json_bool(j, "gameLockHeld") ? -2 : game_lock(priv);
     if (lock == -1) {
         if (errno == EAGAIN) setup_fail(c, "busy", "The game is running; close it before moving the game data");
         else st_io_fail(c, "open", "state/game.lock");

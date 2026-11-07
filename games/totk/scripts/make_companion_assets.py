@@ -41,7 +41,7 @@ from companion_decor import extract_decor
 
 # The APK generates the same tree on the device: android/setup/companion (C port of this script, companion_decor.py and
 # bflyt_render.py). Change both together; tests/setup/test_companion.py compares them file by file.
-GENERATOR_VERSION = 4
+GENERATOR_VERSION = 5
 COMMON = 'UI/LayoutArchive/Common.Product.140.Nin_NX_NVN.blarc.zs'
 ASTC = dict(zip(range(0x2d, 0x3b), ((4,4),(5,4),(5,5),(6,5),(6,6),(8,5),(8,6),(8,8),(10,5),(10,6),(10,8),(10,10),(12,10),(12,12))))
 LAYERS = {'G': 'Ground', 'S': 'Sky', 'U': 'UnderGround'}
@@ -127,8 +127,9 @@ def msbt(data):
     """LBL1 bucket labels -> TXT2 strings, dropping formatting/control payloads.
 
     MSBT 0x0e tags carry group, type and a byte-length payload; 0x0f closing
-    tags carry group/type only. Skip those structures rather than decoding
-    parameter bytes as UTF-16. Preserve ordinary text/newlines and ruby base text.
+    tags carry group/type only. Skip formatting parameters; declension tags
+    (201/10) contain length-prefixed grammatical forms: keep the first, the standalone/nominative name.
+    Preserve ordinary text/newlines and ruby base text.
     """
     if data[:8] != b'MsgStdBn':
         raise ValueError('Expected MSBT')
@@ -152,7 +153,12 @@ def msbt(data):
             pos += 2
             if ch == 0: break
             if ch == 0xe:
-                length = struct.unpack_from(endian + 'H', texts, pos + 4)[0]
+                group, kind, length = struct.unpack_from(endian + '3H', texts, pos)
+                if group == 201 and kind == 10:
+                    size = struct.unpack_from(endian + 'H', texts, pos + 6)[0]
+                    if length < 2 or size % 2 or size > length - 2 or pos + 6 + length > len(texts):
+                        raise ValueError('Invalid MSBT declension')
+                    pieces += texts[pos + 8:pos + 8 + size]
                 pos += 6 + length
             elif ch == 0xf:
                 pos += 4
@@ -354,17 +360,19 @@ def base_actors(reader, actor):
     return [a for a in out if not (a in seen or seen.add(a))]
 
 
-def pouch_name_sources(reader, named):
-    """Pouch actors without their own PouchContent name -> the actor whose text the pause menu shows for them.
+def pouch_name_sources(reader, named, common):
+    """Pouch/fuse actors -> their display actor, or @<AttachmentCommonName> message label.
 
-    The game's pouch text lookup (1.4.3 main 0x2193220 and its siblings) first replaces the actor with its ActorInfo
-    ActorName when that is set (Animal_Fish_A -> Item_FishGet_A, bundles -> their single actor), then reads
-    ActorMsg/PouchContent <name>_Name / _Caption. A few pouch actors have text under neither name (the opening's
-    Weapon_Sword_077 and Armor_1150_Upper); they take the text of the first named actor they are built from
-    (base_actors), the item they are a variant of. Every language has the same labels, so `named` is one language's."""
+    Pouch names use ActorInfo ActorName and the named actor's $parent chains. Fuse-only objects additionally use
+    ActorMsg/Attachment and AttachmentActorInfo.AttachmentCommonName -> StaticMsg/AttachmentCommonName. These are
+    the game's authored material names, not the adjectives used to construct a combined weapon's title.
+    """
     info = {row['__RowId']: row.get('ActorName') for row in rsdb(reader, 'ActorInfo')}
-    out = {}
-    for row in rsdb(reader, 'PouchActorInfo'):
+    attachments = rsdb(reader, 'AttachmentActorInfo')
+    out = {row['__RowId']: '@' + row['AttachmentCommonName'] for row in attachments
+           if row['__RowId'] not in named and row.get('AttachmentCommonName', '') + '_Name' in common}
+    named = named | out.keys()
+    for row in rsdb(reader, 'PouchActorInfo') + attachments:
         actor = row['__RowId']
         if actor in named or actor in out: continue
         alias = info.get(actor)
@@ -380,6 +388,8 @@ def extract_text(reader, out):
         lang = Path(path).name.split('.')[0]
         archive = sarc(reader.get(path))
         pouch = msbt(archive['ActorMsg/PouchContent.msbt'])
+        attachment = msbt(archive['ActorMsg/Attachment.msbt'])
+        common = msbt(archive['StaticMsg/AttachmentCommonName.msbt'])
         items = {}
         for label, text in pouch.items():
             for suffix, key in (('_Name', 'name'), ('_Caption', 'desc')):
@@ -388,11 +398,17 @@ def extract_text(reader, out):
                     items.setdefault(actor, {})[key] = text
                     actors.add(actor)
                     break
+        for label, text in attachment.items():
+            if label.endswith('_Name'):
+                actor = label[:-5]
+                items.setdefault(actor, {}).setdefault('name', text)
+                actors.add(actor)
         if sources is None:
-            sources = pouch_name_sources(reader, {actor for actor, item in items.items() if 'name' in item})
+            sources = pouch_name_sources(reader, {actor for actor, item in items.items() if 'name' in item}, common)
         for actor, target in sources.items():
-            if actor not in items and 'name' in items.get(target, {}):
-                items[actor] = dict(items[target])
+            source = {'name': common[target[1:] + '_Name']} if target.startswith('@') else items.get(target, {})
+            if actor not in items and 'name' in source:
+                items[actor] = dict(source)
                 actors.add(actor)
         layout = {name: msbt(data) for name, data in archive.items() if name.startswith(('LayoutMsg/', 'StaticMsg/')) and name.endswith('.msbt')}
         categories = layout['LayoutMsg/Pouch_00.msbt']

@@ -1,0 +1,84 @@
+; Hand-authored fixture: lane-dependent predicates differ across logical warps.
+; Outputs per invocation: lane, ballot.xy, shuffle, all, any, subgroup size.
+OpCapability Shader
+OpCapability GroupNonUniformBallot
+OpCapability GroupNonUniformVote
+OpCapability GroupNonUniformShuffle
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %lane %global %size %buffer
+OpExecutionMode %main LocalSize 128 1 1
+OpDecorate %lane BuiltIn SubgroupLocalInvocationId
+OpDecorate %global BuiltIn GlobalInvocationId
+OpDecorate %size BuiltIn SubgroupSize
+OpDecorate %array ArrayStride 4
+OpDecorate %block Block
+OpMemberDecorate %block 0 Offset 0
+OpDecorate %buffer DescriptorSet 0
+OpDecorate %buffer Binding 0
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%bool = OpTypeBool
+%uint = OpTypeInt 32 0
+%v3 = OpTypeVector %uint 3
+%v4 = OpTypeVector %uint 4
+%in = OpTypePointer Input %uint
+%in3 = OpTypePointer Input %v3
+%lane = OpVariable %in Input
+%size = OpVariable %in Input
+%global = OpVariable %in3 Input
+%array = OpTypeRuntimeArray %uint
+%block = OpTypeStruct %array
+%storage = OpTypePointer StorageBuffer %block
+%element = OpTypePointer StorageBuffer %uint
+%buffer = OpVariable %storage StorageBuffer
+%zero = OpConstant %uint 0
+%one = OpConstant %uint 1
+%two = OpConstant %uint 2
+%three = OpConstant %uint 3
+%four = OpConstant %uint 4
+%five = OpConstant %uint 5
+%six = OpConstant %uint 6
+%seven = OpConstant %uint 7
+%thirtyone = OpConstant %uint 31
+%thirtytwo = OpConstant %uint 32
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%lid = OpLoad %uint %lane
+%sz = OpLoad %uint %size
+%gid3 = OpLoad %v3 %global
+%gid = OpCompositeExtract %uint %gid3 0
+%group = OpUDiv %uint %gid %thirtytwo
+%odd = OpBitwiseAnd %uint %group %one
+%predicate = OpIEqual %bool %odd %zero
+%ballot = OpGroupNonUniformBallot %v4 %three %predicate
+%lo = OpCompositeExtract %uint %ballot 0
+%hi = OpCompositeExtract %uint %ballot 1
+%target = OpBitwiseXor %uint %lid %one
+%shuffle = OpGroupNonUniformShuffle %uint %three %gid %target
+%all = OpGroupNonUniformAll %bool %three %predicate
+%any = OpGroupNonUniformAny %bool %three %predicate
+%allint = OpSelect %uint %all %one %zero
+%anyint = OpSelect %uint %any %one %zero
+%offset = OpIMul %uint %gid %seven
+%p0 = OpAccessChain %element %buffer %zero %offset
+OpStore %p0 %lid
+%i1 = OpIAdd %uint %offset %one
+%p1 = OpAccessChain %element %buffer %zero %i1
+OpStore %p1 %lo
+%i2 = OpIAdd %uint %offset %two
+%p2 = OpAccessChain %element %buffer %zero %i2
+OpStore %p2 %hi
+%i3 = OpIAdd %uint %offset %three
+%p3 = OpAccessChain %element %buffer %zero %i3
+OpStore %p3 %shuffle
+%i4 = OpIAdd %uint %offset %four
+%p4 = OpAccessChain %element %buffer %zero %i4
+OpStore %p4 %allint
+%i5 = OpIAdd %uint %offset %five
+%p5 = OpAccessChain %element %buffer %zero %i5
+OpStore %p5 %anyint
+%i6 = OpIAdd %uint %offset %six
+%p6 = OpAccessChain %element %buffer %zero %i6
+OpStore %p6 %sz
+OpReturn
+OpFunctionEnd

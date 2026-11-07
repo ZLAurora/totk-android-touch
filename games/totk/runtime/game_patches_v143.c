@@ -4,6 +4,7 @@
 #include "code_guard.h"
 #include "game_patches.h"
 #include "game_version.h"
+#include "android_thermal.h"
 #include "world_survey.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,6 +36,36 @@ static const Patch fps60[] = {
     {0x2db340, 0x52800028},
     {0x2db34c, 0x1a9fa555},
 };
+
+/* Optional policy experiment: keep the measured-work calculation, candidate
+   clamps, callbacks/veto and window setter; change only the native counter
+   limits. Fixed experiment limits intentionally replace configuration overrides. */
+static void patch_fps60_hysteresis(Module *m) {
+    const char *e = getenv("TOTK_FPS60_HYSTERESIS");
+    int on = e && !strcmp(e, "1");
+    fprintf(stderr, "[totk] TOTK_FPS60_HYSTERESIS=%d: %s\n", on,
+            on ? "over limit 6 (raise on seventh consecutive over-budget call), cooldown reload 2" :
+                 "native over-limit/cooldown configuration");
+    if (!on) return;
+#if TARGET_OS_IPHONE
+    runtime_fail("TOTK_FPS60_HYSTERESIS requires a runtime-patched main");
+#else
+    static const Patch sites[] = {
+        {0x2db2b8, 0x528000cc}, /* ldr w12,[x20,#0x10] -> mov w12,#6 */
+        {0x2db354, 0x5280004c}, /* ldr w12,[x20,#0x14] -> mov w12,#2 */
+        {0x2db3f0, 0x52800049}, /* ldr w9,[x20,#0x14] -> mov w9,#2 */
+    };
+    uint32_t original[3];
+    for (unsigned i = 0; i < 3; i++)
+        if (sites[i].off + 4 > m->text_end)
+            runtime_fail("1.4.3 FPS60 hysteresis site outside text");
+    if (!code_guard(m, SITES(sites), original,
+                    "ea577c9101d653362c01f832a336c10798bc2e2845bf77fed4b26fafb51197cc"))
+        runtime_fail("1.4.3 FPS60 hysteresis original instruction mismatch");
+    for (unsigned i = 0; i < 3; i++)
+        memcpy(m->base + sites[i].off, &sites[i].replacement, 4);
+#endif
+}
 
 
 static _Atomic uint64_t *frame_step_data;
@@ -335,6 +366,63 @@ static void patch_fps60_hardening(Module *m){
         floor_enabled?"4 diagnostic markers; active scripted-camera subset only, exit clear/200ms expiry, guest/present 30fps floor (TOTK_FPS60_HARDENING=0 opts out)":
                       "cutscene floor off (framegen or TOTK_FPS60_HARDENING=0)");
 }
+
+/* The FPS60 selects override stored min=2. Clamp their RESULTS, not the stored
+ * bounds, so the game's own candidate/current update and NVN interval setter
+ * stay authoritative. Installed only with startup TOTK_THERMAL_STEP=1; off
+ * retains the original seven-word policy and allocates no thermal veneer.
+ * Each veneer preserves incoming NZCV and x16/x17, replaying its select first.
+ * The aligned literal is a single machine-word publication, with no side data. */
+#if (defined(__ANDROID__) && defined(TOTK_ANDROID_APP)) || defined(TOTK_THERMAL_PATCH_TEST)
+static void patch_thermal_step(Module *m) {
+    const char *enabled = getenv("TOTK_THERMAL_STEP");
+    if (!enabled || strcmp(enabled, "1")) return;
+    const unsigned indices[] = {1, 6, 4};
+    const unsigned destinations[] = {10, 21, 12};
+    enum { WORDS = 9, COUNT = 3, FLOOR_SLOT = 144 };
+    uint64_t stub = ((m->text_end + 15) & ~15ULL) + 916;
+    uint64_t data = ((m->file_size + 0x3fff) & ~0x3fffULL) + FLOOR_SLOT;
+    if (stub > m->size || COUNT * WORDS * 4 > m->size - stub ||
+        stub + COUNT * WORDS * 4 > ((m->text_end + 0xfff) & ~0xfffULL) ||
+        data > m->size || 4 > m->size - data)
+        runtime_fail("1.4.3 thermal veneer layout");
+    for (unsigned i = 0; i < COUNT; i++) {
+        uint32_t word;
+        memcpy(&word, m->base + fps60[indices[i]].off, 4);
+        if (word != fps60[indices[i]].replacement)
+            runtime_fail("1.4.3 thermal FPS60 select mismatch");
+    }
+    for (unsigned i = 0; i < COUNT * WORDS * 4; i++)
+        if (m->base[stub + i]) runtime_fail("1.4.3 thermal veneer padding in use");
+    for (unsigned i = 0; i < 4; i++)
+        if (m->base[data + i]) runtime_fail("1.4.3 thermal data padding in use");
+    uint32_t code[COUNT * WORDS], jumps[COUNT];
+    for (unsigned i = 0; i < COUNT; i++) {
+        uint64_t at = stub + i * WORDS * 4;
+        int64_t delta = (int64_t)data - (int64_t)(at + 12);
+        if ((delta & 3) || delta < -(1 << 20) || delta >= (1 << 20))
+            runtime_fail("1.4.3 thermal literal outside range");
+        unsigned d = destinations[i], index = indices[i];
+        uint32_t veneer[] = {
+            fps60[index].replacement,
+            0xa9bf47f0, 0xd53b4210, /* save x16/x17; mrs x16,nzcv */
+            0x18000011u | (((uint32_t)(delta >> 2) & 0x7ffff) << 5),
+            0x6b11001fu | (d << 5), /* cmp wD,w17 (floor) */
+            0x1a912000u | (d << 5) | d, /* csel wD,wD,w17,hs */
+            0xd51b4210, 0xa8c147f0, /* msr nzcv,x16; restore x16/x17 */
+            branch(at + 32, fps60[index].off + 4),
+        };
+        memcpy(code + i * WORDS, veneer, sizeof veneer);
+        jumps[i] = branch(fps60[index].off, at);
+    }
+    uint32_t floor = 1;
+    memcpy(m->base + data, &floor, 4);
+    memcpy(m->base + stub, code, sizeof code);
+    for (unsigned i = 0; i < COUNT; i++)
+        memcpy(m->base + fps60[indices[i]].off, jumps + i, 4);
+    runtime_thermal_bind((_Atomic uint32_t *)(void *)(m->base + data));
+}
+#endif
 /* The actor animation update has a second, unscaled clock for cloth/hair
  * (ordinary animation already receives FrameRateMgr's real-time step). Its
  * explicit time-factor path still constructs {factor / 30, factor} every
@@ -904,6 +992,7 @@ void runtime_game_patches(Module *m) {
     const char *enabled = getenv("TOTK_FPS60");
     if (enabled && !strcmp(enabled, "0")) {
         fprintf(stderr, "[totk] 1.4.3 shipping frame controller (TOTK_FPS60=0)\n");
+        fprintf(stderr, "[totk] TOTK_FPS60_HYSTERESIS=0: inactive in shipping-30 mode\n");
         return;
     }
 #if !TARGET_OS_IPHONE
@@ -923,7 +1012,11 @@ void runtime_game_patches(Module *m) {
         memcpy(m->base + fps60[i].off, &fps60[i].replacement, 4);
  #endif
     fprintf(stderr, "[totk] 1.4.3 60 FPS: seven verified controller instructions; original game frame-time calculation\n");
+    patch_fps60_hysteresis(m);
     patch_fps60_hardening(m);
+    #if defined(__ANDROID__) && defined(TOTK_ANDROID_APP)
+    patch_thermal_step(m);
+    #endif
 }
 
 /* New display configuration object: +0x10 is display 0's canvas size, +0x508

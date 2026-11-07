@@ -264,11 +264,13 @@ int tab_write(TabModule *const mods[3], const char *path, char sha256_hex[65], c
         for (size_t o = 0; o < pn[k];) {
             ssize_t w = write(fd, (const uint8_t *)pp[k] + o, pn[k] - o);
             if (w < 0 && errno == EINTR) continue;
-            if (w <= 0) { close(fd); unlink(part); E("cannot write %s: %s", part, w ? strerror(errno) : "no space"); }
+            if (w <= 0) { int e = errno; close(fd); unlink(part); E("cannot write %s: %s", part, w ? strerror(e) : "no space"); }
             o += (size_t)w;
         }
     }
-    if (fsync(fd) < 0 || close(fd) < 0 || rename(part, path) < 0) { unlink(part); E("cannot write %s: %s", path, strerror(errno)); }
+    if (fsync(fd) < 0) { int e = errno; close(fd); unlink(part); E("cannot sync %s: %s", path, strerror(e)); }
+    if (close(fd) < 0) { int e = errno; unlink(part); E("cannot close %s: %s", path, strerror(e)); }
+    if (rename(part, path) < 0) { int e = errno; unlink(part); E("cannot rename %s: %s", path, strerror(e)); }
     if (sha256_hex) rw_sha256_hex(&s, sha256_hex);
     rc = RW_OK;
 fail:

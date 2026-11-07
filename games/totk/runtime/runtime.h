@@ -32,6 +32,10 @@ void runtime_swkbd_probe(void);
 void runtime_swkbd_selftest(void);
 void runtime_dump_threads(void);   /* threads.c: every guest thread's wait state and guest return chain (TOTK_INPUT_FILE "threads") */   /* diagnostic "kbtest": show the text entry bar from a thread of its own */
 void runtime_thread_diag_start(void); /* optional thread diagnostics; Android app defers until environment setup */
+/* threads.c stall watchdog: single present-thread writer, reusing its monotonic timestamp and graphics frame number.
+   stage must be an immutable string with static lifetime; held marks a loading stage. */
+void runtime_progress_mark(uint64_t at_ns, uint64_t frame, const char *stage, int held);
+void runtime_progress_pause(int paused);                 /* threads.c stall watchdog: background / no window */
 void runtime_frame_step_pin(double ms);                  /* game_patches.c: pin the real-time frame step (diagnostics), 0 = real time */
 void runtime_frame_step_update(uint64_t now_ns);
 float runtime_frame_step_seconds(void);                  /* 1.4.3 adaptive: take post-selector producer ticks / 60 once; 0 if uncaptured/invalid/pinned/unselected */
@@ -53,6 +57,9 @@ void runtime_core_back(int *away);
 void dm_core_wait_stats(uint64_t *self_ns, uint64_t *all_ns, uint64_t *all_n);
 void runtime_save_probe(void);
 int runtime_fs_save_busy(void);   /* runtime/fs_host.c: the game is writing save data (window close waits) */
+int runtime_fs_save_pending(void); /* frame suspension: includes uncommitted saves with long gaps between files */
+int runtime_fs_begin_close(void); /* Android: refuse busy saves; on success hold new save changes until process exit */
+int runtime_front_request_close(void); /* 1 accepted (possibly queued), 0 refused; diagnostic input keeps reading on refusal */
 uint8_t *runtime_module_base(const char *name);   /* runtime/loader.c: "main", "subsdk0", "sdk" (probes) */
 uint64_t runtime_module_permission(uint64_t address,uint64_t size,unsigned permission);
 uint64_t runtime_module_lock_permission(uint64_t address,uint64_t size,unsigned mask,unsigned attribute);

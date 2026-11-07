@@ -1,5 +1,5 @@
 /* setup_stage_companion: the dual-screen companion's assets (the Purah Pad pages) made on the phone from the player's own
-   RomFS, the tree scripts/make_companion_assets.py writes on a PC (GENERATOR_VERSION 4): index.json, text/<lang>.json,
+   RomFS, the tree scripts/make_companion_assets.py writes on a PC (GENERATOR_VERSION 5): index.json, text/<lang>.json,
    icons/, ui/, decor/ (companion_decor.py), map/<Layer>/<lod>/ + overview.webp + markers.json, fonts/main.otf.
      1. text: which actor's text each unnamed pouch actor shows (pouch_name_sources), then every Mals/<lang> archive in
         parallel (the actor set selects the icons),
@@ -23,7 +23,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define GENERATOR_VERSION 4
+#define GENERATOR_VERSION 5
 #define SIZE_LIMIT (120ull << 20)
 #define MAX_WORKERS 8   /* make_companion_assets.py --jobs default: up to 8 */
 #define COMMON "UI/LayoutArchive/Common.Product.140.Nin_NX_NVN.blarc.zs"
@@ -94,7 +94,7 @@ typedef struct {
     SetupCtx *c; CgOut out; SeedRomfs romfs; SeedDicts *dicts; int workers;
     /* phase 1: text */
     int64_t *lang_entries; size_t nlang; char **lang_names; char ***lang_actors; size_t *lang_nactors;
-    Pair *sources; size_t nsources;   /* pouch_name_sources(): pouch actor -> the actor whose text it shows */
+    Pair *sources; size_t nsources;   /* actor -> display actor, or @<AttachmentCommonName> message label */
     /* phase 2 */
     uint8_t *common; size_t common_n; SarcMember *archive; size_t narchive;
     const uint8_t *combined; size_t combined_n; CgTex *tex; size_t ntex;
@@ -194,15 +194,19 @@ static int text_task(void *sp, SeedDecoder *dec, size_t li) {
     Stage *s = sp; SeedErr *err = &s->out.err;
     const char *path = seed_romfs_name(&s->romfs, (uint64_t)s->lang_entries[li]);
     uint8_t *data = NULL; size_t n; SarcMember *m = NULL; size_t nm = 0;
-    CgMsg *pouch = NULL, *places = NULL; size_t npouch = 0, nplaces = 0;
+    CgMsg *pouch = NULL, *attachment = NULL, *common = NULL, *places = NULL;
+    size_t npouch = 0, nattachment = 0, ncommon = 0, nplaces = 0;
     struct { const char *name; CgMsg *m; size_t n; } *layout = NULL; size_t nlayout = 0;
     Item *items = NULL; size_t nitems = 0;
     Buf b = { 0 }; int rc = -1;
     if (romfs_get(s, dec, path, &data, &n) || seed_sarc(data, n, &m, &nm, err)) goto done;
     const SarcMember *pm = member(m, nm, "ActorMsg/PouchContent.msbt"), *lm = member(m, nm, "LocationMsg/Location.msbt");
-    if (!pm || !lm) { seed_err(err, "internal", "%s lacks the pouch or location text", path); goto done; }
-    if (cg_msbt(pm->data, pm->size, &pouch, &npouch, err) || cg_msbt(lm->data, lm->size, &places, &nplaces, err)) goto done;
-    if (!(items = calloc(npouch + s->nsources ? npouch + s->nsources : 1, sizeof *items)) || !(layout = calloc(nm ? nm : 1, sizeof *layout))) { fail_oom(s); goto done; }
+    const SarcMember *am = member(m, nm, "ActorMsg/Attachment.msbt"), *cm = member(m, nm, "StaticMsg/AttachmentCommonName.msbt");
+    if (!pm || !lm || !am || !cm) { seed_err(err, "internal", "%s lacks pouch, attachment or location text", path); goto done; }
+    if (cg_msbt(pm->data, pm->size, &pouch, &npouch, err) || cg_msbt(lm->data, lm->size, &places, &nplaces, err) ||
+        cg_msbt(am->data, am->size, &attachment, &nattachment, err) || cg_msbt(cm->data, cm->size, &common, &ncommon, err)) goto done;
+    size_t capacity = npouch + nattachment + s->nsources;
+    if (!(items = calloc(capacity ? capacity : 1, sizeof *items)) || !(layout = calloc(nm ? nm : 1, sizeof *layout))) { fail_oom(s); goto done; }
     for (size_t i = 0; i < npouch; i++) {
         const char *label = pouch[i].label; size_t len = strlen(label); int desc;
         if (ends(label, "_Name")) { desc = 0; len -= 5; }
@@ -216,8 +220,26 @@ static int text_task(void *sp, SeedDecoder *dec, size_t li) {
         }
         if (desc) items[j].desc = pouch[i].text; else items[j].name = pouch[i].text;
     }
+    for (size_t i = 0; i < nattachment; i++) {
+        if (!ends(attachment[i].label, "_Name")) continue;
+        size_t len = strlen(attachment[i].label) - 5, j = 0;
+        while (j < nitems && (strlen(items[j].actor) != len || strncmp(items[j].actor, attachment[i].label, len))) j++;
+        if (j == nitems) {
+            if (!(items[j].actor = strndup(attachment[i].label, len))) { fail_oom(s); goto done; }
+            nitems++;
+        }
+        if (!items[j].name) items[j].name = attachment[i].text;
+    }
     for (size_t i = 0; i < s->nsources; i++) {   /* items[actor] = dict(items[target]) */
-        const Item *t = find_item(items, nitems, s->sources[i].value);
+        const char *source = s->sources[i].value;
+        Item shared = { 0 };
+        const Item *t;
+        if (*source == '@') {
+            char label[160];
+            snprintf(label, sizeof label, "%s_Name", source + 1);
+            shared.name = cg_msg_get(common, ncommon, label);
+            t = &shared;
+        } else t = find_item(items, nitems, source);
         if (find_item(items, nitems, s->sources[i].key) || !t || !t->name) continue;
         if (!(items[nitems].actor = strdup(s->sources[i].key))) { fail_oom(s); goto done; }
         items[nitems].name = t->name; items[nitems].desc = t->desc; items[nitems].desc_first = t->desc_first;
@@ -300,6 +322,7 @@ done:
     for (size_t i = 0; i < nitems; i++) free(items[i].actor);
     for (size_t i = 0; layout && i < nlayout; i++) cg_msbt_free(layout[i].m, layout[i].n);
     free(items); free(layout); cg_msbt_free(pouch, npouch); cg_msbt_free(places, nplaces); free(m); free(data); buf_free(&b);
+    cg_msbt_free(attachment, nattachment); cg_msbt_free(common, ncommon);
     return rc;
 }
 
@@ -554,12 +577,10 @@ static int pair_set(Pair **v, size_t *n, size_t *cap, const char *key, const cha
 }
 static int cmp_str(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
 
-/* pouch_name_sources(): pouch actors without their own PouchContent name -> the actor whose text the pause menu shows
-   for them. The game's pouch text lookup (1.4.3 main 0x2193220 and its siblings) first replaces the actor with its
-   ActorInfo ActorName when that is set (Animal_Fish_A -> Item_FishGet_A, bundles -> their single actor), then reads
-   ActorMsg/PouchContent <name>_Name / _Caption. The few pouch actors with text under neither name (the opening's
-   Weapon_Sword_077 and Armor_1150_Upper) take the text of the first named actor they are built from (base_target),
-   the item they are a variant of. Every language has the same labels, so the first language's decide. */
+/* pouch_name_sources(): actors without their own pouch/attachment name -> a display actor, or an
+   @AttachmentCommonName label. Fuse-only objects take their material names from ActorMsg/Attachment or
+   AttachmentActorInfo.AttachmentCommonName -> StaticMsg/AttachmentCommonName, not the weapon-title adjectives.
+   ActorInfo ActorName aliases and the first named $parent handle actor variants in both tables. */
 static int rsdb_rows(Stage *s, SeedDecoder *dec, const char *table, uint8_t **data, CgVal **rows) {
     char prefix[64]; const char *path = NULL; size_t found = 0, n;
     snprintf(prefix, sizeof prefix, "RSDB/%s.Product.", table);
@@ -637,29 +658,49 @@ done:
 typedef struct { const char *row, *name; } ActorName;
 static int by_row(const void *a, const void *b) { return strcmp(((const ActorName *)a)->row, ((const ActorName *)b)->row); }
 static int pouch_name_sources(Stage *s, SeedDecoder *dec) {
-    uint8_t *mals = NULL, *info_data = NULL, *pouch_data = NULL; size_t n, nm = 0, nmsg = 0, cap = 0, ninfo = 0;
-    SarcMember *m = NULL; CgMsg *msg = NULL; CgVal *info = NULL, *pouch = NULL; ActorName *names = NULL;
+    uint8_t *mals = NULL, *info_data = NULL, *pouch_data = NULL, *attach_data = NULL;
+    size_t n, nm = 0, nmsg = 0, ncommon = 0, cap = 0, ninfo = 0;
+    SarcMember *m = NULL; CgMsg *msg = NULL, *common = NULL;
+    CgVal *info = NULL, *pouch = NULL, *attach = NULL; ActorName *names = NULL;
     StrSet named = { 0 }; int rc = -1;
     if (!s->nlang) return 0;
     if (romfs_get(s, dec, seed_romfs_name(&s->romfs, (uint64_t)s->lang_entries[0]), &mals, &n) || seed_sarc(mals, n, &m, &nm, &s->out.err)) goto done;
-    const SarcMember *pm = member(m, nm, "ActorMsg/PouchContent.msbt");
-    if (!pm) { seed_err(&s->out.err, "internal", "%s lacks the pouch text", s->lang_names[0]); goto done; }
-    if (cg_msbt(pm->data, pm->size, &msg, &nmsg, &s->out.err)) goto done;
-    for (size_t i = 0; i < nmsg; i++) {
-        size_t len = strlen(msg[i].label);
-        if (!ends(msg[i].label, "_Name")) continue;
-        msg[i].label[len - 5] = 0;
-        if (set_add(&named, msg[i].label)) { fail_oom(s); goto done; }
+    for (int table = 0; table < 2; table++) {
+        const SarcMember *pm = member(m, nm, table ? "ActorMsg/Attachment.msbt" : "ActorMsg/PouchContent.msbt");
+        if (!pm) { seed_err(&s->out.err, "internal", "%s lacks pouch or attachment text", s->lang_names[0]); goto done; }
+        if (cg_msbt(pm->data, pm->size, &msg, &nmsg, &s->out.err)) goto done;
+        for (size_t i = 0; i < nmsg; i++) {
+            size_t len = strlen(msg[i].label);
+            if (!ends(msg[i].label, "_Name")) continue;
+            msg[i].label[len - 5] = 0;
+            if (set_add(&named, msg[i].label)) { fail_oom(s); goto done; }
+        }
+        cg_msbt_free(msg, nmsg); msg = NULL; nmsg = 0;
     }
-    if (rsdb_rows(s, dec, "ActorInfo", &info_data, &info) || rsdb_rows(s, dec, "PouchActorInfo", &pouch_data, &pouch)) goto done;
+    const SarcMember *cm = member(m, nm, "StaticMsg/AttachmentCommonName.msbt");
+    if (!cm) { seed_err(&s->out.err, "internal", "%s lacks common attachment text", s->lang_names[0]); goto done; }
+    if (cg_msbt(cm->data, cm->size, &common, &ncommon, &s->out.err) ||
+        rsdb_rows(s, dec, "ActorInfo", &info_data, &info) || rsdb_rows(s, dec, "PouchActorInfo", &pouch_data, &pouch) ||
+        rsdb_rows(s, dec, "AttachmentActorInfo", &attach_data, &attach)) goto done;
+    for (size_t i = 0; i < attach->n; i++) {
+        const char *actor = row_str(&attach->items[i], "__RowId"), *name = row_str(&attach->items[i], "AttachmentCommonName");
+        if (!actor || !name || set_has(&named, actor)) continue;
+        char label[160], target[160];
+        snprintf(label, sizeof label, "%s_Name", name);
+        if (!cg_msg_get(common, ncommon, label)) continue;
+        snprintf(target, sizeof target, "@%s", name);
+        if (pair_set(&s->sources, &s->nsources, &cap, actor, target)) { fail_oom(s); goto done; }
+    }
+    for (size_t i = 0; i < s->nsources; i++) if (set_add(&named, s->sources[i].key)) { fail_oom(s); goto done; }
     if (!(names = malloc((info->n ? info->n : 1) * sizeof *names))) { fail_oom(s); goto done; }
     for (size_t i = 0; i < info->n; i++) {
         const char *row = row_str(&info->items[i], "__RowId");
         if (row) { names[ninfo].row = row; names[ninfo++].name = row_str(&info->items[i], "ActorName"); }
     }
     qsort(names, ninfo, sizeof *names, by_row);
-    for (size_t i = 0; i < pouch->n; i++) {
-        const char *actor = row_str(&pouch->items[i], "__RowId");
+    for (size_t i = 0; i < pouch->n + attach->n; i++) {
+        const CgVal *row = i < pouch->n ? &pouch->items[i] : &attach->items[i - pouch->n];
+        const char *actor = row_str(row, "__RowId");
         if (!actor || set_has(&named, actor)) continue;
         int seen = 0;
         for (size_t k = 0; k < s->nsources && !seen; k++) seen = !strcmp(s->sources[k].key, actor);
@@ -673,8 +714,8 @@ static int pouch_name_sources(Stage *s, SeedDecoder *dec) {
     }
     rc = 0;
 done:
-    free(names); cg_val_free(info); cg_val_free(pouch); free(info_data); free(pouch_data);
-    cg_msbt_free(msg, nmsg); free(m); free(mals); set_free(&named);
+    free(names); cg_val_free(info); cg_val_free(pouch); cg_val_free(attach); free(info_data); free(pouch_data); free(attach_data);
+    cg_msbt_free(msg, nmsg); cg_msbt_free(common, ncommon); free(m); free(mals); set_free(&named);
     return rc;
 }
 static int icon_jobs(Stage *s, SeedDecoder *dec, const StrSet *actors, size_t *cap, Buf *icons_json, Buf *aliases_json) {

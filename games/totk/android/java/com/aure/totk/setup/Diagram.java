@@ -32,7 +32,7 @@ final class Diagram extends View {
             case "frame_rate": case "frame_gen": return 150;
             case "latency": case "audio_latency": case "aa": return 200;
             case "game_language": return 170;
-            case "rumble": case "motion": return 0;   // text and facts only
+            case "gpu_feed": case "rumble": case "motion": return 0;   // text and facts only
             default: return 300;
         }
     }

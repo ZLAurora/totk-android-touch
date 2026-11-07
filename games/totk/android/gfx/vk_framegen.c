@@ -1941,7 +1941,9 @@ static void fg_writer_dispatch(VkCommandBuffer cb, unsigned index, unsigned phas
     vkCmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_COMPUTE,FW.pipeline);
     vkCmdBindDescriptorSets(cb,VK_PIPELINE_BIND_POINT_COMPUTE,FW.layout,0,1,&w->set,0,NULL);
     vkCmdPushConstants(cb,FW.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof push,push);
+    if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "framegen");
     vkCmdDispatch(cb,(uint32_t)(((uint64_t)s->authority_w*s->authority_h+255)/256),1,1);
+    if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
 }
 int vk_fg_writer_end(VkCommandBuffer cb, vk_tex *depth, unsigned level, unsigned layer, uint64_t draws) {
     if (!vk_fg_writer_diag()) return 1;
@@ -2186,7 +2188,9 @@ static void fg_authority_span_dispatch(VkCommandBuffer cb, fg_source *s, unsigne
     uint32_t push[4]={phase,s->authority_w,s->authority_h,0};
     vkCmdPushConstants(cb,F.authority_layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof push,push);
     vkCmdPushConstants(cb,F.authority_layout,VK_SHADER_STAGE_COMPUTE_BIT,80,sizeof s->span_rect,s->span_rect);
+    if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "framegen");
     vkCmdDispatch(cb,(uint32_t)(((uint64_t)s->span_rect[2]*s->span_rect[3]+255)/256),1,1);
+    if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
     fg_buffer_barrier(cb,&s->spans,VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
         VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,VK_ACCESS_2_MEMORY_READ_BIT|VK_ACCESS_2_MEMORY_WRITE_BIT);
 }
@@ -2277,7 +2281,9 @@ static void fg_authority_compare(VkCommandBuffer cb, vk_tex *depth, unsigned dl,
        Only observed final==last-after unknown/experimental states contribute. */
     uint32_t push[4]={0,s->authority_w,s->authority_h,!!s->experimental_spans};
     vkCmdPushConstants(cb,F.authority_layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof push,push);
+    if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "framegen");
     vkCmdDispatch(cb,s->authority_h,1,1);
+    if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
     fg_buffer_barrier(cb,&s->authority,VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT|VK_PIPELINE_STAGE_2_COPY_BIT,
         VK_ACCESS_2_SHADER_STORAGE_READ_BIT|VK_ACCESS_2_TRANSFER_READ_BIT);
@@ -2348,7 +2354,9 @@ static int fg_pair_dilate(VkCommandBuffer cb, fg_source *s, fg_source *old) {
             fg_profile_source_begin(cb,index,profile+i);
             push.phase=phases[i];
             vkCmdPushConstants(cb,F.authority_layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof push,&push);
+            if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "framegen");
             vkCmdDispatch(cb,i==0 ? 1 : coarse_groups,1,1);
+            if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
             fg_buffer_barrier(cb,pair,VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT|VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT|VK_PIPELINE_STAGE_2_COPY_BIT,
                 VK_ACCESS_2_SHADER_STORAGE_READ_BIT|VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT|VK_ACCESS_2_TRANSFER_READ_BIT);
@@ -2730,7 +2738,9 @@ static void fg_render_record(VkCommandBuffer cb, fg_source *s, fg_image *target,
 }
 static void fg_render(VkCommandBuffer cb,fg_source *s,fg_image *target,VkPipeline pipeline,
         VkImageView final,VkImageLayout final_layout,float mode) {
+    if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "framegen");
     fg_render_record(cb,s,target,pipeline,final,final_layout,mode,0);
+    if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
 }
 static int fg_scale_scene(VkCommandBuffer cb, fg_source *s, fg_image *input, fg_image *target) {
     vk_post_output dst={target->image,target->raw,target->w,target->h,vk_fg_raw_format(target->format)},scratch={0};

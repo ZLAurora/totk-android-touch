@@ -7,7 +7,10 @@
      line, like the variables run.sh takes in front). Without install.json saying "playable" the game does not start;
    - the Vulkan driver: the player's driver.so (copied into private storage), else the Turnip the APK bundles
      (libtotk_turnip.so beside this library, used in place), else the system's;
-   - the log: stdout and stderr go to totk.log in that folder and to logcat (tag "totk");
+   - the log: stdout and stderr go to totk.log in that folder, which a low-priority thread copies to logcat (tag "totk",
+     log_mirror.h; TOTK_LOGCAT=1 opts into the copy, off by default);
+   - live switches: <game folder>/totk.ctl, followed by another low-priority thread and applied at the next presented
+     frame (live_ctl.h; tools/bench/live.sh writes it);
    - the window: handed to the Vulkan backend's AHB presenter or automatic copy fallback (vk_draw.c);
    - input: the built-in controller (the AYN Thor's) or any gamepad, mapped to the Switch's buttons by position;
    - a full-screen landscape window kept on while the game runs.
@@ -32,6 +35,9 @@
 #include <stdatomic.h>
 #include "present_clock.h"
 #include "thread_place.h"
+#include "log_mirror.h"
+#include "live_ctl.h"
+#include "thread_sampler.h"
 #include "build_kind.h"
 #include <android/api-level.h>
 #include <android/choreographer.h>
@@ -56,6 +62,22 @@
 #include "adreno_gmem.h"
 #include "overlay_chord.h"
 int totk_host_main(int argc, char **argv);
+#include "android_pause.h"
+static AndroidGamePause game_pause = ANDROID_GAME_PAUSE_INIT;
+int runtime_android_game_paused(void) {
+    return atomic_load_explicit(&game_pause.paused, memory_order_acquire);
+}
+AndroidGameSuspension runtime_android_game_suspension(void) {
+    return android_game_pause_suspension(&game_pause);
+}
+void runtime_android_game_pause_wait(void) {
+    if (!runtime_android_game_paused() || runtime_fs_save_pending()) return;
+    uint64_t begin = runtime_now_ns();
+    fprintf(stderr, "[totk-app] paused at guest frame boundary\n");
+    android_game_pause_wait(&game_pause, runtime_fs_save_pending);
+    fprintf(stderr, "[totk-app] frame boundary released after %.3f s (%s)\n",
+            (runtime_now_ns() - begin) / 1e9, runtime_android_game_paused() ? "finishing save" : "resumed");
+}
 uint64_t vk_window_set(ANativeWindow *window, ANativeWindow *surface_parent, int display_id);   /* android/gfx/vk_draw.c */
 void vk_window_resized(ANativeWindow *window, uint64_t epoch);   /* android/gfx/vk_draw.c */
 void vk_window_transform_hint(ANativeWindow *window, uint64_t epoch, int hint);   /* android/gfx/vk_draw.c */
@@ -66,6 +88,8 @@ int vk_overlay_cycle(void);   /* android/gfx/vk_overlay.c */
 extern void runtime_fps_adaptive_lifecycle(int window, int paused) __attribute__((weak));
 extern void runtime_fps_adaptive_pipeline(uint64_t now) __attribute__((weak));
 extern void runtime_fps_adaptive_grace(uint64_t now, uint64_t duration) __attribute__((weak));
+extern void vk_gpuprof_identity(const char *commit, const char *package, uint64_t version, const char *build) __attribute__((weak));
+extern void vk_gpuprof_shutdown(void) __attribute__((weak));
 
 static char g_data[1024];                    /* the game folder (shared storage) */
 static ANativeActivity *g_activity;
@@ -116,13 +140,16 @@ static void present_timeline_invalidate_locked(void) {
         adaptive_slots_epoch_ns = runtime_now_ns();
 }
 /* -1 leaves that lifecycle facet unchanged. Record events even before startup
- * admission, since NativeActivity may publish its first window first. */
+ * admission, since NativeActivity may publish its first window first. The stall
+ * watchdog (threads.c) also pauses without a window or in the background. */
 static void present_timeline_lifecycle(int window, int paused) {
     pthread_mutex_lock(&display_mu);
     if (window >= 0) present_timeline_window = window;
     if (paused >= 0) present_timeline_paused = paused;
     present_timeline_invalidate_locked();
+    int watch_paused = !present_timeline_window || present_timeline_paused;
     pthread_mutex_unlock(&display_mu);
+    runtime_progress_pause(watch_paused);
     if (runtime_fps_adaptive_lifecycle) runtime_fps_adaptive_lifecycle(window, paused);
 }
 
@@ -1017,12 +1044,13 @@ static void display_frame(int64_t frame_ns, void *arg) {
 }
 static void display_vsync(const AChoreographerFrameCallbackData *data, void *arg) {
     AChoreographer *choreographer = arg;
+    totk_live_slack_tick();   /* a live TOTK_TIMER_SLACK_NS: this thread applies it itself */
     display_frame_observe(present_timeline_api.frame_time(data), data);
     present_timeline_api.post_vsync(choreographer, display_vsync, choreographer);
 }
 static void *display_thread(void *arg) {
     (void)arg;
-    pthread_setname_np(pthread_self(), "totk-vsync");
+    totk_thread_start("totk-vsync", NULL);
     if (!ALooper_prepare(ALOOPER_PREPARE_ALLOW_NON_CALLBACKS)) runtime_fail("display Looper");
     AChoreographer *choreographer = AChoreographer_getInstance();
     if (!choreographer) runtime_fail("display Choreographer");
@@ -1093,25 +1121,116 @@ static int android_display_vsync_start(void) {
     return display_pace_on;
 }
 
-/* ---------- log: stdout / stderr -> totk.log ----------
+/* ---------- log: stdout / stderr -> totk.log, mirrored to logcat ----------
    Straight into the file, not through a pipe and a reader thread: a failure that ends the process with _exit (or a
    signal) would lose whatever the thread had not yet copied, which is exactly the message that says why. */
 static int g_log_fd = -1;
+static char g_log_path[1100];
 static void log_start(void) {
-    char path[1100]; snprintf(path, sizeof path, "%s/totk.log", g_data);
-    g_log_fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND | O_CLOEXEC, 0644);
-    if (g_log_fd < 0) { __android_log_print(ANDROID_LOG_ERROR, "totk", "cannot open %s: %s", path, strerror(errno)); return; }
+    snprintf(g_log_path, sizeof g_log_path, "%s/totk.log", g_data);
+    g_log_fd = open(g_log_path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND | O_CLOEXEC, 0644);
+    if (g_log_fd < 0) { __android_log_print(ANDROID_LOG_ERROR, "totk", "cannot open %s: %s", g_log_path, strerror(errno)); return; }
     dup2(g_log_fd, 1); dup2(g_log_fd, 2);
     setvbuf(stdout, NULL, _IOLBF, 0); setvbuf(stderr, NULL, _IONBF, 0);
-    __android_log_print(ANDROID_LOG_INFO, "totk", "log: %s", path);
+    __android_log_print(ANDROID_LOG_INFO, "totk", "log: %s", g_log_path);
+}
+/* The logcat copy (log_mirror.h): a thread that sleeps until totk.log grows, then copies its new complete lines with
+   tag "totk" (FATAL / CRASH / device lost as errors, red messages as warnings). It runs at nice 10, on the slower CPUs
+   when the device has them, and reads the file from its start, so lines written before it started are copied too.
+   TOTK_LOGCAT=1 (totk.env) opts in, off by default; started after the environment files, or at a refusal before them. */
+static log_mirror_tail g_log_tail;
+static void log_mirror_logcat(void *context, int level, const char *line) {
+    (void)context;
+    __android_log_write(level == LOG_MIRROR_ERROR ? ANDROID_LOG_ERROR : level == LOG_MIRROR_WARN ? ANDROID_LOG_WARN : ANDROID_LOG_INFO,
+                        "totk", line);
+}
+static void *log_mirror_thread(void *arg) {
+    (void)arg; totk_thread_start("totk-logcat", NULL);
+    errno = 0; int nice_error = setpriority(PRIO_PROCESS, 0, 10) ? errno : 0;
+    cpu_set_t allowed, slow; unsigned capacity[CPU_SETSIZE]; const char *source, *decision = "unchanged";
+    if (!sched_getaffinity(0, sizeof allowed, &allowed)) {
+        totk_thread_background_select("/sys/devices/system/cpu", &allowed, &slow, capacity, &source, &decision);
+        if (!CPU_EQUAL(&slow, &allowed) && sched_setaffinity(0, sizeof slow, &slow)) decision = "unchanged (setaffinity failed)";
+    }
+    fprintf(stderr, "[totk-logcat] on (TOTK_LOGCAT=1): totk.log -> logcat tag totk, wake=%s nice=%d%s cpus=%s\n",
+            g_log_tail.watch >= 0 ? "inotify" : "poll 20 ms", getpriority(PRIO_PROCESS, 0), nice_error ? " (setpriority failed)" : "", decision);
+    log_mirror_run(&g_log_tail);
+    return NULL;
+}
+static void log_mirror_start(void) {
+    static int started;
+    if (started || g_log_fd < 0) return;
+    started = 1;
+    const char *value = getenv("TOTK_LOGCAT");
+    if (!log_mirror_enabled(value)) { fprintf(stderr, "[totk-logcat] off (TOTK_LOGCAT!=1): totk.log only\n"); return; }
+    g_log_tail.path = g_log_path; g_log_tail.emit = log_mirror_logcat;
+    int error = log_mirror_open(&g_log_tail);
+    pthread_t thread;
+    if (!error) error = pthread_create(&thread, NULL, log_mirror_thread, NULL);
+    if (error) { fprintf(stderr, "[totk-logcat] off: %s\n", strerror(error)); return; }
+    pthread_detach(thread);
+}
+/* Live switches (live_ctl.h): a thread that sleeps until <game>/totk.ctl grows (or is created) and stages its new
+   lines; the present path applies them (runtime_live_frame). Nice 10 on the slower CPUs, like the logcat copy. Lines
+   written before this start are not replayed. */
+static totk_live_reader g_live_reader;
+static char g_live_path[1100];
+/* Nice 10 on the slower CPUs, when the device has them: the background threads below. Returns the CPU decision. */
+static const char *background_place(int *nice_error) {
+    errno = 0; *nice_error = setpriority(PRIO_PROCESS, 0, 10) ? errno : 0;
+    cpu_set_t allowed, slow; unsigned capacity[CPU_SETSIZE]; const char *source, *decision = "unchanged";
+    if (!sched_getaffinity(0, sizeof allowed, &allowed)) {
+        totk_thread_background_select("/sys/devices/system/cpu", &allowed, &slow, capacity, &source, &decision);
+        if (!CPU_EQUAL(&slow, &allowed) && sched_setaffinity(0, sizeof slow, &slow)) decision = "unchanged (setaffinity failed)";
+    }
+    return decision;
+}
+/* Thread sampler (thread_sampler.h): TOTK_THREAD_SAMPLER=1 (default off, live through totk.ctl) names the threads that
+   ran most in each long frame and every 300 presents, in totk.log. The present path starts its thread at the first
+   frame with the switch on; with it off the frame hook is one compare. */
+static totk_sampler g_sampler;
+static int g_sampler_launch;
+static totk_live_cache g_sampler_live;
+static void sampler_thread_init(void) {
+    totk_thread_start("totk-tsample", NULL);
+    int nice_error; const char *decision = background_place(&nice_error);
+    fprintf(stderr, "[totk-threads] sampler thread nice=%d%s cpus=%s\n", getpriority(PRIO_PROCESS, 0),
+            nice_error ? " (setpriority failed)" : "", decision);
+}
+static void thread_sampler_start(void) {   /* after totk.env: the launch value */
+    const char *e = getenv("TOTK_THREAD_SAMPLER"); g_sampler_launch = e && atoi(e) == 1;
+    g_sampler.thread_init = sampler_thread_init;
+    fprintf(stderr, "[totk-threads] TOTK_THREAD_SAMPLER=%d: %s\n", g_sampler_launch, g_sampler_launch ?
+            "long frames (over 50 ms) and every 300 presents name the 3 threads that ran most, from /proc/self/task" :
+            "off (default; live through totk.ctl)");
+}
+void runtime_live_frame(uint64_t frame) {   /* hle_nvn.c, once per presented frame */
+    totk_live_frame(frame);
+    totk_sampler_frame(&g_sampler, frame, totk_live_cached(&g_sampler_live, "TOTK_THREAD_SAMPLER", g_sampler_launch));
+}
+static void *live_ctl_thread(void *arg) {
+    (void)arg; totk_thread_start("totk-ctl", NULL);
+    int nice_error; const char *decision = background_place(&nice_error);
+    fprintf(stderr, "[totk-ctl] following %s (set KEY=VALUE, unset KEY, mark <text>; applied at the next presented frame), nice=%d%s cpus=%s\n",
+            g_live_path, getpriority(PRIO_PROCESS, 0), nice_error ? " (setpriority failed)" : "", decision);
+    live_ctl_run(&g_live_reader);
+    return NULL;
+}
+static void live_ctl_start(void) {
+    snprintf(g_live_path, sizeof g_live_path, "%s/totk.ctl", g_data);
+    g_live_reader.path = g_live_path; g_live_reader.skip_existing = 1;
+    pthread_t thread; int error = pthread_create(&thread, NULL, live_ctl_thread, NULL);
+    if (error) { fprintf(stderr, "[totk-ctl] off: %s\n", strerror(error)); return; }
+    pthread_detach(thread);
 }
 
 /* ---------- options ---------- */
 #include "android_storage.h"   /* TOTK_DATA_DIR validation and the game lock */
 /* The game lock (android_storage.h), taken by start_game and held until the process ends; given back when the start is
-   refused, since the process outlives a finished activity and the launcher would otherwise see a game running. */
+   refused, since the process outlives a finished activity and the launcher would otherwise see a game running.
+   A refusal also honors an inherited explicit logcat opt-in; environment files are not read yet. */
 static int g_game_lock = -1;
-static int start_refused(void) { if (g_game_lock >= 0) { close(g_game_lock); g_game_lock = -1; } return -1; }
+static int start_refused(void) { if (g_game_lock >= 0) { close(g_game_lock); g_game_lock = -1; } log_mirror_start(); return -1; }
 /* What the launcher menu may write into <private>/settings.env: the option mapping and the frame-generation timing
    block of the settings contract, and the game data folder when it is not on the primary storage (TOTK_DATA_DIR, which
    start_game reads before anything else), plus TOTK_AUTOLOAD for a session that writes settings.env and starts the game
@@ -1122,6 +1241,8 @@ static const char *const settings_keys[] = {
     "TOTK_POST_SGSR_SHARPNESS", "TOTK_FXAA", "TOTK_POST_AA", "TOTK_SHADOW_RES", "TOTK_OPERATION_MODE", "TOTK_NATIVE_UI",
     "TOTK_OVERLAY", "TOTK_OVERLAY_POS", "TOTK_COMPANION", "TOTK_FACE_BUTTONS", "TOTK_AUDIO_PREFILL_MS", "TOTK_LOCALE",
     "TOTK_LANG", "TOTK_RUMBLE", "TOTK_RUMBLE_GAIN", "TOTK_GYRO", "TOTK_AUTOLOAD",
+    "TOTK_VK_SPLIT_PASS_DRAWS", "TOTK_ADPF_GPU",
+    "TOTK_FPS60_HYSTERESIS",
     /* frame generation timing block */
     "TOTK_REALTIME", "TOTK_FRAME_LAG", "TOTK_FPS_AUTO", "DM_PRESENT_HZ", "DM_PRESENT_INTERVAL", "TOTK_PRESENT_SLOTS",
     "TOTK_VK_PRESENT", "TOTK_ACQUIRE_CLOCK", "TOTK_PACE", "TOTK_ASYNC_REPLAY",
@@ -1221,6 +1342,61 @@ static void pipeline_key_asset(const ANativeActivity *a) {
     if (f) { if (fflush(f) || fsync(fileno(f))) ok = 0; if (fclose(f)) ok = 0; }
     if (ok && !rename(tmp, path)) env_default("TOTK_PSO_KEYS", "%s", path);
     else { unlink(tmp); fprintf(stderr, "[pso-prewarm] cannot stage APK key list\n"); }
+}
+/* Profile identity comes from this APK, not user-editable launch variables.
+   Missing facts stay unavailable; only collect them for an opted-in launch. */
+static void gpu_profile_identity(const ANativeActivity *a) {
+    const char *mode = getenv("TOTK_VK_GPU_PROFILE");
+    if (!vk_gpuprof_identity || !mode || (strcmp(mode, "1") && strcmp(mode, "2") && strcmp(mode, "3"))) return;
+    char build[256] = {0}, commit[80] = {0}, package[256] = {0};
+    AAsset *asset = AAssetManager_open(a->assetManager, "build.txt", AASSET_MODE_BUFFER);
+    if (asset) {
+        off_t size = AAsset_getLength(asset);
+        if (size > 0 && size < (off_t)sizeof build && AAsset_read(asset, build, (size_t)size) == size) {
+            char candidate[80], extra;
+            if (sscanf(build, "commit %79s %c", candidate, &extra) == 1) {
+                size_t n = strlen(candidate);
+                if ((n == 12 || n == 40 || n == 64) && strspn(candidate, "0123456789abcdef") == n)
+                    snprintf(commit, sizeof commit, "%s", candidate);
+            }
+        } else build[0] = 0;
+        AAsset_close(asset);
+    }
+    JNIEnv *env = NULL; int attached = 0; uint64_t version = 0;
+    if ((*a->vm)->GetEnv(a->vm, (void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if ((*a->vm)->AttachCurrentThread(a->vm, &env, NULL) == JNI_OK) attached = 1;
+        else env = NULL;
+    }
+    if (env && (*env)->PushLocalFrame(env, 16) == JNI_OK) {
+        jclass activity = (*env)->GetObjectClass(env, a->clazz);
+        jmethodID name_method = activity ? (*env)->GetMethodID(env, activity, "getPackageName", "()Ljava/lang/String;") : NULL;
+        jstring name = name_method ? (*env)->CallObjectMethod(env, a->clazz, name_method) : NULL;
+        if (!name || (*env)->ExceptionCheck(env)) goto identity_done;
+        const char *text = (*env)->GetStringUTFChars(env, name, NULL);
+        if (!text) goto identity_done;
+        snprintf(package, sizeof package, "%s", text);
+        (*env)->ReleaseStringUTFChars(env, name, text);
+        jmethodID manager_method = (*env)->GetMethodID(env, activity, "getPackageManager", "()Landroid/content/pm/PackageManager;");
+        jobject manager = manager_method ? (*env)->CallObjectMethod(env, a->clazz, manager_method) : NULL;
+        if (!manager || (*env)->ExceptionCheck(env)) goto identity_done;
+        jclass manager_class = (*env)->GetObjectClass(env, manager);
+        jmethodID info_method = manager_class ? (*env)->GetMethodID(env, manager_class, "getPackageInfo",
+            "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;") : NULL;
+        jobject info = info_method ? (*env)->CallObjectMethod(env, manager, info_method, name, 0) : NULL;
+        if (!info || (*env)->ExceptionCheck(env)) goto identity_done;
+        jclass info_class = (*env)->GetObjectClass(env, info);
+        jmethodID version_method = info_class ? (*env)->GetMethodID(env, info_class, "getLongVersionCode", "()J") : NULL;
+        if (version_method && !(*env)->ExceptionCheck(env)) {
+            jlong value = (*env)->CallLongMethod(env, info, version_method);
+            if (!(*env)->ExceptionCheck(env) && value > 0) version = (uint64_t)value;
+        }
+identity_done:
+        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+        (*env)->PopLocalFrame(env, NULL);
+    }
+    if (env && (*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    if (attached) (*a->vm)->DetachCurrentThread(a->vm);
+    vk_gpuprof_identity(commit, package, version, build);
 }
 static int is_dir(const char *p) { struct stat st; return !stat(p, &st) && S_ISDIR(st.st_mode); }
 static int is_file(const char *p) { struct stat st; return !stat(p, &st) && S_ISREG(st.st_mode); }
@@ -1374,6 +1550,7 @@ static void driver_setup(const char *private_dir) {
 static char g_rewritten[1200];
 /* All files access right now (start_game; defined with the activity callbacks, which own the JNI calls). */
 static int android_all_files_access(const ANativeActivity *a);
+static void android_close_requests_start(const char *private_files);
 static void *game_thread(void *arg) {
     (void)arg;
     totk_thread_start("totk-boot", NULL);
@@ -1435,7 +1612,7 @@ static int start_game(const ANativeActivity *a) {
             snprintf(g_data, sizeof g_data, "%s", state);
             log_start();
             fprintf(stderr, "[totk-app] 【红】game folder %s %s; not starting. Insert the card, or open TotK Native and set the game up on another storage\n", chosen, why);
-            return -1;
+            return start_refused();
         }
         snprintf(g_data, sizeof g_data, "%s", chosen);
         snprintf(why, sizeof why, "%s", kind == ANDROID_DATA_PRIVATE ? "private storage" : kind == ANDROID_DATA_APP ? "app folder" : "folder with All files access");
@@ -1449,13 +1626,20 @@ static int start_game(const ANativeActivity *a) {
     log_start();
     fprintf(stderr, "[totk-app] build %s %s %s; game folder %s (%s; Android SDK %d)\n", TOTK_BUILD_KIND, __DATE__, __TIME__, g_data, why, a->sdkVersion);
     snprintf(p, sizeof p, "%s/game.lock", state);
-    if ((g_game_lock = android_game_lock(p, 4000, why, sizeof why)) < 0) { fprintf(stderr, "[totk-app] 【红】%s; not starting\n", why); return -1; }
+    if ((g_game_lock = android_game_lock(p, 4000, why, sizeof why)) < 0) { fprintf(stderr, "[totk-app] 【红】%s; not starting\n", why); return start_refused(); }
+    int marker_rc = android_game_start_finished(a->internalDataPath);
+    __android_log_print(marker_rc ? ANDROID_LOG_WARN : ANDROID_LOG_INFO, "TotkSetup",
+            "game start: pid=%d lock=OFD-acquired marker=%s errno=%d", getpid(), marker_rc ? "remove-error" : "removed", marker_rc ? errno : 0);
     if (chdir(g_data)) fprintf(stderr, "[totk-app] chdir %s: %s\n", g_data, strerror(errno));
     if (!install_playable(g_data)) return start_refused();   /* the caller finishes the activity */
     /* The launcher menu's choices first, then the developer's totk.env, which overrides them (both replace). */
     snprintf(p, sizeof p, "%s/settings.env", a->internalDataPath); settings_file(p);
     snprintf(p, sizeof p, "%s/totk.env", g_data); env_file(p);
     android_driver_env_policy(); /* freeze driver options before any app worker or driver call */
+    gpu_profile_identity(a);
+    log_mirror_start();   /* TOTK_LOGCAT is final now */
+    live_ctl_start();     /* after totk.env: its values are the launch values a live "unset" returns to */
+    thread_sampler_start();
     totk_thread_game_startup();   /* snapshot the allowed CPUs before any guest narrows its affinity */
     setenv("TOTK_INPUT_FILE_NEW", "1", 0);   /* the command file outlives runs: read newly appended commands only */
     char version[256];
@@ -1539,6 +1723,7 @@ static int start_game(const ANativeActivity *a) {
     pthread_t t; pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setstacksize(&at, 64u << 20);
     if (pthread_create(&t, &at, game_thread, NULL)) { fprintf(stderr, "[totk-app] game thread: %s\n", strerror(errno)); return 0; }
     pthread_attr_destroy(&at); pthread_detach(t);
+    android_close_requests_start(priv);
     return 1;
 }
 
@@ -1553,6 +1738,7 @@ static int32_t g_axes[4];
 static int g_pad_seen;
 static overlay_chord g_chord;   /* Minus + R live overlay shortcut (overlay_chord.h); under g_pad_mu */
 static uint64_t mono_ns(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec; }
+static int64_t game_input_after_ns; /* UI-owned: do not replay queued events or a return-to-game button held across resume */
 static void pad_key_locked(int bit, int down) {
     if (down) { if (!(g_keys >> bit & 1)) g_edges |= 1ull << bit; g_keys |= 1ull << bit; }
     else g_keys &= ~(1ull << bit);
@@ -1601,7 +1787,11 @@ static void chord_trace(unsigned button, unsigned action, unsigned r, unsigned s
             states[state < 5 ? state : 0]);
 }
 static int handle_input(AInputEvent *ev) {
+    if (runtime_android_game_paused()) return 1;
     int type = AInputEvent_getType(ev), src = AInputEvent_getSource(ev);
+    if (type == AINPUT_EVENT_TYPE_KEY &&
+            (AKeyEvent_getEventTime(ev) < game_input_after_ns || AKeyEvent_getDownTime(ev) < game_input_after_ns)) return 1;
+    if (type == AINPUT_EVENT_TYPE_MOTION && AMotionEvent_getEventTime(ev) < game_input_after_ns) return 1;
     int pad = (src & AINPUT_SOURCE_GAMEPAD) == AINPUT_SOURCE_GAMEPAD || (src & AINPUT_SOURCE_JOYSTICK) == AINPUT_SOURCE_JOYSTICK || (src & AINPUT_SOURCE_DPAD) == AINPUT_SOURCE_DPAD;
     if (type == AINPUT_EVENT_TYPE_KEY) {
         int code = AKeyEvent_getKeyCode(ev), act = AKeyEvent_getAction(ev);
@@ -1665,7 +1855,38 @@ void runtime_gamepad_read(RuntimeGamepadState *out) {
     out->connected = g_pad_seen;
     pthread_mutex_unlock(&g_pad_mu);
 }
-void runtime_front_request_close(void) { fprintf(stderr, "[totk] close requested: flushing pipeline cache and exiting\n"); vk_pcache_shutdown(); _exit(0); }
+int runtime_front_request_close(void) {
+    if (!runtime_fs_begin_close()) {
+        __android_log_print(ANDROID_LOG_WARN, "TotkSetup", "close game: pid=%d save=busy; native exit refused", getpid());
+        return 0;
+    }
+    __android_log_print(ANDROID_LOG_WARN, "TotkSetup", "close game: pid=%d save=idle; native pipeline-cache flush and exit", getpid());
+    fprintf(stderr, "[totk] close requested: flushing pipeline cache and exiting\n"); vk_pcache_shutdown();
+    if (vk_gpuprof_shutdown) vk_gpuprof_shutdown();
+    _exit(0);
+}
+/* One stat per 500 ms on this non-render thread; no activity launch, task-affinity changes or frame-loop I/O. */
+static void *android_close_requests(void *arg) {
+    AndroidClosePaths paths;
+    if (android_close_paths(&paths, arg)) {
+        __android_log_print(ANDROID_LOG_ERROR, "TotkSetup", "close game: path error errno=%d (%s)", errno, strerror(errno));
+        return NULL;
+    }
+    for (;;) {
+        int result = android_close_poll(&paths, runtime_front_request_close);
+        if (result) __android_log_print(ANDROID_LOG_WARN, "TotkSetup",
+                "close game: pid=%d request=%s errno=%d (%s)", getpid(), result < 0 ? "I/O-error" : "saving-refused",
+                result < 0 ? errno : 0, result < 0 ? strerror(errno) : "save in progress");
+        struct timespec pause = {0, 500 * 1000000L};
+        while (nanosleep(&pause, &pause) && errno == EINTR) { }
+    }
+}
+static void android_close_requests_start(const char *private_files) {
+    pthread_t thread;
+    int error = pthread_create(&thread, NULL, android_close_requests, (void *)private_files);
+    if (!error) pthread_detach(thread);
+    else __android_log_print(ANDROID_LOG_ERROR, "TotkSetup", "close game: poller unavailable errno=%d (%s)", error, strerror(error));
+}
 
 /* ---------- text entry (nn::swkbd, runtime/swkbd_host.c) ----------
    The guest thread that asks waits here (its virtual core given up by swkbd_host.c). A byte on g_text_wake wakes the UI
@@ -2126,17 +2347,54 @@ static void on_focus(ANativeActivity *a, int focused) {
         vk_window_resized(g_window, g_window_epoch);
     } else { runtime_gamepad_clear(); runtime_feedback_quiet(); }   /* releases may not arrive while another window has focus; no rumble meanwhile */
 }
-static void on_pause(ANativeActivity *a) { (void)a; present_timeline_lifecycle(-1, 1); vk_pcache_background(1); }
-static void on_stop(ANativeActivity *a) { (void)a; present_timeline_lifecycle(-1, 1); vk_pcache_background(1); }
+/* UI-thread facets: focus cannot undo an actual lifecycle pause. A single
+ * display's live recents tile may stay RESUMED; dual-screen focus stays free. */
+static int game_activity_paused, game_focus_paused;
+static void android_game_pause_update(void) {
+    int paused = game_activity_paused || game_focus_paused;
+    if (paused == runtime_android_game_paused()) return;
+    game_input_after_ns = (int64_t)mono_ns();
+    android_game_pause_set(&game_pause, paused);
+    runtime_audio_output_pause(paused);
+    runtime_input_clear();
+    present_timeline_lifecycle(-1, paused);
+    vk_pcache_background(paused);
+    fprintf(stderr, "[totk-app] game and audio %s: lifecycle=%d single-display-focus=%d\n",
+            paused ? "paused (pending saves may finish)" : "resumed", game_activity_paused, game_focus_paused);
+}
+void runtime_android_game_focus(JNIEnv *env, jclass cls, jboolean focused, jboolean single_display) {
+    (void)env; (void)cls;
+    game_focus_paused = !focused && single_display;
+    android_game_pause_update();
+}
+/* Top-resumed is global; window focus is per-display. Clear held/queued input
+ * when controller routing changes, without altering either background-pause facet. */
+void runtime_android_game_input_focus(JNIEnv *env, jclass cls, jboolean top) {
+    (void)env; (void)cls;
+    game_input_after_ns = (int64_t)mono_ns();
+    /* Losing routing clears everything held; regaining it clears only the controller state, so a companion shortcut
+     * issued in between (a synthetic key with its pending edge) still reaches the game. */
+    if (top) runtime_gamepad_clear();
+    else { runtime_input_clear(); runtime_feedback_quiet(); }
+}
+static void android_game_lifecycle_pause(int paused) {
+    game_activity_paused = paused;
+    android_game_pause_update();
+}
+static void on_pause(ANativeActivity *a) { (void)a; android_game_lifecycle_pause(1); }
+static void on_stop(ANativeActivity *a) { (void)a; android_game_lifecycle_pause(1); }
 static void on_resume(ANativeActivity *a) {
     (void)a;
-    present_timeline_lifecycle(-1, 0);
-    vk_pcache_background(0);
+    game_input_after_ns = (int64_t)mono_ns();
+    android_game_lifecycle_pause(0);
+    /* The focus facet may still hold the gate until the window regains focus. */
     vk_window_resized(g_window, g_window_epoch);
     present_transform_update(a,g_window_epoch);
 }
 static void on_destroy(ANativeActivity *a) {
-    vk_pcache_shutdown(); window_clear(a); fprintf(stderr, "[totk-app] activity destroyed: exiting\n"); _exit(0);
+    vk_pcache_shutdown(); window_clear(a); fprintf(stderr, "[totk-app] activity destroyed: exiting\n");
+    if (vk_gpuprof_shutdown) vk_gpuprof_shutdown();
+    _exit(0);
 }
 
 __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActivity *a, void *saved, size_t saved_size) {
@@ -2159,6 +2417,14 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     immersive(a);
     text_wake_start();
     /* Not set up (or not finished): nothing to show, so return to the launcher, whose setup screen explains. */
-    if (!started) { started = 1; if (start_game(a) < 0) { ANativeActivity_finish(a); android_refused_exit(1500); } }
+    if (!started) {
+        started = 1;
+        if (start_game(a) < 0) {
+            int rc = android_game_start_finished(a->internalDataPath);
+            __android_log_print(ANDROID_LOG_INFO, "TotkSetup", "game start refused: pid=%d marker=%s errno=%d", getpid(), rc ? "remove-error" : "removed", rc ? errno : 0);
+            ANativeActivity_finish(a);
+            android_refused_exit(1500);
+        }
+    }
 }
 #endif

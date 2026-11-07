@@ -27,7 +27,7 @@ int setup_fonts_write(SetupCtx *c, const SetupInput *fonts, int nfonts, const ch
         size_t padded = ((size_t)in->size + 3) & ~(size_t)3;
         uint8_t *data = calloc(1, padded + 8);
         if (!data) { setup_fail(c, "internal", "Out of memory"); rc = -1; break; }
-        if (st_pread(in->fd, data + 8, (size_t)in->size, in->offset)) { free(data); rc = st_io_fail(c, "read", in->name); break; }
+        if (st_pread(in->fd, data + 8, (size_t)in->size, in->offset)) { rc = st_io_fail(c, "read", in->name); free(data); break; }
         const uint8_t *m = data + 8;
         if (memcmp(m, "\0\1\0\0", 4) && memcmp(m, "OTTO", 4) && memcmp(m, "true", 4)) { free(data); setup_fail(c, "missing_input", "%s is not a TrueType/OpenType font", in->name); rc = -1; break; }
         if (i == 0) sha256_buf_hex(data + 8, (size_t)in->size, src_sha);

@@ -28,6 +28,20 @@ SYM(runtime_hle_switch):
     ldr w13, [x13, PAGEOFF(SYM(runtime_hle_trace))]
     cbnz w13, 2f
 3:  blr x16
+    // Revalidate a pending core handoff before restoring the guest stack.
+    // Nested HLE calls never reach this path. Preserve every AAPCS64 return
+    // register (integer pair or up to four homogeneous FP/vector members).
+    adrp x9, PAGE(SYM(runtime_core_wait_event))
+    ldr w9, [x9, PAGEOFF(SYM(runtime_core_wait_event))]
+    cbz w9, 5f
+    stp x0, x1, [sp, #-80]!
+    stp q0, q1, [sp, #16]
+    stp q2, q3, [sp, #48]
+    bl SYM(runtime_core_hle_return)
+    ldp q2, q3, [sp, #48]
+    ldp q0, q1, [sp, #16]
+    ldp x0, x1, [sp], #80
+5:
     ldp x12, x11, [sp, #16]
     ldp x29, x30, [sp]
     mov sp, x12

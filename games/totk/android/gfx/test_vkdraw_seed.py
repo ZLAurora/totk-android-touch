@@ -142,6 +142,12 @@ layout(set=0,binding=1) uniform sampler2D fp_t_tcb_5A;
 layout(location=0) out vec4 o0;
 void main() { o0=texture(fp_t_tcb_5A,fp_c3.uv.xy); }
 '''
+# One array output spanning locations 0 and 1: the reflection's fout line names location 0 only
+# (test_vkpipeline.c unwritten_probe: TOTK_VK_UNWRITTEN_MASK must not mask location 1).
+FS_ARRAY_OUT = '''#version 450
+layout(location=0) out vec4 o[2];
+void main() { o[0]=vec4(1,1,1,1); o[1]=vec4(1,0,1,1); }
+'''
 
 def shader_binary(stage, salt):
     """The test's NVN shader: control section (stage at 0x714, code length at 0x704, c1 offset at 0x700) and code."""
@@ -181,7 +187,8 @@ def main(out):
                    (1, FS_NATIVE_COORD, 42, 'frag', []),
                    (1, FS_ATLAS_UV, 43, 'frag', []),
                    (0, VS_TERMINAL_OWNED, 44, 'vert', []),
-                   (1, FS_TERMINAL_OWNED, 45, 'frag', []))
+                   (1, FS_TERMINAL_OWNED, 45, 'frag', []),
+                   (1, FS_ARRAY_OUT, 46, 'frag', []))
         for stage, src, salt, ext, sbufs in shaders:
             control, code = shader_binary(stage, salt)
             key = key_of(control, code)

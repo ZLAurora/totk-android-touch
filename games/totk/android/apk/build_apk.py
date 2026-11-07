@@ -29,13 +29,16 @@ LABEL = 'TotK Native'
 SETUP_ACTIVITY = 'com.aure.totk.setup.SetupActivity'
 SETUP_SERVICE = 'com.aure.totk.setup.SetupService'
 GAME_ACTIVITY = 'com.aure.totk.TotkActivity'
+GAME_CONTROL_SERVICE = 'com.aure.totk.GameControlService'
 SETUP_PROCESS = ':setup'
 # MANAGE_EXTERNAL_STORAGE: optional All files access (direct file access, as Azahar's non-Play build); the app works
 # without it through the Storage Access Framework. The APK is distributed outside Google Play (see the Azahar notes in
 # android/APP.md for what a Play build would have to remove).
 PERMISSIONS = ('android.permission.FOREGROUND_SERVICE', 'android.permission.FOREGROUND_SERVICE_DATA_SYNC',
                'android.permission.POST_NOTIFICATIONS', 'android.permission.WAKE_LOCK',
-               'android.permission.MANAGE_EXTERNAL_STORAGE', 'android.permission.VIBRATE')
+               'android.permission.MANAGE_EXTERNAL_STORAGE', 'android.permission.VIBRATE',
+               'android.permission.INTERNET', 'android.permission.ACCESS_NETWORK_STATE',
+               'android.permission.REQUEST_INSTALL_PACKAGES')
 
 # android.R.attr resource ids of the manifest attributes used here (checked against aapt2 link with android.jar)
 ATTR = {
@@ -45,6 +48,8 @@ ATTR = {
     'targetSdkVersion': 0x01010270, 'allowBackup': 0x01010280, 'isGame': 0x010103f4, 'extractNativeLibs': 0x010104ea,
     'drawable': 0x01010199, 'roundIcon': 0x0101052c, 'foregroundServiceType': 0x01010599, 'hasFragileUserData': 0x0101059a,
     'fullBackupContent': 0x010104eb, 'dataExtractionRules': 0x0101063e,
+    'relinquishTaskIdentity': 0x01010476,
+    'usesCleartextTraffic': 0x010104ec,
 }
 THEME_NOTITLEBAR_FULLSCREEN = 0x01030007   # @android:style/Theme.NoTitleBar.Fullscreen
 THEME_TRANSLUCENT_FULLSCREEN = 0x01030011  # @android:style/Theme.Translucent.NoTitleBar.Fullscreen (no flash when setup forwards to the game)
@@ -100,13 +105,16 @@ def manifest_tree(package, label, version_code, version_name, min_sdk, target_sd
                          (A, 'extractNativeLibs', 'bool', True), (A, 'isGame', 'bool', True), (A, 'theme', 'ref', THEME_NOTITLEBAR_FULLSCREEN),
                          # Saves and setup state stay on the device: no cloud/adb backup of the app's private files, and
                          # Android asks before removing the (large, player-supplied) data on uninstall.
-                         (A, 'allowBackup', 'bool', False), (A, 'hasFragileUserData', 'bool', True)]
+                         (A, 'allowBackup', 'bool', False), (A, 'hasFragileUserData', 'bool', True),
+                         # Only the private, root-written update-source.txt override can use HTTP; production update
+                         # URLs and every redirect are checked in Java before opening a connection.
+                         (A, 'usesCleartextTraffic', 'bool', True)]
                          + ([(A, 'dataExtractionRules', 'ref', backup['data_extraction_rules']),
                              (A, 'fullBackupContent', 'ref', backup['backup_rules'])] if backup else [])
                          + ([(A, 'icon', 'ref', icon)] if icon is not None else [])
                          + ([(A, 'roundIcon', 'ref', round_icon)] if round_icon is not None else []), [
             ('activity', [(A, 'name', 'str', SETUP_ACTIVITY), (A, 'label', 'str', label), (A, 'exported', 'bool', True),
-                          (A, 'process', 'str', SETUP_PROCESS), (A, 'launchMode', 'int', SINGLE_TOP),
+                          (A, 'process', 'str', SETUP_PROCESS), (A, 'launchMode', 'int', SINGLE_TOP), (A, 'relinquishTaskIdentity', 'bool', True),
                           (A, 'theme', 'ref', THEME_TRANSLUCENT_FULLSCREEN), (A, 'configChanges', 'hex', CONFIG_CHANGES)], [
                 ('intent-filter', [], [
                     ('action', [(A, 'name', 'str', 'android.intent.action.MAIN')], []),
@@ -118,8 +126,13 @@ def manifest_tree(package, label, version_code, version_name, min_sdk, target_sd
                           (A, 'configChanges', 'hex', CONFIG_CHANGES)], [
                 ('meta-data', [(A, 'name', 'str', 'android.app.lib_name'), (A, 'value', 'str', 'totk')], []),
             ]),
+            ('activity', [(A, 'name', 'str', 'com.aure.totk.setup.UpdateEntryActivity'), (A, 'exported', 'bool', False),
+                          (A, 'process', 'str', SETUP_PROCESS), (A, 'theme', 'ref', THEME_TRANSLUCENT_FULLSCREEN)], []),
             ('service', [(A, 'name', 'str', SETUP_SERVICE), (A, 'exported', 'bool', False), (A, 'process', 'str', SETUP_PROCESS),
                          (A, 'foregroundServiceType', 'hex', FOREGROUND_DATA_SYNC)], []),
+            ('service', [(A, 'name', 'str', GAME_CONTROL_SERVICE), (A, 'exported', 'bool', False)], []),
+            ('receiver', [(A, 'name', 'str', 'com.aure.totk.setup.UpdateReceiver'), (A, 'exported', 'bool', False),
+                          (A, 'process', 'str', SETUP_PROCESS)], []),
         ]),
     ])
 

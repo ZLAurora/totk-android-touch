@@ -39,18 +39,25 @@ class ShaderSeedTests(unittest.TestCase):
                 (dest / 'probe.spv').write_text(marker)
             env = dict(os.environ)
             env.pop('TOTK_SHADER_SEED_DIR', None)
+            env.pop('TOTK_VK_POS_INVARIANT', None)
+            env.pop('TOTK_VK_POS_NOCONTRACT', None)
             env['TEST_GAME_DIR'] = str(root)
             launch = root / 'unrelated-working-directory'
             launch.mkdir()
 
-            def run(folder, marker, indexed=False):
+            def run(folder, marker, indexed=False, position=('0', '0'), mutate=False):
                 e = dict(env)
                 e['TOTK_VK_SEED_IO'] = '1' if indexed else '0'
+                e['TOTK_VK_POS_INVARIANT'], e['TOTK_VK_POS_NOCONTRACT'] = position
+                if mutate:
+                    e['TEST_POSITION_MUTATE'] = '1'
                 if folder is not None:
                     e['TOTK_SHADER_SEED_DIR'] = folder
                 result = subprocess.run([str(probe), marker], cwd=launch, env=e, text=True, capture_output=True, check=True)
                 lines = result.stdout.splitlines()
                 self.assertIn(f'shader seed: {lines[0]}', result.stderr)
+                for name, value in zip(('INVARIANT', 'NOCONTRACT'), position):
+                    self.assertEqual(result.stderr.count(f'TOTK_VK_POS_{name}={value} (startup-only)'), 1)
                 self.assertTrue(Path(lines[0]).is_absolute())
                 return lines
 
@@ -61,6 +68,18 @@ class ShaderSeedTests(unittest.TestCase):
             self.assertEqual(run('seed-opt/v143', 'optimized', indexed=True)[1:4], alternate[1:4])
             legacy = ['state/vk-pipeline-cache.bin', 'state/vk-prewarm.bin', 'custom-import']
             self.assertEqual(original[1:4], legacy)
+            # All four immutable precision arms isolate pipeline, prewarm and
+            # explicit import paths, for canonical and alternate seeds alike.
+            for folder, marker, baseline in ((None, 'original', original),
+                                             ('seed-opt/v143', 'optimized', alternate)):
+                paths = []
+                for invariant, nocontract in (('0', '0'), ('1', '0'), ('0', '1'), ('1', '1')):
+                    position = (invariant, nocontract)
+                    arm = run(folder, marker, position=position, mutate=True)
+                    suffix = '' if position == ('0', '0') else f'.pos-v1-{invariant}{nocontract}'
+                    self.assertEqual(arm[1:4], [path + suffix for path in baseline[1:4]])
+                    paths.append(tuple(arm[1:4]))
+                self.assertEqual(len(set(paths)), 4)
             for folder in ('', 'shaders', './shaders', str(root / 'shaders')):
                 with self.subTest(default_alias=folder):
                     self.assertEqual(run(folder, 'original')[1:4], legacy)

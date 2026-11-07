@@ -27,7 +27,7 @@ void dm_gfx_anomdump(void){runtime_fail("unexpected anomaly dump in unit probe")
 void dm_gfx_window_shot(const char *p){(void)p;runtime_fail("unexpected window shot in unit probe");}
 int runtime_survey_command(const char *line){(void)line;return 0;}
 void runtime_survey_cancel_user(void){}
-void runtime_front_request_close(void){runtime_fail("unexpected window close in unit probe");}
+int runtime_front_request_close(void){runtime_fail("unexpected window close in unit probe");}
 /* Test double for the native controller layer (runtime/gamepad.m is not linked into this probe). */
 static RuntimeGamepadState fake_pad;
 void runtime_gamepad_read(RuntimeGamepadState *out){*out=fake_pad;}

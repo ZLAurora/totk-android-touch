@@ -45,6 +45,52 @@ int main(int argc, char **argv) {   /* romfs-dir sha256 size: the runtime's own 
 }
 '''
 
+FIFO_SHIM = r'''
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+int mkfifo(const char *path, mode_t mode) {
+    const char *root = getenv("TOTK_DENY_FIFO_UNDER");
+    if (root && !strncmp(path, root, strlen(root)) && path[strlen(root)] == '/') { errno = EPERM; return -1; }
+    return ((int (*)(const char *, mode_t))dlsym(RTLD_NEXT, "mkfifo"))(path, mode);
+}
+int open(const char *path, int flags, ...) {
+    mode_t mode = 0;
+    if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = va_arg(ap, int); va_end(ap); }
+    if (getenv("TOTK_DENY_FIFO_OPEN") && strstr(path, "/romfs-") && strstr(path, ".fifo")) { errno = EACCES; return -1; }
+    return ((int (*)(const char *, int, ...))dlsym(RTLD_NEXT, "open"))(path, flags, mode);
+}
+ssize_t write(int fd, const void *buf, size_t n) {
+    const char *name = getenv("TOTK_DENY_KEY_WRITE");
+    if (name) {
+        char link[64], path[4096]; snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
+        ssize_t len = readlink(link, path, sizeof path - 1);
+        if (len >= 0) {
+            path[len] = 0; const char *base = strrchr(path, '/');
+            if (base && !strcmp(base + 1, name)) { errno = ENOSPC; return -1; }
+        }
+    }
+    return ((ssize_t (*)(int, const void *, size_t))dlsym(RTLD_NEXT, "write"))(fd, buf, n);
+}
+int close(int fd) {
+    int rc = ((int (*)(int))dlsym(RTLD_NEXT, "close"))(fd);
+    if (getenv("TOTK_CLOBBER_CLOSE_ERRNO")) errno = ENOENT;
+    return rc;
+}
+int unlink(const char *path) {
+    const char *deny = getenv("TOTK_DENY_UNLINK");
+    if (deny && !strcmp(path, deny)) { errno = EPERM; return -1; }
+    return ((int (*)(const char *))dlsym(RTLD_NEXT, "unlink"))(path);
+}
+'''
+
 
 def files_of(root, skip=()):
     """rel path -> sha256 of every regular file under root."""
@@ -256,6 +302,18 @@ class Parts(Storage):
 class ContainerParts(Storage):
     """The container route's merged image through the FIFO sink, with a stand-in for hactool that writes the image to its
     --sectionN= output the way hactool does (sequentially) and reports all six IVFC levels."""
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cc = shutil.which('cc') or 'gcc'
+        source = WORK / 'fifo-shim.c'
+        source.write_text(FIFO_SHIM)
+        cls.fifo_shim = WORK / 'fifo-shim.so'
+        subprocess.run([cc, '-shared', '-fPIC', str(source), '-o', str(cls.fifo_shim), '-ldl'], check=True)
+        # ASan must be first even when the test injects a filesystem failure through LD_PRELOAD.
+        preload = ([subprocess.check_output([cc, '-print-file-name=libasan.so'], text=True).strip()] if cls.sanitize else [])
+        cls.preload = ':'.join([*preload, str(cls.fifo_shim)])
+
     def setUp(self):
         super().setUp()
         self.keys.write_text(f'header_key = {HEADER.hex()}\nkey_area_key_application_00 = {bytes.fromhex("00" * 16).hex()}\n')
@@ -271,16 +329,25 @@ class ContainerParts(Storage):
         self.update.write_bytes(partition([('program.nca', update), ('meta.cnmt.nca', nca(content=1, title=0x0100F2C0115B6800)), ('a.tik', ticket())]))
         self.lib = self.dir / 'lib'; self.lib.mkdir()
         fake = self.lib / 'libhactool.so'
-        fake.write_text('#!/bin/sh\nfor a in "$@"; do case "$a" in --section*=*) out="${a#*=}";; esac; done\n'
+        # Do not preload the CLI's ASan runtime / fault shim into the unrelated system shell and cat.
+        fake.write_text('#!/usr/bin/env -S -u LD_PRELOAD /bin/sh\nfor a in "$@"; do case "$a" in --section*=*) out="${a#*=}";; esac; done\n'
+                        'test -p "$out" || exit 2\nprintf "%s\\n" "$out" > "$TOTK_FIFO_PATH_LOG"\n'
                         'cat "$TOTK_FAKE_IMAGE" > "$out" || exit 1\nfor i in 0 1 2 3 4 5; do echo "Level $i (GOOD)"; done\n')
         fake.chmod(0o755)
 
-    def merge(self, out, part_bytes):
-        work = self.dir / 'work'; work.mkdir(exist_ok=True)
-        env = dict(os.environ, TOTK_FAKE_IMAGE=str(self.dir / 'romfs.bin'))
+    def merge(self, out, part_bytes, nobackup=True, **extra_env):
+        work = self.game / '.import'; work.mkdir(parents=True, exist_ok=True)
+        self.fifo_log = self.dir / 'fifo-path.txt'
+        env = dict(os.environ, TOTK_FAKE_IMAGE=str(self.dir / 'romfs.bin'), TOTK_FIFO_PATH_LOG=str(self.fifo_log),
+                   ASAN_OPTIONS='detect_leaks=1:abort_on_error=0', UBSAN_OPTIONS='print_stacktrace=1')
+        env.update(extra_env)
         p = subprocess.run([str(self.cli), 'merge', '--base', str(self.base), '--update', str(self.update), '--keys', str(self.keys),
                             '--out', str(out), '--work', str(work), '--libdir', str(self.lib), '--part-bytes', str(part_bytes),
-                            '--pins', str(self.pins)], capture_output=True, text=True, env=env, timeout=120)
+                            '--pins', str(self.pins), *(['--nobackup', str(self.nobackup)] if nobackup else [])],
+                           capture_output=True, text=True, env=env, timeout=120)
+        self.assertNotIn('Sanitizer', p.stderr, p.stderr)
+        self.assertNotIn('runtime error', p.stderr, p.stderr)
+        self.no_secret(p.stdout + p.stderr)
         return p, json.loads(p.stdout.strip().splitlines()[-1])
 
     def test_merge_into_parts_and_one_file(self):
@@ -290,7 +357,10 @@ class ContainerParts(Storage):
         names = image_files(self.dir / 'parts')
         self.assertEqual(names, ['romfs.bin.000', 'romfs.bin.001', 'romfs.bin.002'])
         self.assertEqual(b''.join((self.dir / 'parts' / n).read_bytes() for n in names), self.image)
-        self.assertFalse((self.dir / 'work/romfs.fifo').exists())
+        fifo = Path(self.fifo_log.read_text().strip())
+        self.assertEqual(fifo.parent, self.nobackup / 'setup-work')
+        self.assertRegex(fifo.name, r'^romfs-\d+\.fifo$')
+        self.assertFalse(fifo.exists())
         p, out = self.merge(self.dir / 'one', 0)
         self.assertTrue(out['ok'], out)
         self.assertEqual((self.dir / 'one/romfs.bin').read_bytes(), self.image)
@@ -300,6 +370,98 @@ class ContainerParts(Storage):
         p, out = self.merge(self.dir / 'parts', self.part)
         self.assertEqual(out['code'], 'hash_mismatch', out)
         self.assertEqual(image_files(self.dir / 'parts'), [])
+
+    def test_merge_on_volume_without_fifo_support(self):
+        for part_bytes in (0, self.part):
+            with self.subTest(part_bytes=part_bytes):
+                folder = self.game / ('parts' if part_bytes else 'one')
+                p, out = self.merge(folder, part_bytes, LD_PRELOAD=self.preload, TOTK_DENY_FIFO_UNDER=str(self.game))
+                self.assertTrue(out['ok'], out | {'stderr': p.stderr[-2000:]})
+                self.assertEqual(out['sha256'], sha(self.image))
+                self.assertEqual(b''.join((folder / name).read_bytes() for name in image_files(folder)), self.image)
+                fifo = Path(self.fifo_log.read_text().strip())
+                self.assertEqual(fifo.parent, self.nobackup / 'setup-work')
+                self.assertFalse(fifo.exists())
+
+    def test_merge_without_nobackup_uses_temporary_fifo(self):
+        p, out = self.merge(self.game / 'one', 0, nobackup=False,
+                            LD_PRELOAD=self.preload, TOTK_DENY_FIFO_UNDER=str(self.game))
+        self.assertTrue(out['ok'], out | {'stderr': p.stderr[-2000:]})
+        self.assertEqual((self.game / 'one/romfs.bin').read_bytes(), self.image)
+        fifo = Path(self.fifo_log.read_text().strip())
+        self.assertEqual(fifo.parent.parent, Path('/tmp'))
+        self.assertTrue(fifo.parent.name.startswith('totk-romfs-'))
+        self.assertFalse(fifo.parent.exists())
+
+    def test_next_locked_setup_reclaims_dead_process_fifos(self):
+        work = self.nobackup / 'setup-work'; work.mkdir(parents=True)
+        stale = [work / f'romfs-{pid}.fifo' for pid in (2147483646, 2147483647)]
+        for path in stale:
+            os.mkfifo(path, 0o600)
+        regular = work / 'romfs-regular.fifo'; regular.write_bytes(b'keep')
+        other = work / 'other.fifo'; os.mkfifo(other, 0o600)
+        link = work / 'romfs-link.fifo'; link.symlink_to(other)
+        scratch = work / 'shaders-resume'; scratch.mkdir()
+        nested = scratch / stale[0].name; os.mkfifo(nested, 0o600)
+        with (self.nobackup / 'setup.lock').open('w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            p, out = self.run_setup([self.dir / 'romfs.bin'], stages=['romfs'])
+            self.assertFalse(out['ok'], out)
+            self.assertIn('already running', out['message'])
+            self.assertTrue(all(path.exists() for path in stale), 'another setup must not reclaim the active setup’s pipes')
+        p, out = self.run_setup([self.dir / 'romfs.bin'], stages=['romfs'])
+        self.assertTrue(out['ok'], out | {'stderr': p.stderr[-2000:]})
+        self.assertTrue(all(not path.exists() for path in stale), 'the next locked run removes dead process pipes')
+        self.assertEqual(regular.read_bytes(), b'keep')
+        self.assertTrue(other.exists())
+        self.assertTrue(link.is_symlink())
+        self.assertTrue(nested.exists(), 'shader resume scratch is not swept recursively')
+
+    def test_mkfifo_reports_its_own_error_before_cleanup(self):
+        p, out = self.merge(self.game / 'parts', self.part, LD_PRELOAD=self.preload,
+                            TOTK_DENY_FIFO_UNDER=str(self.nobackup), TOTK_CLOBBER_CLOSE_ERRNO='1')
+        self.assertEqual((p.returncode, out['ok'], out['code']), (1, False, 'io'), out)
+        self.assertIn('mkfifo romfs-', out['message'])
+        self.assertIn(os.strerror(1), out['message'])   # EPERM, not unlink's ENOENT
+        self.assertNotIn(os.strerror(2), out['message'])
+        self.assertEqual(image_files(self.game / 'parts'), [])
+        self.assertEqual(list((self.nobackup / 'setup-work').glob('*.fifo')), [])
+
+    def test_fifo_open_reports_its_own_error_before_cleanup(self):
+        p, out = self.merge(self.game / 'parts', self.part, LD_PRELOAD=self.preload,
+                            TOTK_DENY_FIFO_OPEN='1', TOTK_CLOBBER_CLOSE_ERRNO='1')
+        self.assertEqual((p.returncode, out['ok'], out['code']), (1, False, 'io'), out)
+        self.assertIn('open romfs-', out['message'])
+        self.assertIn(os.strerror(13), out['message'])   # EACCES
+        self.assertNotIn('mkfifo', out['message'])
+        self.assertEqual(image_files(self.game / 'parts'), [])
+        self.assertEqual(list((self.nobackup / 'setup-work').glob('*.fifo')), [])
+
+    def test_temporary_key_write_error_survives_close(self):
+        for name in ('hactool.keys', 'title.keys'):
+            with self.subTest(name=name):
+                p, out = self.merge(self.game / 'parts', self.part, LD_PRELOAD=self.preload,
+                                    TOTK_DENY_KEY_WRITE=name, TOTK_CLOBBER_CLOSE_ERRNO='1')
+                self.assertEqual((p.returncode, out['ok'], out['code']), (1, False, 'no_space'), out)
+                self.assertIn('write the temporary', out['message'])
+                self.assertIn(name, out['message'])
+                self.assertIn(os.strerror(28), out['message'])   # ENOSPC
+                self.assertFalse((self.game / '.import/import-keys').exists())
+                self.assertEqual(list((self.nobackup / 'setup-work').glob('*.fifo')), [])
+
+    def test_remove_keeps_first_error_while_cleaning_other_data(self):
+        self.game.mkdir()
+        install = self.game / 'install.json'; install.write_text('{}')
+        extracted = self.game / 'extracted'; extracted.mkdir(); (extracted / 'stale').write_bytes(b'x')
+        env = dict(os.environ, LD_PRELOAD=self.preload, TOTK_DENY_UNLINK=str(install), TOTK_CLOBBER_CLOSE_ERRNO='1',
+                   ASAN_OPTIONS='detect_leaks=1:abort_on_error=0', UBSAN_OPTIONS='print_stacktrace=1')
+        p = subprocess.run([str(self.cli), 'remove', '--dir', str(self.game)], capture_output=True, text=True, env=env)
+        self.assertNotIn('Sanitizer', p.stderr, p.stderr)
+        out = json.loads(p.stdout)
+        self.assertEqual((p.returncode, out['ok'], out['code']), (1, False, 'io'), out)
+        self.assertIn(os.strerror(1), out['message'])
+        self.assertTrue(install.exists())
+        self.assertFalse(extracted.exists())
 
 
 class Move(Storage):
@@ -492,6 +654,10 @@ class Move(Storage):
 
 
 class PartsSan(Parts):
+    sanitize = True
+
+
+class ContainerPartsSan(ContainerParts):
     sanitize = True
 
 

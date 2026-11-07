@@ -134,6 +134,7 @@ static int identical(const char *a, const char *b, uint64_t magic) {
         if (nl != nr || memcmp(l, r, nl)) { fprintf(stderr, "identity differs at byte block %zu\n", total); ok = 0; break; }
         total += nl;
         if (!nl) {
+            if (magic < (1u<<20)) { ok = !ferror(left) && !ferror(right) && total == magic; break; } /* raw pixel fixture size */
             uint64_t footer[2];
             ok = !ferror(left) && !ferror(right) && total > sizeof footer && !fseek(left, -(long)sizeof footer, SEEK_END)
                 && fread(footer, sizeof footer, 1, left) == 1 && footer[0] == magic && footer[1] == 12;
@@ -149,6 +150,27 @@ int main(int argc, char **argv) {
     if (len < 0) { perror("/proc/self/exe"); return 1; } binary[len] = 0;
     char *base = strrchr(binary, '/'); if (!base) return 1; strcpy(base + 1, "vkdrawtest");
     char dir[] = "./vkrecord-XXXXXX"; if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
+    if (argc==2 && !strcmp(argv[1],"--alpha-clear")) {
+        int ok=1;
+        for (unsigned workers=0;workers<2;workers++) {
+            ok &= run(binary,"--alpha-test","unused",workers?"2":"0",0);
+            ok &= run(binary,"--clear-on-read","unused",workers?"2":"0",0);
+        }
+        rmdir(dir); return !ok;
+    }
+    if (argc == 2 && (!strcmp(argv[1],"--load-elide") || !strcmp(argv[1],"--feedback-narrow"))) {
+        int feedback=!strcmp(argv[1],"--feedback-narrow");
+        char reference[PATH_MAX]; snprintf(reference,sizeof reference,"%s/reference.bin",dir);
+        int ok = 1;
+        for (int enabled = 0; enabled < 2; enabled++) for (int worker = 0; worker < 2; worker++) {
+            char path[PATH_MAX]; snprintf(path,sizeof path,"%s/pixels-%d-%d.bin",dir,enabled,worker);
+            setenv(feedback ? "TOTK_VK_FEEDBACK_NARROW" : "TOTK_VK_LOAD_ELIDE",enabled ? "1" : "0",1);
+            ok &= run(binary,argv[1],path,worker ? "2" : "0",0);
+            if (!enabled && !worker) { if (rename(path,reference)) ok = 0; }
+            else { ok &= identical(reference,path,(feedback ? 7 : 9)*64*64*4); unlink(path); }
+        }
+        unlink(reference); rmdir(dir); return !ok;
+    }
     if (argc == 2 && !strcmp(argv[1], "--job-reuse")) {
         int ok = 1; const char *workers[] = {"0", "2", "3", "4"};
         for (int i = 0; i < 4; i++) {
@@ -166,13 +188,34 @@ int main(int argc, char **argv) {
         }
         rmdir(dir); return !ok;
     }
-    if (argc != 1) { rmdir(dir); return 2; }
+    int split_only = argc == 2 && !strcmp(argv[1], "--split-only");
+    if (argc != 1 && !split_only) { rmdir(dir); return 2; }
     const char *threads[] = {"0", "2", "3"}, *modes[] = {"--rec-identity", "--rec-boundaries", "--rec-submit"};
     const uint64_t magic[] = {0x5245434944454e33ull, 0x524543424e445933ull, 0x524543424e445933ull}; int ok = 1;
+    if (!split_only) {
     for (int i = 0; i < 2; i++) {
         char log[PATH_MAX]; snprintf(log, sizeof log, "%s/xlate-%d.log", dir, i);
         ok &= run(binary, "--xlate-stats", log, i ? "2" : "0", 0);
         ok &= xlate_log(log); unlink(log);
+    }
+    /* Opt-in hot-path switches: the same bytes as the default inline recorder, in fresh processes at 0/2/3 workers.
+       TOTK_VK_REC_WAKE_BATCH with batched worker wakes and with workers polling the queue before parking (the boundary
+       stream's worker gates run under both); TOTK_VK_TEX_MEMO with every texture/sampler handle changing per draw. */
+    const char *arms[][2] = {{"TOTK_VK_REC_WAKE_BATCH", "1"}, {"TOTK_VK_REC_WAKE_BATCH", "200"}, {"TOTK_VK_TEX_MEMO", "1"}};
+    for (int mode = 0; mode < 3; mode++) {
+        char reference[PATH_MAX], output[PATH_MAX];
+        snprintf(reference, sizeof reference, "%s/arm-m%d-reference.bin", dir, mode);
+        if (!run(binary, modes[mode], reference, "0", 0)) { fprintf(stderr, "%s failed inline (arm reference)\n", modes[mode]); ok = 0; }
+        for (unsigned arm = 0; arm < sizeof arms / sizeof *arms; arm++) for (int i = 0; i < 3; i++) {
+            snprintf(output, sizeof output, "%s/arm-m%d-%u-%s.bin", dir, mode, arm, threads[i]);
+            setenv(arms[arm][0], arms[arm][1], 1);
+            int ran = run(binary, modes[mode], output, threads[i], 0);
+            unsetenv(arms[arm][0]);
+            if (!ran) { fprintf(stderr, "%s failed with %s workers, %s=%s\n", modes[mode], threads[i], arms[arm][0], arms[arm][1]); ok = 0; }
+            printf("%s threads=0 vs %s, %s=%s: ", modes[mode], threads[i], arms[arm][0], arms[arm][1]);
+            ok &= identical(reference, output, magic[mode]); unlink(output);
+        }
+        unlink(reference);
     }
     for (int mode = 0; mode < 3; mode++) {
         char output[2][3][PATH_MAX];
@@ -192,5 +235,31 @@ int main(int argc, char **argv) {
         ok &= identical(output[0][0], output[1][0], magic[mode]);
         for (int widen = 0; widen < 2; widen++) for (int i = 0; i < 3; i++) unlink(output[widen][i]);
     }
+    }
+    /* Pin both LRZ arms and the absent/default arm: lavapipe has no LRZ, so the child checks exact decisions as
+       well as near/far color and depth pixels. --split-only runs this matrix in isolation (including under TSan). */
+    const char *split_modes[] = {"--split-pass", "--split-depth", "--split-depth-only", "--split-depth-mask"};
+    for (unsigned mode = 0; mode < 4; mode++) for (int safe = 0; safe < 3; safe++) for (int arm = 0; arm < 4; arm++) {
+        if (safe < 2) setenv("TOTK_VK_SPLIT_LRZ_SAFE", safe ? "1" : "0", 1); else unsetenv("TOTK_VK_SPLIT_LRZ_SAFE");
+        const char *split[] = {NULL, "64", "1"}, *workers = arm == 3 ? "2" : threads[arm];
+        if (arm == 3) setenv("TOTK_FRAME_LAG", "1", 1);
+        char output[3][PATH_MAX];
+        for (int s = 0; s < 3; s++) {
+            snprintf(output[s], sizeof output[s], "%s/split-%u-%d-%d-%d.bin", dir, mode, safe, arm, s);
+            if (split[s]) setenv("TOTK_VK_SPLIT_PASS_DRAWS", split[s], 1); else unsetenv("TOTK_VK_SPLIT_PASS_DRAWS");
+            if (!run(binary, split_modes[mode], output[s], workers, 0)) {
+                fprintf(stderr, "%s failed with %s workers, split=%s LRZ_SAFE=%d%s\n", split_modes[mode], workers,
+                    split[s] ? split[s] : "off", safe, arm == 3 ? ", lag" : "");
+                ok = 0;
+            }
+        }
+        unsetenv("TOTK_VK_SPLIT_PASS_DRAWS"); unsetenv("TOTK_FRAME_LAG");
+        for (int s = 1; s < 3; s++) {
+            printf("%s threads=%s%s LRZ_SAFE=%d off vs every %s draws: ", split_modes[mode], workers, arm == 3 ? " lag" : "", safe, split[s]);
+            ok &= identical(output[0], output[s], 0x53504c4954504153ull);
+        }
+        for (int s = 0; s < 3; s++) unlink(output[s]);
+    }
+    unsetenv("TOTK_VK_SPLIT_LRZ_SAFE");
     rmdir(dir); return !ok;
 }

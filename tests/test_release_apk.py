@@ -118,7 +118,7 @@ class ReleaseInputTests(unittest.TestCase):
 
     def test_release_version(self):
         # versionName is the app's semver (the game version is shown separately); versionCode grows with it.
-        self.assertEqual(release.APP_VERSION, '1.0.0')
+        release.semver_code(release.APP_VERSION)   # the release version itself must be a valid MAJOR.MINOR.PATCH
         self.assertEqual(release.semver_code('1.0.0'), 10000)
         self.assertEqual([release.semver_code(v) for v in ('1.0.1', '1.1.0', '1.99.99', '2.0.0', '2.0.0-rc1')],
                          [10001, 10100, 19999, 20000, 20000])

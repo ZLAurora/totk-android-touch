@@ -192,6 +192,42 @@ static void missing_invalid_and_evicted_reports_hold_the_last_completed_input(vo
     assert(!valid); /* bounded-cache eviction is observable withholding, not stale provenance */
 }
 
+static void fps_median_is_opt_in_and_preserves_sustained_work(void) {
+    assert(!vk_gpu_time_fps_median_enabled(NULL));
+    const char *off[] = {"", "0", "2", "true", "01", "1 "};
+    for (unsigned i = 0; i < sizeof off / sizeof *off; i++)
+        assert(!vk_gpu_time_fps_median_enabled(off[i]));
+    assert(vk_gpu_time_fps_median_enabled("1"));
+    vk_gpu_time_fps_filter f = {0};
+    const uint64_t addr = 0x1000, low = 12 * 19200, high = 40 * 19200;
+    assert(vk_gpu_time_fps_median(&f, addr, 0, low, 0) == 0);
+    assert(vk_gpu_time_fps_median(&f, addr, 1, high, 1) == high);
+    assert(vk_gpu_time_fps_median(&f, addr, 2, low, 1) == low);
+    assert(vk_gpu_time_fps_median(&f, addr, 3, low, 1) == low);
+    assert(vk_gpu_time_fps_median(&f, addr, 4, high, 1) == low); /* isolated spike */
+    assert(vk_gpu_time_fps_median(&f, addr, 4, high, 1) == low); /* duplicate END */
+    assert(vk_gpu_time_fps_median(&f, addr, 2, low, 1) == low); /* older selected END */
+    assert(f.next == 1); /* interleaved rereads cannot fill the window */
+    assert(f.count == 3 && f.next == 1);
+    assert(vk_gpu_time_fps_median(&f, addr, 5, high, 1) == high); /* second overload */
+    assert(vk_gpu_time_fps_median(&f, addr, 6, 0, 0) == high); /* invalid must not zero */
+    assert(vk_gpu_time_fps_median(&f, addr, 6, high, 1) == high);
+    assert(vk_gpu_time_fps_median(&f, addr, 7, low, 1) == high); /* recovery delay */
+    assert(vk_gpu_time_fps_median(&f, addr, 8, low, 1) == low);
+    /* Address is part of identity; equal timestamps in distinct reports count. */
+    assert(vk_gpu_time_fps_median(&f, addr + 16, 8, high, 1) == low);
+    assert(vk_gpu_time_fps_median(&f, addr + 32, 8, high, 1) == high);
+    /* Median ordering and full tick range, without sum/overflow. */
+    uint64_t perm[6][3] = {{0,1,UINT64_MAX},{0,UINT64_MAX,1},{1,0,UINT64_MAX},
+        {1,UINT64_MAX,0},{UINT64_MAX,0,1},{UINT64_MAX,1,0}};
+    for (unsigned i = 0; i < 6; i++) {
+        vk_gpu_time_fps_filter p = {0};
+        for (unsigned j = 0; j < 3; j++)
+            vk_gpu_time_fps_median(&p, addr, j + 1, perm[i][j], 1);
+        assert(p.output == 1);
+    }
+}
+
 int main(void) {
     replay_delay_does_not_change_guest_timing();
     reports_are_monotonic_and_not_before_submit();
@@ -204,6 +240,7 @@ int main(void) {
     latency_mode_returns_raw_query_unchanged();
     lagged_controller_subtracts_the_report_owners_origin();
     missing_invalid_and_evicted_reports_hold_the_last_completed_input();
+    fps_median_is_opt_in_and_preserves_sustained_work();
     puts("vk_gpu_time tests passed");
     return 0;
 }

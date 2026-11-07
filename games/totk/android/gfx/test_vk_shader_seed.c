@@ -6,6 +6,10 @@ int main(int argc, char **argv) {
     assert(argc == 2);
     const char *game_dir = getenv("TEST_GAME_DIR");
     if (game_dir) vk_shader_seed_startup(game_dir);
+    if (getenv("TEST_POSITION_MUTATE")) {
+        setenv("TOTK_VK_POS_INVARIANT", "0", 1);
+        setenv("TOTK_VK_POS_NOCONTRACT", "0", 1);
+    }
     if (!strcmp(argv[1], "--unready")) {
         assert(!vk_shaders_ready()); assert(!vk_shaders_ready());
         puts(seed_dir()); return 0;

@@ -22,6 +22,11 @@ int nvn_swizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const void
    Padding stays untouched. Spans beyond actual texels are allowed for trailing level/layer alignment. */
 int nvn_swizzle_span(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src_linear, size_t src_pitch,
                      void *dst_storage, uint64_t offset, uint64_t size);
+/* The decoder over the same kind of span: only the texels stored in [offset, offset + size) of this level/layer land in
+   dst_linear, at the places nvn_deswizzle puts them. Disjoint spans write disjoint bytes, so spans that tile the
+   level/layer may be decoded concurrently and together equal nvn_deswizzle (parallel uploads, vk_upload_pool.c). */
+int nvn_deswizzle_span(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src_storage, void *dst_linear,
+                       size_t dst_pitch, uint64_t offset, uint64_t size);
 // 单点地址：本级本层内，线性 (x 字节, y 块行, z 切片) → 相对本级本层起点的块线性字节偏移（单测按手算核）
 // Single-point address: within this level and layer, linear (x byte, y block row, z slice) → block-linear byte offset relative to the start of this level and layer (unit tests verify against hand calculation)
 uint64_t nvn_bl_offset(uint32_t x, uint32_t y, uint32_t z, uint32_t row_bytes, uint32_t rows, unsigned tileH, unsigned tileD);

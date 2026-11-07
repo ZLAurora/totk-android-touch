@@ -105,6 +105,8 @@ static void adaptive_lifecycle(int window, int paused) {
     adaptive_lifecycle_calls++; adaptive_window=window; adaptive_paused=paused;
 }
 static void (*runtime_fps_adaptive_lifecycle)(int,int)=adaptive_lifecycle;
+static int watch_paused=-1;   /* the stall watchdog's pause: no window or in the background */
+static void runtime_progress_pause(int paused) { watch_paused=paused; }
 ''' + timeline_lifecycle + '''
 typedef struct ANativeWindow { int id; } ANativeWindow;
 typedef struct ANativeActivity { int unused; } ANativeActivity;
@@ -132,15 +134,18 @@ int main(int argc, char **argv) {
         present_timeline_lifecycle(-1,1);
         int paused=present_timeline_generation==8 && !present_timeline_snapshot.count &&
             present_timeline_window==1 && present_timeline_paused==1 &&
-            adaptive_slots_epoch_ns==1001 && adaptive_lifecycle_calls==1 && adaptive_window==-1 && adaptive_paused==1;
+            adaptive_slots_epoch_ns==1001 && adaptive_lifecycle_calls==1 && adaptive_window==-1 && adaptive_paused==1 &&
+            watch_paused==1;
         present_timeline_snapshot.count=2;
         present_timeline_lifecycle(0,-1);
         int destroyed=present_timeline_generation==9 && !present_timeline_snapshot.count &&
             !present_timeline_window && present_timeline_paused==1 &&
-            adaptive_slots_epoch_ns==1002 && adaptive_lifecycle_calls==2 && adaptive_window==0 && adaptive_paused==-1;
+            adaptive_slots_epoch_ns==1002 && adaptive_lifecycle_calls==2 && adaptive_window==0 && adaptive_paused==-1 &&
+            watch_paused==1;
         present_timeline_lifecycle(1,0);
         int resumed=present_timeline_generation==10 && present_timeline_window==1 && !present_timeline_paused &&
-            adaptive_slots_epoch_ns==1003 && adaptive_lifecycle_calls==3 && adaptive_window==1 && adaptive_paused==0;
+            adaptive_slots_epoch_ns==1003 && adaptive_lifecycle_calls==3 && adaptive_window==1 && adaptive_paused==0 &&
+            !watch_paused;
         present_timeline_snapshot.count=2;
         present_timeline_lifecycle(-1,-1);
         printf("%d %d %d %d\\n",paused,destroyed,resumed,

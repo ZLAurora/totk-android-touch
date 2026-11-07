@@ -235,7 +235,7 @@ static void note_occlusion(const char *when){int v=(window.occlusionState&NSWind
 @end
 static TOTKWindowDelegate *windowDelegate;
 int runtime_front_window_visible(void){return atomic_load(&windowVisible);}
-void runtime_front_request_close(void){dispatch_async(dispatch_get_main_queue(), ^{[window performClose:nil];});}
+int runtime_front_request_close(void){dispatch_async(dispatch_get_main_queue(), ^{[window performClose:nil];});return 1;}
 /* Use the window-close path, not terminate:, so Command-Q also waits for active saves. */
 static void front_install_menu(void){
  NSMenu *menu=[NSMenu new],*appMenu=[NSMenu new];
