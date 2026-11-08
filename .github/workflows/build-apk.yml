@@ -69,7 +69,9 @@ jobs:
               -alias totk -keyalg RSA -keysize 2048 -validity 10000 \
               -storepass "$KEY_PASS" -keypass "$KEY_PASS" -dname "CN=Personal TotK build"
           fi
-
+          
+      - name: Apply touch patches
+        run: python3 touchmod/apply_patches.py
       - name: Build APK
         run: |
           python3 games/totk/android/build_release.py \
