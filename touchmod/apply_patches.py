@@ -63,3 +63,19 @@ patch(SA, 'if (lostRoles(role)) { card.state(Strings.CANT_OPEN, Theme.WARN, pick
       f'if (lostRoles(role)) {{ card.state(Strings.CANT_OPEN, Theme.WARN, multi(role) ? {HINT} : picked); if (multi(role)) tapHint(card); problems = true; }}')
 patch(SA, 'else if (problem != null) { card.state(problem, Theme.WARN, picked); problems = true; }',
       f'else if (problem != null) {{ card.state(problem, Theme.WARN, multi(role) ? {HINT} : picked); if (multi(role)) tapHint(card); problems = true; }}')
+
+# ---- Build 2a: touch overlay ----
+import shutil
+FE = 'games/totk/runtime/frontend_android.c'
+TA = 'games/totk/android/java/com/aure/totk/TotkActivity.java'
+touch_dir = ROOT / 'games/totk/android/java/com/aure/totk/touch'
+touch_dir.mkdir(parents=True, exist_ok=True)
+shutil.copy(ROOT / 'touchmod/java/TouchOverlay.java', touch_dir / 'TouchOverlay.java')
+shutil.copy(ROOT / 'touchmod/native/touch_input_android.h', ROOT / 'games/totk/runtime/touch_input_android.h')
+patch(FE, '#include "overlay_chord.h"', '#include "overlay_chord.h"\n#include "touch_input_android.h"')
+patch(FE, 'out->connected = g_pad_seen;', 'out->connected = g_pad_seen;\n    touch_merge(out);')
+patch(TA, 'private PresentationController companion;', 'private PresentationController companion;\n    private com.aure.totk.touch.TouchOverlay touch;')
+patch(TA, 'super.onCreate(state);', 'super.onCreate(state);\n        touch = new com.aure.totk.touch.TouchOverlay(this);')
+patch(TA, 'super.onResume();', 'super.onResume();\n        if (touch != null) touch.resume();')
+patch(TA, '@Override protected void onPause() {', '@Override protected void onPause() {\n        if (touch != null) touch.pause();')
+patch(TA, '@Override protected void onDestroy() {', '@Override protected void onDestroy() {\n        if (touch != null) { touch.close(); touch = null; }')
