@@ -18,6 +18,7 @@ def patch(path, old, new):
 
 SA = 'games/totk/android/java/com/aure/totk/setup/SetupActivity.java'
 UL = 'android.graphics.Paint.UNDERLINE_TEXT_FLAG'
+PX = 'android.util.TypedValue.COMPLEX_UNIT_PX'
 
 # 1. tapping the "or a whole folder / or pick the three files" line opens the other picker
 patch(SA, 'card.setTag("pick:" + role);',
@@ -25,10 +26,20 @@ patch(SA, 'card.setTag("pick:" + role);',
       '            card.detail.setFocusable(false);\n'
       '            card.detail.setOnClickListener(v -> pick(role, multi(role) && inputs.get(role).isEmpty() ? !primaryFolder(role) : primaryFolder(role)));')
 
-# 2. underline that line while nothing is picked, so it looks tappable
+# 2. reset the line to its normal look on every refresh
 patch(SA, 'Widgets.Card card = slotCards.get(role);',
       'Widgets.Card card = slotCards.get(role);\n'
-      f'            if (card != null) card.detail.setPaintFlags(card.detail.getPaintFlags() & ~{UL});')
+      '            if (card != null) {\n'
+      '                if (card.detail.getTag() == null) card.detail.setTag(Float.valueOf(card.detail.getTextSize()));\n'
+      f'                card.detail.setTextSize({PX}, (Float) card.detail.getTag());\n'
+      '                card.detail.setPadding(0, 0, 0, 0);\n'
+      f'                card.detail.setPaintFlags(card.detail.getPaintFlags() & ~{UL});\n'
+      '            }')
+
+# 3. while nothing is picked: underlined, 50% bigger, with padding so it is easy to hit
 patch(SA, 'multi(role) ? (folder ? Strings.PICK_OR_FILES : Strings.PICK_OR_FOLDER) : null);',
       'multi(role) ? (folder ? Strings.PICK_OR_FILES : Strings.PICK_OR_FOLDER) : null);\n'
-      f'                card.detail.setPaintFlags(card.detail.getPaintFlags() | {UL});')
+      f'                card.detail.setPaintFlags(card.detail.getPaintFlags() | {UL});\n'
+      '                float tapSize = card.detail.getTextSize() * 1.5f;\n'
+      f'                card.detail.setTextSize({PX}, tapSize);\n'
+      '                card.detail.setPadding(0, (int) (tapSize * 0.35f), 0, (int) (tapSize * 0.35f));')
