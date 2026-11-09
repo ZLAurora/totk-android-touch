@@ -93,3 +93,37 @@ if VARIANT == 'c':
           'WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,')
     patch(TOF, 'setSystemUiVisibility(0x1706);', 'setLayerType(View.LAYER_TYPE_SOFTWARE, null);')
     patch(TOF, 'lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;', '')
+
+# ---- touch hook: register natives by hand + on-screen diagnostic ----
+CJ = 'games/totk/runtime/companion_jni.c'
+_hdr = (ROOT / 'games/totk/runtime/touch_input_android.h').read_text(encoding='utf-8')
+_protos = 'void Java_com_aure_totk_touch_TouchNative_nativeSet(JNIEnv *env, jclass cls, jlong buttons, jint lx, jint ly, jint rx, jint ry);\n'
+_entries = '{"nativeSet", "(JIIII)V", (void *)Java_com_aure_totk_touch_TouchNative_nativeSet},\n'
+if 'nativeAspect' in _hdr:
+    _protos += ('void Java_com_aure_totk_touch_TouchNative_nativeAspect(JNIEnv *env, jclass cls, jfloat ratio);\n'
+                'void Java_com_aure_totk_touch_TouchNative_nativeAnchor(JNIEnv *env, jclass cls, jint mode);\n')
+    _entries += ('{"nativeAspect", "(F)V", (void *)Java_com_aure_totk_touch_TouchNative_nativeAspect},\n'
+                 '{"nativeAnchor", "(I)V", (void *)Java_com_aure_totk_touch_TouchNative_nativeAnchor},\n')
+patch(CJ, 'void runtime_android_present_transform_hint(uint64_t epoch, int hint);',
+      'void runtime_android_present_transform_hint(uint64_t epoch, int hint);\n' + _protos)
+_old = '} else (*env)->ExceptionClear(env); /* NativeActivity-only APK: optional Java hint unavailable. */'
+patch(CJ, _old, _old + '''
+    {   /* touchmod: the overlay's natives, registered by hand like the others */
+        jclass tc = (*env)->FindClass(env, "com/aure/totk/touch/TouchNative");
+        if (tc) {
+            static const JNINativeMethod touch_methods[] = {
+''' + _entries + '''            };
+            if ((*env)->RegisterNatives(env, tc, touch_methods, sizeof touch_methods / sizeof *touch_methods)) {
+                (*env)->ExceptionClear(env); fprintf(stderr, "[touch] RegisterNatives failed\\n");
+            }
+        } else { (*env)->ExceptionClear(env); fprintf(stderr, "[touch] TouchNative class not found\\n"); }
+    }''')
+
+TOF2 = 'games/totk/android/java/com/aure/totk/touch/TouchOverlay.java'
+patch(TOF2, 'private boolean hidden, forceShow, controller, nativeOk = true;', 'private boolean hidden, forceShow, controller, nativeOk = true, sentOk;')
+patch(TOF2, 'try { TouchNative.nativeSet(m, lx, ly, rx, ry); }', 'try { TouchNative.nativeSet(m, lx, ly, rx, ry); sentOk = true; }')
+patch(TOF2, 'text(c, controller && !forceShow ? "Show" : hidden ? "Show" : "Hide", 57.5f * u, 5.56f * H / 100f, u, false, 0, false, false);',
+      '''text(c, controller && !forceShow ? "Show" : hidden ? "Show" : "Hide", 57.5f * u, 5.56f * H / 100f, u, false, 0, false, false);
+        p.setShader(null); p.setStyle(Paint.Style.FILL); p.setColor(0xAA000000); c.drawRect(0, H - 3.2f * u, 28 * u, H, p);
+        tp.setShader(null); tp.setTypeface(Typeface.DEFAULT); tp.setTextSkewX(0); tp.setTextSize(1.8f * u); tp.setColor(0xFFFFFFFF);
+        c.drawText("touch " + (nativeOk ? (sentOk ? "ok" : "idle") : "HOOK MISSING") + " mask=" + Long.toHexString(lastMask), .5f * u, H - 1f * u, tp);''')
