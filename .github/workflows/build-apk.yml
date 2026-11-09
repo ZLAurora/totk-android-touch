@@ -71,7 +71,7 @@ jobs:
           fi
           
       - name: Apply touch patches
-        run: python3 touchmod/apply_patches.py
+        run: python3 touchmod/apply_patches.py --setup-only
       - name: Build APK
         run: |
           python3 games/totk/android/build_release.py \
