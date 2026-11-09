@@ -1,7 +1,9 @@
 package com.aure.totk.touch;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.Context;
+import android.content.SharedPreferences;
 import android.graphics.Canvas;
 import android.graphics.LinearGradient;
 import android.graphics.Paint;
@@ -17,12 +19,20 @@ import android.os.Looper;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
 import android.os.VibratorManager;
+import android.text.InputType;
 import android.util.Log;
 import android.util.SparseArray;
+import android.view.Choreographer;
 import android.view.InputDevice;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
+import android.widget.CheckBox;
+import android.widget.EditText;
+import android.widget.LinearLayout;
+import android.widget.ScrollView;
+import android.widget.SeekBar;
+import android.widget.TextView;
 import java.util.Arrays;
 
 /** Touch controls in a window of their own above the game (the game owns its activity window's surface). */
@@ -40,7 +50,7 @@ public final class TouchOverlay implements InputManager.InputDeviceListener {
         input = activity.getSystemService(InputManager.class);
         input.registerInputDeviceListener(this, ui);
     }
-    public void resume() { closed = false; show(); if (view != null) view.setVisibility(View.VISIBLE); }
+    public void resume() { closed = false; show(); TouchDisplay.applySaved(activity); if (view != null) view.setVisibility(View.VISIBLE); }
     public void pause() { if (view != null) { view.setVisibility(View.INVISIBLE); view.release(); } }
     public void close() {
         closed = true;
@@ -55,16 +65,17 @@ public final class TouchOverlay implements InputManager.InputDeviceListener {
         if (view != null || closed) return;
         View decor = activity.getWindow().getDecorView();
         if (decor.getWindowToken() == null) { if (tries++ < 50) ui.postDelayed(this::show, 100); return; }
-        TouchView v = new TouchView(activity);
+        final TouchView v = new TouchView(activity);
         v.setController(controllerConnected());
+        v.displayHook = () -> TouchDisplay.open(activity);
+        v.aimHook = () -> TouchSettings.open(activity, v::reloadAim);
         WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
                 WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT,
                 WindowManager.LayoutParams.TYPE_APPLICATION_PANEL,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
-                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS | WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
                 PixelFormat.TRANSLUCENT);
         lp.token = decor.getWindowToken();
-        lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
         lp.setTitle("TotkTouch");
         try { activity.getWindowManager().addView(v, lp); view = v; }
         catch (RuntimeException failed) { Log.w(TAG, "overlay window failed", failed); }
@@ -82,10 +93,161 @@ public final class TouchOverlay implements InputManager.InputDeviceListener {
     @Override public void onInputDeviceChanged(int id) { refresh(); }
 }
 
-/** JNI: runtime/touch_input_android.h. */
+/** JNI: runtime/touch_input_android.h (registered by hand in companion_jni.c). */
 final class TouchNative {
     static { System.loadLibrary("totk"); }
     static native void nativeSet(long buttons, int lx, int ly, int rx, int ry);
+    static native void nativeAim(float sx, float sy, float dt);
+    static native void nativeAspect(float ratio);
+    static native void nativeAnchor(int mode);
+}
+
+/** Touch aim: finger velocity -> right-stick deflection, with fling coasting. Plain Java, no game dependencies. */
+final class TouchAim {
+    float sensX = 1, sensY = 1, curve = 1.2f, offset = 0.1f, smoothMs = 15, tau = 90, cutMs = 300, rampMs = 60, minFling = 700, backlogMs = 0;
+    boolean invertY;
+    private static final float V0 = 1200f;   // dp/s that gives full deflection at sensitivity 1
+    private boolean down, coasting;
+    private float accX, accY, vx, vy, v0x, v0y, coastT, debt, dirX, dirY;
+
+    void load(SharedPreferences sp) {
+        sensX = sp.getFloat("sensX", 1f); sensY = sp.getFloat("sensY", 1f); curve = sp.getFloat("curve", 1.2f);
+        offset = sp.getFloat("offset", 0.1f); smoothMs = sp.getFloat("smooth", 15f); tau = Math.max(1f, sp.getFloat("tau", 90f));
+        cutMs = sp.getFloat("cut", 300f); rampMs = Math.max(1f, sp.getFloat("ramp", 60f)); minFling = sp.getFloat("minfling", 700f);
+        backlogMs = sp.getFloat("backlog", 0f); invertY = sp.getBoolean("invertY", false);
+    }
+    void touchDown() { down = true; coasting = false; vx = vy = 0; accX = accY = 0; }
+    void move(float dxDp, float dyDp) { accX += dxDp; accY += dyDp; }
+    void touchUp() {
+        down = false;
+        if (Math.hypot(vx, vy) >= minFling) { coasting = true; v0x = vx; v0y = vy; coastT = 0; } else { vx = vy = 0; }
+    }
+    void cancel() { down = false; coasting = false; vx = vy = 0; debt = 0; }
+    boolean active() { return down || coasting || debt > 0; }
+    /** Advance dt seconds; out = stick x, y in -1..1 (up is +y). */
+    void step(float dt, float[] out) {
+        if (down) {
+            float ix = accX / dt, iy = accY / dt; accX = accY = 0;
+            float a = smoothMs <= 0 ? 1f : 1f - (float) Math.exp(-dt * 1000f / smoothMs);
+            vx += (ix - vx) * a; vy += (iy - vy) * a;
+        } else if (coasting) {
+            coastT += dt;
+            float ms = coastT * 1000f, f = (float) Math.exp(-ms / tau);
+            if (ms > cutMs) f *= Math.max(0f, 1f - (ms - cutMs) / rampMs);
+            if (f < 0.01f) { coasting = false; vx = vy = 0; } else { vx = v0x * f; vy = v0y * f; }
+        }
+        float fx = shape(vx) * sensX, fy = -shape(vy) * sensY * (invertY ? -1f : 1f);
+        float m = (float) Math.hypot(fx, fy);
+        if (m > 0.001f) { dirX = fx / m; dirY = fy / m; }
+        float cap = backlogMs / 1000f;
+        if (m > 1f) { debt = Math.min(cap, debt + (m - 1f) * dt); m = 1f; }
+        else if (debt > 0f && cap > 0f) { float add = Math.min(1f - m, debt / dt); m += add; debt -= add * dt; }
+        else debt = 0f;
+        if (m < 0.01f) m = 0f; else m = offset + (1f - offset) * Math.min(1f, m);
+        out[0] = dirX * m; out[1] = dirY * m;
+    }
+    private float shape(float v) { return Math.signum(v) * (float) Math.pow(Math.abs(v) / V0, curve); }
+}
+
+/** Aim settings panel: every value is saved on the device and applied at once. */
+final class TouchSettings {
+    private static final class P {
+        final String key, label; final float min, max, def, step;
+        P(String key, String label, float min, float max, float def, float step) { this.key = key; this.label = label; this.min = min; this.max = max; this.def = def; this.step = step; }
+    }
+    private static final P[] PARAMS = {
+        new P("sensX", "Aim sensitivity X", 0.2f, 4f, 1f, 0.05f), new P("sensY", "Aim sensitivity Y", 0.2f, 4f, 1f, 0.05f),
+        new P("curve", "Response curve (1 = linear)", 0.6f, 2f, 1.2f, 0.05f), new P("offset", "Dead-zone compensation", 0f, 0.4f, 0.1f, 0.01f),
+        new P("smooth", "Smoothing (ms)", 0f, 60f, 15f, 1f), new P("tau", "Fling time constant (ms)", 20f, 400f, 90f, 5f),
+        new P("cut", "Fling hard cut-off (ms)", 50f, 800f, 300f, 10f), new P("ramp", "Cut-off ramp to zero (ms)", 10f, 300f, 60f, 5f),
+        new P("minfling", "Minimum fling speed", 200f, 3000f, 700f, 50f), new P("backlog", "Flick backlog (ms, 0 = off)", 0f, 600f, 0f, 10f),
+    };
+    static SharedPreferences prefs(Context c) { return c.getSharedPreferences("touch", Context.MODE_PRIVATE); }
+    private static String text(P p, float v) { return p.label + ": " + (Math.round(v * 100) / 100f) + "   (default " + p.def + ")"; }
+    private static CheckBox check(Context a, SharedPreferences sp, String key, String label, Runnable changed) {
+        CheckBox c = new CheckBox(a); c.setText(label); c.setChecked(sp.getBoolean(key, false));
+        c.setOnCheckedChangeListener((b, on) -> { sp.edit().putBoolean(key, on).apply(); changed.run(); });
+        return c;
+    }
+    static void open(Activity a, Runnable changed) {
+        SharedPreferences sp = prefs(a);
+        int pad = (int) (12 * a.getResources().getDisplayMetrics().density);
+        LinearLayout col = new LinearLayout(a); col.setOrientation(LinearLayout.VERTICAL); col.setPadding(pad, pad, pad, pad);
+        for (P p : PARAMS) {
+            TextView label = new TextView(a); SeekBar bar = new SeekBar(a);
+            bar.setMax(Math.round((p.max - p.min) / p.step));
+            float cur = sp.getFloat(p.key, p.def);
+            bar.setProgress(Math.round((cur - p.min) / p.step));
+            label.setText(text(p, cur));
+            bar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                @Override public void onProgressChanged(SeekBar s, int v, boolean user) {
+                    float val = p.min + v * p.step; label.setText(text(p, val));
+                    if (user) { sp.edit().putFloat(p.key, val).apply(); changed.run(); }
+                }
+                @Override public void onStartTrackingTouch(SeekBar s) { }
+                @Override public void onStopTrackingTouch(SeekBar s) { }
+            });
+            col.addView(label); col.addView(bar);
+        }
+        col.addView(check(a, sp, "invertY", "Invert vertical aim", changed));
+        col.addView(check(a, sp, "joystick", "Right side: joystick instead of touch aim", changed));
+        ScrollView sv = new ScrollView(a); sv.addView(col);
+        new AlertDialog.Builder(a).setTitle("Touch aim").setView(sv).setPositiveButton("Done", null)
+                .setNeutralButton("Reset", (d, w) -> {
+                    SharedPreferences.Editor e = sp.edit();
+                    for (P p : PARAMS) e.remove(p.key);
+                    e.remove("invertY"); e.remove("joystick"); e.apply(); changed.run();
+                }).show();
+    }
+}
+
+/** Display menu: aspect ratio (live, through the game's camera patch) and HUD anchoring. */
+final class TouchDisplay {
+    private static final String[] NAMES = {"16:9 (the game's own)", "18:9", "19.5:9", "20:9", "21:9", "16:10", "Fit my screen", "Custom..."};
+    private static final float[] RATIOS = {0f, 2f, 19.5f / 9f, 20f / 9f, 21f / 9f, 1.6f, -1f, -2f};
+    private static SharedPreferences prefs(Context c) { return c.getSharedPreferences("touch", Context.MODE_PRIVATE); }
+    private static float ratio(Activity a) {
+        float r = prefs(a).getFloat("aspect", 0f);
+        if (r == -1f) { View d = a.getWindow().getDecorView(); return d.getHeight() > 0 ? d.getWidth() / (float) d.getHeight() : 0f; }
+        return r;
+    }
+    static void apply(Activity a) {
+        try { TouchNative.nativeAspect(ratio(a)); TouchNative.nativeAnchor(prefs(a).getInt("anchor", 0)); }
+        catch (LinkageError missing) { }
+    }
+    /** The game installs its camera patch while it starts, so the saved ratio is applied a few times. */
+    static void applySaved(Activity a) {
+        Handler h = new Handler(Looper.getMainLooper());
+        for (int ms : new int[]{1500, 5000, 15000, 40000}) h.postDelayed(() -> apply(a), ms);
+    }
+    static void open(Activity a) {
+        float cur = prefs(a).getFloat("aspect", 0f);
+        int anchor = prefs(a).getInt("anchor", 0);
+        String[] items = new String[NAMES.length + 1];
+        for (int i = 0; i < NAMES.length; i++) items[i] = (RATIOS[i] == cur ? "\u2713 " : "") + NAMES[i];
+        items[NAMES.length] = "HUD anchor: " + (anchor == 1 ? "screen edges (experimental)" : "centre");
+        new AlertDialog.Builder(a).setTitle("Display").setItems(items, (d, which) -> {
+            if (which == NAMES.length) { prefs(a).edit().putInt("anchor", 1 - anchor).apply(); apply(a); open(a); }
+            else if (RATIOS[which] == -2f) custom(a);
+            else { prefs(a).edit().putFloat("aspect", RATIOS[which]).apply(); apply(a); }
+        }).show();
+    }
+    private static void custom(Activity a) {
+        EditText t = new EditText(a);
+        t.setHint("21:9, 2.1 or 3440x1440"); t.setInputType(InputType.TYPE_CLASS_TEXT);
+        new AlertDialog.Builder(a).setTitle("Custom ratio").setView(t).setNegativeButton("Cancel", null)
+                .setPositiveButton("Set", (d, w) -> {
+                    float r = parse(t.getText().toString());
+                    if (r > 0) { prefs(a).edit().putFloat("aspect", r).apply(); apply(a); }
+                }).show();
+    }
+    static float parse(String s) {
+        try {
+            s = s.trim().toLowerCase().replace('x', ':');
+            float r = s.contains(":") ? Float.parseFloat(s.split(":")[0]) / Float.parseFloat(s.split(":")[1]) : Float.parseFloat(s);
+            return r >= 0.5f && r <= 8f ? r : 0f;
+        } catch (RuntimeException bad) { return 0f; }
+    }
 }
 
 /** Default layout (your preview layout): x, y = centre in % of the screen; w, h in % of the screen width. */
@@ -125,6 +287,7 @@ final class TouchView extends View {
     private static final String TAG = "TotkTouch";
     private static final int PRESS_FILL = 0xFF065E25, PRESS_LINE = 0xFF89E8A9, BLACK = 0xB8000000;
     private static final float STICK_R = 6.5f;   // in % of the screen width
+    private static final float[] SYS_X = {42.5f, 50f, 57.5f};
     private final TouchLayout.Btn[] bs = TouchLayout.defaults();
     private final boolean[] toggled = new boolean[bs.length];
     private final SparseArray<Ptr> ptrs = new SparseArray<>();
@@ -132,12 +295,16 @@ final class TouchView extends View {
     private final RectF r = new RectF(), rr = new RectF();
     private final Typeface face = Typeface.create(Typeface.SANS_SERIF, 250, false);
     private final Vibrator vib;
-    private boolean hidden, forceShow, controller, nativeOk = true;
-    private long lastMask = -1;
+    private final float density;
+    private boolean hidden, forceShow, controller, nativeOk = true, joystick, looping;
+    private long lastMask = -1, lastFrame;
     private final int[] lastAx = {1, 1, 1, 1};
+    final TouchAim aim = new TouchAim();
+    Runnable displayHook, aimHook;
+    private final float[] aimOut = new float[2];
 
     private static final class Ptr {
-        final boolean[] own, hov; int stick = -1; float cx, cy, px, py;
+        final boolean[] own, hov; int stick = -1; boolean aim; float cx, cy, px, py;
         Ptr(int n) { own = new boolean[n]; hov = new boolean[n]; }
     }
 
@@ -145,11 +312,17 @@ final class TouchView extends View {
         super(context);
         VibratorManager vm = context.getSystemService(VibratorManager.class);
         vib = vm == null ? null : vm.getDefaultVibrator();
-        setSystemUiVisibility(0x1706);
+        density = context.getResources().getDisplayMetrics().density;
+        setLayerType(View.LAYER_TYPE_SOFTWARE, null);
+        reloadAim();
+    }
+    void reloadAim() {
+        SharedPreferences sp = TouchSettings.prefs(getContext());
+        aim.load(sp); joystick = sp.getBoolean("joystick", false);
     }
     void setController(boolean c) { controller = c; publish(); invalidate(); }
     private boolean showButtons() { return !hidden && (!controller || forceShow); }
-    void release() { ptrs.clear(); lastMask = -1; send(0, 0, 0, 0, 0); invalidate(); }
+    void release() { ptrs.clear(); lastMask = -1; aim.cancel(); send(0, 0, 0, 0, 0); sendAim(0, 0, 0.01f); invalidate(); }
 
     @Override protected void onLayout(boolean changed, int l, int t, int rt, int b) {
         super.onLayout(changed, l, t, rt, b);
@@ -157,14 +330,28 @@ final class TouchView extends View {
         setSystemGestureExclusionRects(Arrays.asList(new Rect(0, 0, m, h), new Rect(w - m, 0, w, h)));
     }
 
+    // ---- aim loop (one step per display frame while a finger aims or a fling coasts) ----
+    private final Choreographer.FrameCallback frame = new Choreographer.FrameCallback() {
+        @Override public void doFrame(long t) {
+            float dt = lastFrame == 0 ? 0.0083f : Math.min(0.05f, Math.max(0.0005f, (t - lastFrame) / 1e9f));
+            lastFrame = t;
+            aim.step(dt, aimOut);
+            sendAim(aimOut[0], aimOut[1], dt);
+            if (aim.active()) Choreographer.getInstance().postFrameCallback(this); else { looping = false; lastFrame = 0; }
+        }
+    };
+    private void startLoop() { if (!looping) { looping = true; lastFrame = 0; Choreographer.getInstance().postFrameCallback(frame); } }
+    private boolean aimBusy() { for (int k = 0; k < ptrs.size(); k++) if (ptrs.valueAt(k).aim) return true; return false; }
+
     // ---- touch ----
     private boolean contains(int i, float x, float y) {
         float u = getWidth() / 100f, cx = bs[i].x * u, cy = bs[i].y * getHeight() / 100f;
         return Math.abs(x - cx) <= bs[i].w * u / 2 && Math.abs(y - cy) <= bs[i].h * u / 2;
     }
-    private boolean inHide(float x, float y) {
-        float u = getWidth() / 100f;
-        return Math.abs(x - 57.5f * u) <= 2.45f * u && Math.abs(y - 5.56f * getHeight() / 100f) <= 1.75f * u;
+    private int sysAt(float x, float y) {
+        float u = getWidth() / 100f, cy = 5.56f * getHeight() / 100f;
+        for (int i = 0; i < SYS_X.length; i++) if (Math.abs(x - SYS_X[i] * u) <= 2.45f * u && Math.abs(y - cy) <= 1.75f * u) return i;
+        return -1;
     }
     private boolean pressed(int i) {
         if ((bs[i].flags & TouchLayout.TOG) != 0) return toggled[i];
@@ -172,6 +359,11 @@ final class TouchView extends View {
         return false;
     }
     private void tick() { if (vib != null) vib.vibrate(VibrationEffect.createOneShot(12, 120)); }
+    private void end(int id) {
+        Ptr q = ptrs.get(id);
+        if (q != null && q.aim) { aim.touchUp(); startLoop(); }
+        ptrs.remove(id);
+    }
 
     @Override public boolean onTouchEvent(MotionEvent e) {
         int act = e.getActionMasked(), idx = e.getActionIndex();
@@ -179,17 +371,25 @@ final class TouchView extends View {
             case MotionEvent.ACTION_DOWN: requestUnbufferedDispatch(e); down(e.getPointerId(0), e.getX(0), e.getY(0)); break;
             case MotionEvent.ACTION_POINTER_DOWN: down(e.getPointerId(idx), e.getX(idx), e.getY(idx)); break;
             case MotionEvent.ACTION_MOVE: for (int k = 0; k < e.getPointerCount(); k++) move(e.getPointerId(k), e.getX(k), e.getY(k)); break;
-            case MotionEvent.ACTION_UP: case MotionEvent.ACTION_POINTER_UP: ptrs.remove(e.getPointerId(idx)); break;
-            case MotionEvent.ACTION_CANCEL: ptrs.clear(); break;
+            case MotionEvent.ACTION_UP: case MotionEvent.ACTION_POINTER_UP: end(e.getPointerId(idx)); break;
+            case MotionEvent.ACTION_CANCEL: while (ptrs.size() > 0) end(ptrs.keyAt(0)); break;
             default: break;
         }
         publish(); invalidate();
         return true;
     }
     private void down(int id, float x, float y) {
-        if (inHide(x, y)) { if (controller && !forceShow) forceShow = true; else hidden = !hidden; tick(); return; }
+        int s = sysAt(x, y);
+        if (s >= 0) {
+            tick();
+            if (s == 0) { if (aimHook != null) aimHook.run(); }
+            else if (s == 1) { if (displayHook != null) displayHook.run(); }
+            else if (controller && !forceShow) forceShow = true; else hidden = !hidden;
+            return;
+        }
         if (!showButtons()) return;
         Ptr q = new Ptr(bs.length); ptrs.put(id, q);
+        q.px = x; q.py = y;
         int top = -1;
         for (int i = bs.length - 1; i >= 0; i--) {   // topmost first; a button passes the touch on only with THRU_BTN
             if (!contains(i, x, y)) continue;
@@ -200,7 +400,9 @@ final class TouchView extends View {
         }
         if (top >= 0) tick();
         if (top < 0 || (bs[top].flags & TouchLayout.THRU_CAM) != 0) {
-            q.stick = x < getWidth() / 2f ? 0 : 1; q.cx = x; q.cy = y; q.px = x; q.py = y;
+            boolean right = x >= getWidth() / 2f;
+            if (right && !joystick) { if (!aimBusy()) { q.aim = true; aim.touchDown(); startLoop(); } }
+            else { q.stick = right ? 1 : 0; q.cx = x; q.cy = y; }
         }
     }
     private void move(int id, float x, float y) {
@@ -212,6 +414,7 @@ final class TouchView extends View {
             if (in && !q.hov[i]) { q.hov[i] = true; if ((bs[i].flags & TouchLayout.TOG) != 0) toggled[i] = !toggled[i]; tick(); }
             else if (!in) q.hov[i] = false;
         }
+        if (q.aim) aim.move((x - q.px) / density, (y - q.py) / density);
         q.px = x; q.py = y;
     }
 
@@ -239,6 +442,10 @@ final class TouchView extends View {
         try { TouchNative.nativeSet(m, lx, ly, rx, ry); }
         catch (LinkageError missing) { nativeOk = false; Log.e(TAG, "touch hook missing in libtotk.so", missing); }
     }
+    private void sendAim(float sx, float sy, float dt) {
+        if (!nativeOk) return;
+        try { TouchNative.nativeAim(sx, sy, dt); } catch (LinkageError missing) { nativeOk = false; }
+    }
 
     // ---- drawing ----
     @Override protected void onDraw(Canvas c) {
@@ -248,8 +455,11 @@ final class TouchView extends View {
             for (int i = 0; i < bs.length; i++) button(c, i, u, W, H);
             for (int k = 0; k < ptrs.size(); k++) { Ptr q = ptrs.valueAt(k); if (q.stick >= 0) stick(c, q, u); }
         }
-        box(c, 57.5f * u, 5.56f * H / 100f, 2.45f * u, 1.75f * u, 1.75f * u, u, hidden, false, false);
-        text(c, controller && !forceShow ? "Show" : hidden ? "Show" : "Hide", 57.5f * u, 5.56f * H / 100f, u, false, 0, false, false);
+        String[] names = {"Aim", "Display", controller && !forceShow ? "Show" : hidden ? "Show" : "Hide"};
+        for (int i = 0; i < SYS_X.length; i++) {
+            box(c, SYS_X[i] * u, 5.56f * H / 100f, 2.45f * u, 1.75f * u, 1.75f * u, u, false, false, false);
+            text(c, names[i], SYS_X[i] * u, 5.56f * H / 100f, u, false, 0, false, false);
+        }
     }
     private void box(Canvas c, float cx, float cy, float hw, float hh, float rad, float u, boolean on, boolean hov, boolean thru) {
         float g = .144f * u, k = .28f * u;
@@ -315,4 +525,4 @@ final class TouchView extends View {
         c.drawCircle(kx, ky, kr, p);
         p.setShader(null);
     }
-}
+            }
