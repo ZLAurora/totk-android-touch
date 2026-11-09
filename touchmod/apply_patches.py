@@ -64,6 +64,7 @@ patch(SA, 'if (lostRoles(role)) { card.state(Strings.CANT_OPEN, Theme.WARN, pick
 patch(SA, 'else if (problem != null) { card.state(problem, Theme.WARN, picked); problems = true; }',
       f'else if (problem != null) {{ card.state(problem, Theme.WARN, multi(role) ? {HINT} : picked); if (multi(role)) tapHint(card); problems = true; }}')
 
+if '--setup-only' in sys.argv: sys.exit(0)
 # ---- Build 2a: touch overlay ----
 import shutil
 FE = 'games/totk/runtime/frontend_android.c'
