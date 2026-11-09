@@ -80,3 +80,16 @@ patch(TA, 'super.onCreate(state);', 'super.onCreate(state);\n        touch = new
 patch(TA, 'super.onResume();', 'super.onResume();\n        if (touch != null) touch.resume();')
 patch(TA, '@Override protected void onPause() {', '@Override protected void onPause() {\n        if (touch != null) touch.pause();')
 patch(TA, '@Override protected void onDestroy() {', '@Override protected void onDestroy() {\n        if (touch != null) { touch.close(); touch = null; }')
+
+# ---- overlay black-screen bisect ----
+VARIANT = 'c'   # a = as before, b = overlay added 20 s late, c = software-drawn window with simpler flags
+TOF = 'games/totk/android/java/com/aure/totk/touch/TouchOverlay.java'
+if VARIANT == 'b':
+    patch(TOF, 'private boolean closed;', 'private boolean closed, delayed;')
+    patch(TOF, 'if (view != null || closed) return;',
+          'if (view != null || closed) return;\n        if (!delayed) { delayed = true; ui.postDelayed(this::show, 20000); return; }')
+if VARIANT == 'c':
+    patch(TOF, 'WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS | WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,',
+          'WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,')
+    patch(TOF, 'setSystemUiVisibility(0x1706);', 'setLayerType(View.LAYER_TYPE_SOFTWARE, null);')
+    patch(TOF, 'lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;', '')
