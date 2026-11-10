@@ -12,6 +12,11 @@ extern int runtime_handheld_mode(void);
 #include <stdatomic.h>
 #include <time.h>
 #include <math.h>
+#include <dirent.h>
+#include <unistd.h>
+#ifdef __ANDROID__
+#include <dlfcn.h>
+#endif
 #define MINV(a, b) ((a) < (b) ? (a) : (b))
 #define SECOND_NS UINT64_C(1000000000)
 
@@ -113,6 +118,11 @@ static void count4(char out[8], unsigned value) {
     if (value > 9999) memcpy(out, "????", 5);
     else snprintf(out, 8, "%4u", value);
 }
+static unsigned memory_key(unsigned mib) { return mib > 999999 ? 1000000 : mib; }
+static void memory6(char out[8], unsigned mib) {
+    if (mib > 999999) memcpy(out, "??????", 7);
+    else snprintf(out, 8, "%6u", mib);
+}
 static void extent(char out[10], uint32_t w, uint32_t h) {
     if (!w || !h) { memcpy(out, "        ?", 10); return; }
     char a[5], b[5], raw[10];
@@ -187,6 +197,16 @@ void vk_overlay_text(vk_overlay_panel *p, uint64_t now_ns) {
     key.power.power = p->power_mw > 0 ? decimal_key(p->power_mw / 1000.0) : -1;
     key.power.input = p->power_mw > 0 && p->power_input;
     key.power.temperature = p->temperature_mc != INT_MIN && p->temperature_mc >= -50000 && p->temperature_mc <= 150000 ? p->temperature_mc / 100 : INT_MIN;
+    if (p->system && !p->compact) {
+        key.system.thermal = p->sys.thermal <= 7 ? p->sys.thermal : 0;
+        key.system.headroom = p->sys.headroom <= 1000 ? p->sys.headroom : 0;
+        key.system.cpu = p->sys.cpu <= 1024 ? p->sys.cpu : 0;
+        key.system.ratio = p->sys.ratio <= 101 ? p->sys.ratio : 0;
+        key.system.cap = p->sys.cap <= 2 ? p->sys.cap : 0;
+        key.memory.available = memory_key(p->sys.available);
+        key.memory.total = memory_key(p->sys.total);
+        key.memory.rss = memory_key(p->sys.rss);
+    }
     if (p->display_key_valid && !memcmp(&key, &p->display_key, sizeof key)) return;
 
     char a[8], b[8], c[8], line[VK_OVERLAY_COLS + 1];
@@ -266,6 +286,32 @@ void vk_overlay_text(vk_overlay_panel *p, uint64_t now_ns) {
         }
         label(p, p->power_text, line);
     }
+    if (!p->display_key_valid || memcmp(&key.system, &old->system, sizeof key.system)) {
+        line[0] = 0;
+        if (key.system.thermal) snprintf(line, sizeof line, "THM %u", key.system.thermal - 1);
+        if (key.system.headroom) {
+            unsigned v = key.system.headroom - 1; size_t n = strlen(line);
+            snprintf(line + n, sizeof line - n, "%sH%u.%02u", n ? " " : "", v / 100, v % 100);
+        }
+        if (key.system.cpu && key.system.ratio) {
+            unsigned v = key.system.ratio - 1; size_t n = strlen(line);
+            snprintf(line + n, sizeof line - n, "%sCPU%u %u.%02u%s", n ? " " : "",
+                key.system.cpu - 1, v / 100, v % 100, key.system.cap == 2 ? " CAP" : "");
+        }
+        label(p, p->system_text, line);
+    }
+    if (!p->display_key_valid || memcmp(&key.memory, &old->memory, sizeof key.memory)) {
+        line[0] = 0;
+        if (key.memory.total) {
+            memory6(a, key.memory.available); memory6(b, key.memory.total);
+            snprintf(line, sizeof line, "RAM %s/%sM", a, b);
+        }
+        if (key.memory.rss) {
+            memory6(c, key.memory.rss); size_t n = strlen(line);
+            snprintf(line + n, sizeof line - n, "%sRSS %sM", n ? " " : "", c);
+        }
+        label(p, p->memory_text, line);
+    }
     p->display_key = key; p->display_key_valid = 1;
 }
 int vk_overlay_configure(vk_overlay_panel *p, uint32_t w, uint32_t h, int framegen, int power, const char *pos) {
@@ -274,18 +320,21 @@ int vk_overlay_configure(vk_overlay_panel *p, uint32_t w, uint32_t h, int frameg
     vk_overlay_layout *l = &p->layout;
     framegen = framegen != 0; power = power != 0;
     int compact = p->compact != 0;
-    if (l->generation && l->output_w == w && l->output_h == h && l->framegen == framegen && l->power == power && l->position == corner && l->handheld == (p->handheld != 0) && l->compact == compact) return 0;
-    l->output_w = w; l->output_h = h; l->framegen = framegen; l->power = power; l->position = corner; l->handheld = p->handheld != 0; l->compact = compact;
+    int system = p->system != 0;
+    if (l->generation && l->output_w == w && l->output_h == h && l->framegen == framegen && l->power == power && l->position == corner && l->handheld == (p->handheld != 0) && l->compact == compact && l->system == system) return 0;
+    l->output_w = w; l->output_h = h; l->framegen = framegen; l->power = power; l->position = corner; l->handheld = p->handheld != 0; l->compact = compact; l->system = system;
     if (compact) {
         /* One rate row, no graph (graph_w 0 skips every graph raster/copy); glyph height plus padding. */
         l->width = (framegen ? VK_OVERLAY_COMPACT_FG_COLS : VK_OVERLAY_COMPACT_COLS) * VK_OVERLAY_CELL_W + 2 * VK_OVERLAY_PAD;
-        l->compile_row = l->power_row = UINT_MAX; l->rows = 1;
+        l->compile_row = l->power_row = l->system_row = UINT_MAX; l->rows = 1;
         l->height = 2 * VK_OVERLAY_PAD + VK_OVERLAY_GLYPH_H;
         l->graph_x = VK_OVERLAY_PAD; l->graph_y = l->height; l->graph_w = 0;
     } else {
-        l->width = (framegen ? VK_OVERLAY_COLS : VK_OVERLAY_PLAIN_COLS) * VK_OVERLAY_CELL_W + 2 * VK_OVERLAY_PAD;
+        l->width = (framegen || system ? VK_OVERLAY_COLS : VK_OVERLAY_PLAIN_COLS) * VK_OVERLAY_CELL_W + 2 * VK_OVERLAY_PAD;
         l->compile_row = framegen ? 4 : 2; l->power_row = power ? l->compile_row + 1 : UINT_MAX;
         l->rows = l->compile_row + 1 + power;
+        l->system_row = system ? l->rows : UINT_MAX;
+        l->rows += system ? 2 : 0;
         l->graph_x = VK_OVERLAY_PAD; l->graph_y = VK_OVERLAY_PAD + l->rows * VK_OVERLAY_ROW_H;
         l->graph_w = l->width - 2 * VK_OVERLAY_PAD; l->height = l->graph_y + VK_OVERLAY_GRAPH_H + VK_OVERLAY_PAD;
     }
@@ -312,6 +361,8 @@ static const char *row_text(const vk_overlay_panel *p, unsigned row) {
     if (row == 1) return p->resolution_text;
     if (row == p->layout.compile_row) return p->compile_text;
     if (row == p->layout.power_row) return p->power_text;
+    if (row == p->layout.system_row) return p->system_text;
+    if (p->layout.system && row == p->layout.system_row + 1) return p->memory_text;
     return row == 2 ? p->fg_text : p->gpu_text;
 }
 /* Rotate the small cached panel while rasterizing changed cells/columns.
@@ -380,13 +431,14 @@ static _Atomic uint64_t compile_at[256], compile_cost[256];
 static _Atomic unsigned handoff_count, scale_sample[2], model_performance, gpu_paired, compile_count;
 static _Atomic unsigned power_sample;
 static _Atomic int temperature_sample = INT_MIN;
+static _Atomic unsigned system_sample[8];
 static vk_overlay_panel history = {.power_mw = -1, .temperature_mc = INT_MIN, .gpu_real_ms = -1, .gpu_incremental_ms = -1, .gpu_budget_ms = -1};
 vk_overlay_counters vk_overlay_get_counters(const vk_overlay_panel *panel) {
     return (panel ? panel : &history)->counters;
 }
 /* available: fixed at init (see vk_overlay_available). live_mode: the shown mode, changed by
    vk_overlay_cycle from the input thread and read by the recorder at every present. */
-static int available, power_enabled;
+static int available, power_enabled, system_enabled;
 static _Atomic int live_mode, power_started;
 static const char *position;
 void vk_overlay_set_resolution(uint32_t rw, uint32_t rh, uint32_t cw, uint32_t ch) {
@@ -469,6 +521,104 @@ int vk_overlay_read_temperature(const char *root) {
     if (!read_number(root, "battery/temp", &value) || value < -500 || value > 1500) return INT_MIN;
     return (int)lround(value * 100);
 }
+/* Kernel counters are KiB. Reject malformed/duplicate fields, not partial samples. */
+static unsigned memory_mib(const char *root, const char *file, const char *field) {
+    char path[512], line[256];
+    if (snprintf(path, sizeof path, "%s/%s", root, file) >= (int)sizeof path) return UINT_MAX;
+    FILE *f = fopen(path, "r"); if (!f) return UINT_MAX;
+    unsigned result = UINT_MAX, found = 0;
+    while (fgets(line, sizeof line, f)) {
+        size_t n = strlen(field);
+        if (strncmp(line, field, n) || line[n] != ':') continue;
+        double kb; char unit[8], extra;
+        if (++found != 1 || sscanf(line + n + 1, "%lf %7s %c", &kb, unit, &extra) != 2 ||
+            strcmp(unit, "kB") || !isfinite(kb) || kb < 0 || kb >= (double)UINT_MAX * 1024 || floor(kb) != kb) {
+            result = UINT_MAX; break;
+        }
+        result = (unsigned)(kb / 1024);
+    }
+    if (ferror(f)) result = UINT_MAX;
+    fclose(f); return result;
+}
+vk_overlay_system vk_overlay_read_system(const char *cpu_root, const char *proc_root, int cpu) {
+    vk_overlay_system s = {0};
+    s.total = memory_mib(proc_root, "meminfo", "MemTotal");
+    s.available = memory_mib(proc_root, "meminfo", "MemAvailable");
+    if (s.total == UINT_MAX || s.available == UINT_MAX || s.available > s.total) s.available = s.total = 0;
+    s.rss = memory_mib(proc_root, "self/status", "VmRSS");
+    if (s.rss == UINT_MAX) s.rss = 0;
+    if (cpu < 0 || cpu >= 1024) return s;
+    char root[512];
+    if (snprintf(root, sizeof root, "%s/cpu%d/cpufreq", cpu_root, cpu) >= (int)sizeof root) return s;
+    double current, maximum, cap;
+    if (read_number(root, "scaling_cur_freq", &current) && current > 0 &&
+        read_number(root, "cpuinfo_max_freq", &maximum) && maximum > 0 &&
+        current <= maximum && maximum <= INT_MAX) {
+        s.cpu = (unsigned)cpu + 1; s.ratio = (unsigned)lround(current * 100 / maximum) + 1;
+        if (read_number(root, "scaling_max_freq", &cap) && cap > 0 && cap <= maximum)
+            s.cap = cap < maximum ? 2 : 1;
+    }
+    return s;
+}
+/* Follow g-main's actual last host CPU, never the sampler's CPU or a guessed cluster. */
+static int main_cpu(void) {
+    static unsigned tid;
+    char path[128], text[1024];
+    if (!tid) {
+        DIR *dir = opendir("/proc/self/task"); if (!dir) return -1;
+        struct dirent *entry;
+        while ((entry = readdir(dir))) {
+            char *end; unsigned long candidate = strtoul(entry->d_name, &end, 10);
+            if (*end || !candidate || candidate > INT_MAX) continue;
+            snprintf(path, sizeof path, "/proc/self/task/%lu/comm", candidate);
+            FILE *f = fopen(path, "r"); if (!f) continue;
+            int match = fgets(text, sizeof text, f) && !strcmp(text, "g-main\n"); fclose(f);
+            if (match) { tid = (unsigned)candidate; break; }
+        }
+        closedir(dir);
+    }
+    if (!tid) return -1;
+    snprintf(path, sizeof path, "/proc/self/task/%u/stat", tid);
+    FILE *f = fopen(path, "r"); if (!f) { tid = 0; return -1; }
+    int ok = fgets(text, sizeof text, f) != NULL; fclose(f);
+    char *p = ok ? strrchr(text, ')') : NULL;
+    if (!p || p[1] != ' ') return -1;
+    p += 2; /* field 3 (state); processor is field 39 */
+    for (unsigned field = 3; field < 39; field++) {
+        p = strchr(p, ' '); if (!p) return -1;
+        while (*p == ' ') p++;
+    }
+    char *end; long cpu = strtol(p, &end, 10);
+    return end != p && (*end == ' ' || *end == '\n') && cpu >= 0 && cpu < 1024 ? (int)cpu : -1;
+}
+#ifdef __ANDROID__
+/* Optional API29/30 symbols: older releases still load. Android headroom requires
+   >=10s between calls; keep its last value between those samples. */
+static void thermal_sample(vk_overlay_system *s) {
+    static int initialized, tick;
+    static void *manager;
+    static int (*status)(void *);
+    static float (*headroom)(void *, int);
+    static unsigned cached;
+    if (!initialized) {
+        initialized = 1;
+        void *lib = dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL);
+        if (lib) {
+            void *(*acquire)(void) = (void *(*)(void))dlsym(lib, "AThermal_acquireManager");
+            status = (int (*)(void *))dlsym(lib, "AThermal_getCurrentThermalStatus");
+            headroom = (float (*)(void *, int))dlsym(lib, "AThermal_getThermalHeadroom");
+            if (acquire) manager = acquire();
+        }
+    }
+    if (manager && status) { int v = status(manager); if (v >= 0 && v <= 6) s->thermal = (unsigned)v + 1; }
+    if (manager && headroom && !tick) {
+        float v = headroom(manager, 0);
+        cached = isfinite(v) && v >= 0 && v < 9.995f ? (unsigned)lroundf(v * 100) + 1 : 0;
+    }
+    tick = (tick + 1) % 10;
+    s->headroom = cached;
+}
+#endif
 static void *power_sampler(void *unused) {
     (void)unused;
 #ifdef __ANDROID__
@@ -476,11 +626,20 @@ static void *power_sampler(void *unused) {
 #endif
     for (;;) {
         /* Only while the panel is shown: the live toggle may hide it for most of a session. */
-        if (atomic_load_explicit(&live_mode, memory_order_relaxed)) {
+        int mode = atomic_load_explicit(&live_mode, memory_order_relaxed);
+        if (mode && power_enabled) {
             vk_overlay_power p = vk_overlay_read_power("/sys/class/power_supply");
             unsigned sample = p.mw > 0 ? (unsigned)p.mw << 1 | (unsigned)p.input : 0;
             atomic_store_explicit(&power_sample, sample, memory_order_relaxed);
             atomic_store_explicit(&temperature_sample, vk_overlay_read_temperature("/sys/class/power_supply"), memory_order_relaxed);
+        }
+        if (mode == 2 && system_enabled) {
+            vk_overlay_system s = vk_overlay_read_system("/sys/devices/system/cpu", "/proc", main_cpu());
+#ifdef __ANDROID__
+            thermal_sample(&s);
+#endif
+            unsigned values[] = {s.thermal, s.headroom, s.cpu, s.ratio, s.cap, s.available, s.total, s.rss};
+            for (unsigned i = 0; i < 8; i++) atomic_store_explicit(&system_sample[i], values[i], memory_order_relaxed);
         }
         /* Delay after sampling: reads can never be more frequent than once per second. */
         struct timespec delay = {.tv_sec = 1};
@@ -489,7 +648,7 @@ static void *power_sampler(void *unused) {
     return NULL;
 }
 static void power_start(void) {
-    if (!power_enabled || atomic_exchange_explicit(&power_started, 1, memory_order_relaxed)) return;
+    if ((!power_enabled && !system_enabled) || atomic_exchange_explicit(&power_started, 1, memory_order_relaxed)) return;
     pthread_t th; if (!pthread_create(&th, NULL, power_sampler, NULL)) pthread_detach(th);
 }
 static void init(void) {
@@ -507,6 +666,9 @@ static void init(void) {
     e = getenv("TOTK_FPS60"); history.target_ms = e && !strcmp(e, "1") ? 1000.0 / 60 : 1000.0 / 30;
     history.handheld = runtime_handheld_mode();
     e = getenv("TOTK_OVERLAY_POWER"); power_enabled = available && e && !strcmp(e, "1");
+    e = getenv("TOTK_OVERLAY_SYS"); system_enabled = available && e && !strcmp(e, "1");
+    history.system = system_enabled;
+    fprintf(stderr, "[totk-overlay] sys=%d (TOTK_OVERLAY_SYS, startup-only)\n", system_enabled);
     atomic_store_explicit(&live_mode, mode, memory_order_relaxed);
     if (mode) power_start();
 }
@@ -564,6 +726,11 @@ static void sample_labels(vk_overlay_panel *p, uint64_t now, uint64_t fg_sample)
     unsigned sample = atomic_load_explicit(&power_sample, memory_order_relaxed);
     p->power_mw = sample ? (int)(sample >> 1) : -1; p->power_input = sample & 1;
     p->temperature_mc = atomic_load_explicit(&temperature_sample, memory_order_relaxed);
+    if (system_enabled) {
+        unsigned *fields[] = {&p->sys.thermal, &p->sys.headroom, &p->sys.cpu, &p->sys.ratio,
+                              &p->sys.cap, &p->sys.available, &p->sys.total, &p->sys.rss};
+        for (unsigned i = 0; i < 8; i++) *fields[i] = atomic_load_explicit(&system_sample[i], memory_order_relaxed);
+    }
     uint64_t resolution = atomic_load_explicit(&resolution_sample, memory_order_relaxed);
     p->render_w = resolution >> 48; p->render_h = resolution >> 32 & 65535;
     p->canvas_w = resolution >> 16 & 65535; p->canvas_h = resolution & 65535;

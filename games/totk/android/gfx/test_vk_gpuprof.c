@@ -13,6 +13,12 @@
 #include "vk_int.h"
 #include "vk_record.h"
 #include "vk_gpuprof_time.h"
+#include "vk_gpuprof_pipe.h"
+#include "vk_gpuprof_compact.h"
+int vk_gpuprof_test_compact_run(int argc, char **argv);
+int vk_gpuprof_test_record_run(void);
+int vk_gpuprof_test_sink_run(void);
+int vk_gpuprof_test_report_contract(void);
 #include "vk_load.h"
 #include "../../third_party/d2r_gfx/gfx/tex/nvn_deswizzle.h"
 #include <errno.h>
@@ -83,6 +89,115 @@ static void timestamp_contract(void) {
     CHECK(vk_gpuprof_interval_check(first, last, domain, domain).status == GP_TIME_DOMAIN,
         "invalid timestamp period is rejected");
 }
+static void pipeline_contract(void) {
+    for (unsigned budget = 1; budget <= VK_GPUPROF_PIPE_BUDGET; budget++) {
+        unsigned hits[VK_GPUPROF_PIPE_ORDINALS] = {0};
+        for (unsigned phase = 0; phase < VK_GPUPROF_PIPE_ORDINALS; phase++) {
+            for (unsigned i = 0; i < budget; i++) {
+                unsigned ordinal = (phase + i) % VK_GPUPROF_PIPE_ORDINALS;
+                CHECK(vk_gpuprof_pipe_selected(ordinal, phase, budget, VK_GPUPROF_PIPE_ORDINALS), "rotating window selects each bounded group");
+                hits[ordinal]++;
+            }
+            CHECK(!vk_gpuprof_pipe_selected((phase + budget) % VK_GPUPROF_PIPE_ORDINALS, phase, budget, VK_GPUPROF_PIPE_ORDINALS),
+                "next ordinal never exceeds the hard frame budget");
+            CHECK(!vk_gpuprof_pipe_selected(VK_GPUPROF_PIPE_ORDINALS, phase, budget, VK_GPUPROF_PIPE_ORDINALS),
+                "unknown tail is never presented as an equal-probability sample");
+        }
+        for (unsigned i = 0; i < VK_GPUPROF_PIPE_ORDINALS; i++)
+            CHECK(hits[i] == budget, "uniform phase gives every ordinal exactly k/N inclusion");
+    }
+    CHECK(vk_gpuprof_pipe_population(2048, 4000) == 4096 &&
+        vk_gpuprof_pipe_population(4096, 2000) == 4096, "domain grows to cover whole layouts and never shrinks");
+    CHECK(vk_gpuprof_pipe_selected(3000, 3000, 16, 4096),
+        "newly observed tail groups become eligible after domain growth");
+    uint64_t n = UINT64_MAX;
+    CHECK(vk_gpuprof_pipe_primitives(4, 9, 3, 0, &n) && n == 9, "triangle input counts include instances");
+    CHECK(vk_gpuprof_pipe_primitives(7, 12, 2, 0, &n) && n == 12, "quads count actual emitted triangles");
+    CHECK(vk_gpuprof_pipe_primitives(5, 7, 2, 0, &n) && n == 10, "non-indexed strip primitives are known");
+    CHECK(!vk_gpuprof_pipe_primitives(5, 7, 2, 1, &n), "indexed restart is explicitly unknown without payload reads");
+    CHECK(vk_gpuprof_pipe_primitives(0, UINT32_MAX, UINT32_MAX, 0, &n) &&
+        n == (uint64_t)UINT32_MAX * UINT32_MAX, "primitive products do not truncate at 32 bits");
+}
+static void compact_contract(void) {
+    static gp_compact c;
+    gp_compact_key key = {.pipeline = 17, .shader = {"full-vs-variant-a", "full-fs-variant-a", NULL}};
+    gp_compact_begin(&c, 1, 2048, 4);
+    gp_compact_observe(&c, &key, 1, 1, 0, 0, 2, 2048, 4, 3, 0, 9, 0);
+    gp_compact_entry *e = gp_compact_get(&c, &key);
+    uint64_t id = e->id;
+    c.frame_out_of_range = 1; /* later lease/nested scope invalidates the prefix */
+    gp_compact_finish(&c, 1);
+    CHECK(e->v[GC_VALID].integer == 1 && e->v[GC_ELIGIBLE].real == 0,
+        "later-frame domain gap excludes every earlier sample from eligible subtotal");
+    gp_compact_begin(&c, 2, 4096, 4);
+    gp_compact_observe(&c, &key, 1, 1, 0, 0, 3, 4096, 4, 4, 0, 12, 0);
+    gp_compact_finish(&c, 1);
+    CHECK(e->v[GC_MS].real == 5 && e->v[GC_SQUARE].real == 13 && e->v[GC_WEIGHTED].real == 4096 &&
+        e->v[GC_ELIGIBLE_WEIGHTED].real == 3072 && e->v[GC_ELIGIBLE_SQUARE].real == 3072.0 * 3072,
+        "population growth weights each sample by its actual denominator and preserves moments");
+    gp_compact_begin(&c, 3, 4096, 4);
+    gp_compact_observe(&c, &key, 1, 0, 0, 0, 0, 4096, 4, 1, 0, 3, 0);
+    gp_compact_finish(&c, 1);
+    CHECK(e->v[GC_SELECTED].integer == 3 && e->v[GC_MISSING].integer == 1 && e->v[GC_ELIGIBLE_MISSING].real == 1,
+        "missing selected timing is not zero and retains eligible-domain missing authority");
+    CHECK(c.frames == 3 && c.eligible_frames == 2 && c.domain_excluded_frames == 1 &&
+        c.nexposure == 2 && c.exposure[0].population == 2048 && c.exposure[1].frames == 2,
+        "partial windows retain exact exposure strata and completed-frame counts");
+    gp_compact_key variant = key; variant.shader[1] = "full-fs-variant-b";
+    CHECK(gp_compact_get(&c, &variant)->id != id, "full shader variant participates in dictionary identity");
+    variant = key; variant.compute = 1;
+    CHECK(gp_compact_get(&c, &variant)->id != id, "graphics and compute never share a dictionary key");
+    static const char alias_vs[] = "full-vs-variant-a", alias_fs[] = "full-fs-variant-a";
+    gp_compact_key alias = {.pipeline = 17, .shader = {alias_vs, alias_fs, NULL}};
+    CHECK(gp_compact_get(&c, &alias)->id == id && gp_compact_get(&c, &key)->id == id,
+        "different immutable source objects with identical full names intern to the same exact identity");
+    static char oversized_name[81];
+    memset(oversized_name, 'x', 80);
+    gp_compact_key oversized = {.pipeline = 18, .shader = {oversized_name, NULL, NULL}};
+    CHECK(!gp_compact_get(&c, &oversized) && c.aggregate_overflow && !c.counts_complete,
+        "an unrepresentable full variant is rejected, never truncated into an existing identity");
+    CHECK(!c.map_dirty, "insert-only dictionary has no tombstones to rebuild");
+    gp_compact_reset(&c);
+    gp_compact_begin(&c, 301, 4096, 4);
+    CHECK(gp_compact_get(&c, &key)->id == id && !e->v[GC_SELECTED].integer,
+        "window reset preserves interned identity but never duplicates flushed samples");
+    for (unsigned i = 0; i < GP_COMPACT_KEYS; i++) {
+        gp_compact_key churn = {.pipeline = UINT64_C(100000) + i};
+        gp_compact_get(&c, &churn);
+    }
+    CHECK(c.key_overflow > 0 && !c.counts_complete && c.map_dirty,
+        "current-window overflow is explicit and successful inactive eviction marks the index dirty");
+    gp_compact_reset(&c);
+    unsigned tombstones = 0;
+    for (unsigned i = 0; i < GP_COMPACT_KEYS * 2; i++) tombstones += c.map[i] == UINT32_MAX;
+    CHECK(!c.map_dirty && !tombstones, "dirty reset rebuilds exact key slots and clears every eviction tombstone");
+    gp_compact_begin(&c, 601, 4096, 4);
+    gp_compact_key fresh = {.pipeline = UINT64_C(100000000)};
+    gp_compact_entry *next = gp_compact_get(&c, &fresh);
+    CHECK(next && next->id > id && !c.key_overflow && c.nkeys == GP_COMPACT_KEYS,
+        "fresh-key lifetime churn evicts inactive dictionary entries without permanent exhaustion");
+    gp_compact_observe(&c, &fresh, 1, 1, 0, 0, 1, 4096, 4, 1, 0, 1, 0);
+    gp_compact_finish(&c, 0);
+    CHECK(!next->v[GC_ELIGIBLE].real && c.domain_excluded_frames == 1,
+        "unfinished close never grants completed-frame eligibility");
+    gp_compact_begin(&c, 602, 4096, 4);
+    gp_compact_observe(&c, &fresh, 0, 0, 0, 0, 0, 4096, 4, UINT64_MAX, 0, 1, 0);
+    CHECK(c.aggregate_overflow && !c.counts_complete,
+        "counter values beyond exact numeric-array range expose overflow instead of rounding authority");
+    gp_compact_begin(&c, 602, 8192, 4);
+    gp_compact_finish(&c, 1);
+    CHECK(c.frame_overflow && !next->v[GC_ELIGIBLE].real,
+        "inconsistent per-frame population snapshots cannot grant eligibility");
+    CHECK(sizeof c == 4427008, "compact worker memory bound matches published 64-bit ABI documentation");
+    gp_compact_begin(&c, 603, 4096, 4);
+    fresh.pipeline++;
+    gp_compact_observe(&c, &fresh, 1, 0, 1, 0, 0, 4096, 4, 1, 0, 1, 0);
+    gp_compact_entry *discarded = gp_compact_get(&c, &fresh);
+    gp_compact_finish(&c, 1);
+    CHECK(discarded->selected_discarded == 1 && discarded->v[GC_SELECTED].integer == 0 &&
+        discarded->v[GC_DISCARDED].integer == 1 && discarded->v[GC_ELIGIBLE].real == 0,
+        "selected discarded-only keys retain output authority without becoming eligible samples");
+}
 static void unavailable_query_contract(void) {
     if (!V.has_host_query_reset) return;
     VkQueryPool pool;
@@ -134,6 +249,7 @@ static void submit(int frame_end) {
     if (frame_end) { vk_end_rendering(); vk_gpuprof_test_frame(vk_cb()); }
     wait_submission(mtl_sub_commit());
 }
+static int pipeline_groups;
 static void record_draws(tex_t *target, prog_t *program, uint8_t *memory, unsigned draws) {
     p_set_rt rt = {.n = 1}; rt.color[0] = target; op(OP_SET_RT, &rt, sizeof rt);
     p_bind_program bind = {program, 3}; op(OP_BIND_PROGRAM, &bind, sizeof bind);
@@ -155,7 +271,14 @@ static void record_draws(tex_t *target, prog_t *program, uint8_t *memory, unsign
      * rather than alternating LOAD vs CLEAR attachment operations. */
     p_clear_color clear = {0, 15, {0, 0, 0, 1}}; op(OP_CLEAR_COLOR, &clear, sizeof clear);
     p_draw draw = {4, 0, 3, 0, 0};
-    for (unsigned i = 0; i < draws; i++) op(OP_DRAW, &draw, sizeof draw);
+    for (unsigned i = 0; i < draws; i++) {
+        if (pipeline_groups && draws >= 9) {
+            chmask_st channels = {pipeline_groups == 2 ? (i & 1 ? 7 : 15) : i < 3 || i >= 5 ? 15 : 7};
+            p_bind_state state = {.kind = 2}; memcpy(state.bytes, &channels, sizeof channels);
+            op(OP_BIND_STATE, &state, sizeof state);
+        }
+        op(OP_DRAW, &draw, sizeof draw);
+    }
 }
 static uint8_t *readback_bytes(tex_t *target, uint8_t *memory) {
     return memory + 0x40000 + (target->d.width == 64 ? 0 : 0x10000);
@@ -172,13 +295,21 @@ static void check_pixels(tex_t *target, uint8_t *memory) {
     CHECK(!bad, "profiled draw produces exact all-white real Vulkan readback at both render extents");
 }
 static int finish_fixture(unsigned frames, unsigned passes, unsigned draws, int supported) {
-    int mode = getenv("TOTK_VK_GPU_PROFILE") ? atoi(getenv("TOTK_VK_GPU_PROFILE")) : 0;
+    const char *requested = getenv("TOTK_VK_GPU_PROFILE");
+    int mode = requested && (!strcmp(requested, "1") || !strcmp(requested, "2") || !strcmp(requested, "3")) ?
+        atoi(requested) : 0;
     int workers = getenv("TOTK_VK_REC_THREADS") ? atoi(getenv("TOTK_VK_REC_THREADS")) : 0;
     int stats = getenv("TOTK_VK_GPU_PROFILE_STATS") && !strcmp(getenv("TOTK_VK_GPU_PROFILE_STATS"), "1");
     CHECK(vk_gpuprof_on == mode, "launch-time GPU profile mode remains effective");
     CHECK(!!vk_record_enabled() == !!workers, "GPU profiling does not force requested recorder workers inline");
     CHECK(!!vk_gpuprof_stats_mask() == !!(mode && stats && V.has_pipeline_statistics),
         "statistics are available only when requested and supported");
+    if (!mode) {
+        uint64_t background[3]; vk_gpuprof_test_background(background);
+        CHECK(!vk_gpuprof_pipeline_on, "pipeline subflags cannot enable a disabled master profiler");
+        CHECK(!background[0] && !background[1] && !background[2],
+            "disabled profiler never queues, processes or drops a query lease");
+    }
     if (workers && draws) {
         uint64_t leases[4]; vk_record_test_leases(leases);
         CHECK(leases[1], "parallel recorder secondary leases are actually used for real draws");
@@ -584,7 +715,21 @@ static int run_unavailable_span(int supported) {
     return finish_fixture(1, 0, 0, supported);
 }
 int main(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "--compact-fixture"))
+        return vk_gpuprof_test_compact_run(argc, argv);
+    if (argc == 2 && !strcmp(argv[1], "--record-fixture"))
+        return vk_gpuprof_test_record_run();
+    if (argc == 2 && !strcmp(argv[1], "--sink-contract"))
+        return vk_gpuprof_test_sink_run();
     timestamp_contract();
+    pipeline_contract();
+    compact_contract();
+    if (argc == 2 && !strcmp(argv[1], "--compact-contract")) {
+        CHECK(!vk_gpuprof_test_report_contract(),
+            "frozen compact reports preserve snapshot data and bound each completed-frame pump");
+        printf("gpuprof-compact-contract checks=%u failures=%u\n", checks, failures);
+        return failures != 0;
+    }
     unsigned frames = 302, passes = 180, draws = 2000, textures = 16;
     int areas = argc == 2 && !strcmp(argv[1], "--areas");
     int unavailable_span = argc == 2 && !strcmp(argv[1], "--unavailable-span");
@@ -596,6 +741,9 @@ int main(int argc, char **argv) {
     int last_closed = argc == 2 && !strcmp(argv[1], "--last-closed");
     int shutdown_inflight = argc == 2 && !strcmp(argv[1], "--shutdown-inflight") ? 1 :
         argc == 2 && !strcmp(argv[1], "--shutdown-timeout") ? 2 : 0;
+    pipeline_groups = argc == 2 && !strcmp(argv[1], "--pipeline-groups") ? 1 :
+        argc == 2 && !strcmp(argv[1], "--pipeline-overflow") ? 2 : 0;
+    if (pipeline_groups == 2) frames = 2;
     if (scaled || (argc == 3 && !strcmp(argv[1], "--frames"))) {
         for (int i = scaled ? 2 : 1; i < argc; i += 2) {
             if (i + 1 == argc) return 2;
@@ -609,7 +757,7 @@ int main(int argc, char **argv) {
         }
         if (scaled && draws < passes) return 2;
     } else if (argc != 1 && !areas && !unavailable_span && !sampling && !backpressure && !cancel &&
-               !sealed_present && !last_closed && !shutdown_inflight) return 2;
+               !sealed_present && !last_closed && !shutdown_inflight && !pipeline_groups) return 2;
     /* Force short secondary chunks so workers=2 tests a real parallel pass,
      * rather than merely checking an enabled worker setting on inline draws. */
     setenv("TOTK_VK_REC_CHUNK_DRAWS", scaled ? "16" : "1", 1);
@@ -664,6 +812,12 @@ int main(int argc, char **argv) {
     }
     const float triangle[] = {-1, -1, 3, -1, -1, 3}; memcpy(memory + 0x20000, triangle, sizeof triangle);
     if (scaled) return run_scaled(memory, &pool, targets, &programs[0], frames, passes, draws, textures, supported);
+    static uint8_t compute_control[0x880]; prog_t compute = {.nstage = 1, .serial = 85999};
+    if (pipeline_groups == 1) {
+        shader_binary(5, 3, compute_control, memory + 0x8000);
+        compute.sd[0].control = compute_control;
+        compute.sd[0].data = (NVNbufferAddress)(uintptr_t)(memory + 0x8000);
+    }
     if (sealed_present || last_closed || shutdown_inflight)
         return run_sealed_present(memory, targets, programs, last_closed || shutdown_inflight ? 1 : 302,
                                   supported, shutdown_inflight);
@@ -675,6 +829,7 @@ int main(int argc, char **argv) {
         for (unsigned part = 0; part < (sampling ? 2u : 1u); part++) {
             unsigned index = sampling ? part : frame & 1;
             target = &targets[index]; draws = index ? 3 : 1;
+            if (pipeline_groups) draws = pipeline_groups == 2 ? 2049 : 9;
             record_draws(target, &programs[(frame / 2) & 1], memory, draws);
             record_readback(target, memory);
             expected_draws += draws; expected_passes++;
@@ -686,13 +841,25 @@ int main(int argc, char **argv) {
             record_readback(target, memory);
             expected_draws += draws; expected_passes++;
         }
+        if (pipeline_groups == 1) {
+            p_bind_program bind = {&compute, 1u << 5};
+            p_bind_buf output = {5, 0, (uint64_t)(uintptr_t)(memory + 0x1c0000), 256};
+            p_dispatch dispatch = {1, 1, 1};
+            op(OP_BIND_PROGRAM, &bind, sizeof bind); op(OP_BIND_UBO, &output, sizeof output);
+            op(OP_DISPATCH, &dispatch, sizeof dispatch);
+        }
         submit(1);
         check_pixels(target, memory);
         if (sampling) check_pixels(&targets[0], memory);
+        if (pipeline_groups == 1) {
+            uint32_t *result = (uint32_t *)(memory + 0x1c0000);
+            for (unsigned i = 0; i < 64; i++)
+                CHECK(result[i] == (i ^ 0x12345678u), "pipeline compute timing preserves real dispatch output");
+        }
     }
     if (backpressure) {
         uint64_t counts[3]; vk_gpuprof_test_background(counts);
-        CHECK(counts[0] == 16 && counts[1] == 0 && counts[2] > 0,
+        CHECK(counts[0] == 32 && counts[1] == 0 && counts[2] > 0,
             "walker and GPU completion progress while all bounded profiler leases are paused");
         printf("gpuprof-backpressure frames=%u queued=%llu processed=%llu dropped=%llu\n",
             frames, (unsigned long long)counts[0], (unsigned long long)counts[1], (unsigned long long)counts[2]);
@@ -711,6 +878,10 @@ int main(int argc, char **argv) {
     if (vk_gpuprof_on) vk_gpuprof_scope_begin(pre, "upload");
     vkCmdFillBuffer(pre, upload_buffer, upload_offset, 256, 0x13579bdf);
     if (vk_gpuprof_on) vk_gpuprof_scope_end(pre);
+    if (pipeline_groups == 1) {
+        p_draw continuation = {4, 0, 3, 0, 0};
+        op(OP_DRAW, &continuation, sizeof continuation);
+    }
     record_readback(&targets[0], memory);
     op(OP_END, NULL, 0); mtl_exec(recording); used = 0;
     vk_end_rendering(); vk_gpuprof_test_frame(vk_cb());
@@ -722,6 +893,6 @@ int main(int argc, char **argv) {
     for (unsigned i = 0; i < 64; i++) bad_upload += upload[i] != 0x13579bdf;
     CHECK(!bad_upload, "direct profiled pre scope really fills bytes before the open main rendering executes");
     check_pixels(&targets[0], memory); check_pixels(&targets[1], memory);
-    frames += 2; expected_passes += 2; expected_draws += 4;
+    frames += 2; expected_passes += 2; expected_draws += pipeline_groups == 1 ? 5 : 4;
     return finish_fixture(frames, expected_passes, expected_draws, supported);
 }

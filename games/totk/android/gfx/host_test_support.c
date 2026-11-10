@@ -6,6 +6,18 @@
 #include <time.h>
 /* Backend-only fixtures have no guest present loop; the real frontend adapter overrides this frame state. */
 uint64_t g_frame_pub __attribute__((weak));
+#ifdef __ANDROID__
+/* A fixture including runtime/threads.c supplies the strong process-wide implementation. */
+void totk_thread_game_startup(void) __attribute__((weak));
+void totk_thread_game_auto(void) __attribute__((weak));
+#define TOTK_THREAD_PLACE_IMPLEMENTATION
+#include "thread_place.h"
+/* Backend fixtures have no Android frontend/ADPF session, including NDK-built device fixtures.
+   Match the non-Android inline hooks without linking the app-only performance service. */
+void totk_perf_thread(const char *name) { (void)name; }
+void totk_perf_render(uint64_t ns) { (void)ns; }
+void totk_perf_gpu(uint64_t frame, uint64_t gpu_ns) { (void)frame; (void)gpu_ns; }
+#endif
 typedef struct { uint32_t h[8]; uint64_t bytes; uint8_t buf[64]; unsigned used; } host_sha256_ctx;
 uint64_t host_now_ns(void) {
     struct timespec t;

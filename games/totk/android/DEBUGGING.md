@@ -1752,7 +1752,7 @@ For lower query volume, start with **`TOTK_VK_GPU_PROFILE_SAMPLE=2`** and statis
 budgets `1`–`16` select at most that many pass parts per frame by deterministic ordinal rotation.
 Do not combine it with `TOTK_VK_PASS_PROFILE`, pass dumps, screenshots or the pass probe for performance measurements.
 
-Opt-in startup prepares sixteen reusable timestamp/statistics query-slot leases on the dedicated
+Opt-in startup prepares 32 reusable timestamp/statistics query-slot leases on the dedicated
 `totk-gpuprof` worker; the caller can wait for that initialization once. During play, taking a prepared
 lease is a short private-mutex O(1) operation, with no query reset, result read, formatting or I/O.
 `vkCmdWriteTimestamp2(ALL_COMMANDS)` brackets primary rendering instances (including attachment
@@ -1764,8 +1764,12 @@ independent timestamp reports: at least two and at most `2k+2` for budget `k`. A
 draws, areas and completed-frame scene metadata remain recorded, even with zero samples.
 Existing fence completion detaches/enqueues the fenced profiler lease and immediately releases the
 game ring slot; it does not read queries or report inline. The profiler worker owns result reads
-without WAIT or polling, aggregation, JSONL/log output, query resets and lease return. Its bounded
-sixteen-lease FIFO does not share the recorder-worker mutex. No free lease drops profiler coverage
+without WAIT or polling, aggregation, formatting, query resets and lease return. In compact pipeline
+mode a separate nice+10 sink owns file writes/flushes through a bounded 1 MiB FIFO; the consumer
+requests nice+5 and keeps inherited affinity. FIFO overflow is explicit output loss and censors
+pipeline authority, never a wait on the consumer. Window service/readback/reset/report wall counters
+and bounded footer drop-frame/queued/inflight/phase summaries diagnose bursts, not just average CPU. Its
+32-lease FIFO does not share the recorder-worker mutex. No free lease drops profiler coverage
 (`background_dropped_slots`, cumulative, and missing frame coverage), never blocks the game for I/O.
 CPU present independently publishes `{frame, end_sequence}` to a bounded 256-entry closure FIFO under
 the private background mutex. The worker finalizes only after all fenced leases through that sequence
@@ -2208,6 +2212,9 @@ The desktop presenter mock publishes its pixels/geometry through an atomic post 
 establish the cross-thread publication before assertions inspect ordinary pixel memory (also required under TSan).
 Pass-probe reports serialize their shared LCS/depth scratch between the presenter and explicit test callers;
 that diagnostic lock is outside recording and queue publication.
+PNG CRC lookup initialization uses `pthread_once`: walker pass dumps and presenter black-flash captures can
+write PNGs concurrently. Both diagnostics are compiled into release builds; pass dumps are opt-in, while the
+copy-presenter's black-flash detector defaults on (`TOTK_VK_BLACK=0` disables it). PNG pixels and checksums are unchanged.
 
 `vkdrawtest --lag-walk-bench [frames=6]` measures a Lookout-shaped 5,760-draw stream with two warmup frames per
 stable/churning case. It explicitly disables automatic draw-count chunking (`TOTK_VK_CHUNK_DRAWS=0`) for its

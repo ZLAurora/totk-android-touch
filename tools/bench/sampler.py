@@ -5,8 +5,8 @@ Every --interval seconds, through one persistent root shell on the device (nothi
 '计时 至帧 N' frame of totk.log, the max CPU / GPU thermal-zone temperature, the sum of the thermal cooling-device states
 (cpufreq / cpu-cluster / kgsl / gpu), the GPU's thermal_pwrlevel, clock and max_gpuclk (its effective cap), each
 cpufreq policy's scaling_max_freq/cpuinfo_max_freq, and memory pressure: MemAvailable, the game's VmRSS / VmSwap /
-RssShmem (kB), its kgsl memory /sys/class/kgsl/kgsl/proc/<pid>/{kernel,gpumem_mapped,imported} (bytes, whichever
-exist), PSI cpu / memory some / full avg10 (/proc/pressure), and the kswapd threads' CPU ticks, from which the host adds
+RssShmem (kB), its kgsl memory /sys/class/kgsl/kgsl/proc/<pid>/{kernel,gpumem_mapped,imported_mem} (bytes, with legacy
+imported fallback), PSI cpu / memory some / full avg10 (/proc/pressure), and the kswapd threads' CPU ticks, from which the host adds
 kswapd's CPU % over the interval. Lines are host-timestamped (epoch seconds) and appended to <out>/samples-<label>.txt:
 
   <epoch> f=<frame> cpu=<mC> gpu=<mC> cool=<sum> tpl=<level> gclk=<Hz> gcap=<Hz> external_power=<0|1> level=<%>
@@ -57,8 +57,9 @@ while true; do
   P=$(pidof @PKG@ 2>/dev/null | cut -d' ' -f1); S=/proc/${P:-0}/status; K=/sys/class/kgsl/kgsl/proc/${P:-0}
   st() { [ -n "$P" ] && grep -m1 "^$1:" $S 2>/dev/null </dev/null | tr -s ' \t' ' ' | cut -d' ' -f2; }
   kv() { [ -n "$P" ] && cat $K/$1 2>/dev/null </dev/null; }
+  kv_imported() { v=$(kv imported_mem); [ -n "$v" ] || v=$(kv imported); printf '%s' "$v"; }
   ks=""; for k in $(pgrep kswapd 2>/dev/null); do t=$(cut -d' ' -f14,15 /proc/$k/stat 2>/dev/null </dev/null); [ -n "$t" ] && ks=$(( ${ks:-0} + ${t% *} + ${t#* } )); done
-  mem="mav=$(grep -m1 '^MemAvailable:' /proc/meminfo </dev/null | tr -s ' ' | cut -d' ' -f2) rss=$(st VmRSS) swp=$(st VmSwap) shm=$(st RssShmem) kgk=$(kv kernel) kgm=$(kv gpumem_mapped) kgi=$(kv imported)"
+  mem="mav=$(grep -m1 '^MemAvailable:' /proc/meminfo </dev/null | tr -s ' ' | cut -d' ' -f2) rss=$(st VmRSS) swp=$(st VmSwap) shm=$(st RssShmem) kgk=$(kv kernel) kgm=$(kv gpumem_mapped) kgi=$(kv_imported)"
   psi="pcs=$(PSI some /proc/pressure/cpu) pcf=$(PSI full /proc/pressure/cpu) pms=$(PSI some /proc/pressure/memory) pmf=$(PSI full /proc/pressure/memory) kst=$ks"
   power=""; for p in $SUPPLIES; do n=${p##*/}; power="$power supply.$n.type=$(cat "$p/type" 2>/dev/null) supply.$n.online=$(cat "$p/online" 2>/dev/null)"; done
   echo "f=${f:-0} cpu=$ct gpu=$gt cool=$cs tpl=$(cat /sys/class/kgsl/kgsl-3d0/thermal_pwrlevel 2>/dev/null) gclk=$(cat /sys/class/kgsl/kgsl-3d0/gpuclk 2>/dev/null) gcap=$(cat /sys/class/kgsl/kgsl-3d0/max_gpuclk 2>/dev/null) ac=$(online "$AC") usb=$(online "$USB") level=$(cat $BAT 2>/dev/null </dev/null) $power $mem $psi caps=$caps"

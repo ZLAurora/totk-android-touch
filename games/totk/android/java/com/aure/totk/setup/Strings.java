@@ -86,7 +86,8 @@ final class Strings {
     static final String WHEN_STARTS = "when the game starts";
     static final String LOCKED_FRAMEGEN = "Set by frame generation";
     static String latencyConstraint(Settings settings) {
-        return "40".equals(settings.get("frame_rate")) ? "Fixed for 40 fps" : LOCKED_FRAMEGEN;
+        return "40".equals(settings.get("frame_rate")) ? "Fixed for 40 fps"
+                : "unlimited".equals(settings.get("frame_rate")) ? "Fixed for Unlimited" : LOCKED_FRAMEGEN;
     }
     static final String NEEDS_UPSCALER = "Needs an upscaler (FSR 1 or Snapdragon GSR)";
     static final String HOLD = "Yes · press ";
@@ -150,7 +151,7 @@ final class Strings {
     }
     static String optionHint(String key) {
         switch (key) {
-            case "frame_rate": return "40 fps: smoothest on 120 Hz displays; on 60 Hz it is uneven.";
+            case "frame_rate": return "Unlimited varies; best with a high-refresh screen, but may run hotter and use more battery.";
             case "frame_gen": return "Shows an extra picture between two real ones";
             case "render_res": return "Size of the 3D scene before upscaling";
             case "latency": return "Responsive · Balanced · Smoothest";
@@ -177,7 +178,9 @@ final class Strings {
             case "frame_rate": return "How often the game itself updates. 30 fps is what the game was made for. "
                     + "40 fps is a middle ground: Smoothest on 120 Hz displays; on 60 Hz it is uneven. "
                     + "The app requests 120 Hz but cannot override your display settings. "
-                    + "40 and 60 fps turn frame generation off. 60 fps doubles the work for the processor and GPU; busy areas may drop below it.";
+                    + "40, 60 and Unlimited turn frame generation off. 60 fps doubles the work for the processor and GPU; busy areas may drop below it. "
+                    + "Unlimited lets the frame rate vary up to the game clock's 120 fps safety ceiling. It may run hotter and use more battery, "
+                    + "and is best with a high-refresh screen. The app requests the display's highest supported refresh rate; Android may keep a lower mode.";
             case "frame_gen": return "Draws an in-between picture from two real frames, so the screen updates 60 times a second while "
                     + "the game itself runs at 30. Motion looks smoother; input feels about one frame later.";
             case "render_res": return "The size the game draws its 3D scene at before it is enlarged to fill the screen. Smaller is faster "
@@ -219,7 +222,7 @@ final class Strings {
     }
     static String valueName(String key, String value) {
         switch (key) {
-            case "frame_rate": return value + " fps";
+            case "frame_rate": return value.equals("unlimited") ? "Unlimited" : value + " fps";
             case "frame_gen": return value.equals("on") ? "Interpolation" : "Off";
             case "gpu_feed": return value.equals("on") ? "On" : "Off";
             case "render_res": return value.equals("game") ? "Game default" : value.replace("x", " × ");
@@ -255,7 +258,7 @@ final class Strings {
     }
     /** Short value for the home screen summaries. */
     static String graphicsSummary(Settings s) {
-        String rate = s.get("frame_gen").equals("on") ? "30 → 60 generated" : s.get("frame_rate") + " fps";
+        String rate = s.get("frame_gen").equals("on") ? "30 → 60 generated" : valueName("frame_rate", s.get("frame_rate"));
         String res = s.get("render_res").equals("game") ? "game resolution" : s.get("render_res").replace("x", " × ");
         String up = s.get("upscaler").equals("off") ? "" : " · " + upscalerName(s.get("upscaler"));
         return presetName(s.preset()) + " · " + rate + " · " + res + up;

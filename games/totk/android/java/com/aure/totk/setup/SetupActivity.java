@@ -1385,7 +1385,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     private void fact(String key, String value) { fact(key, Theme.text(this, value, false, 20, Theme.TEXT)); }
     private static int cost(String key, String value) {
         switch (key) {
-            case "frame_rate": return value.equals("60") ? 4 : value.equals("40") ? 3 : 2;
+            case "frame_rate": return value.equals("unlimited") ? 5 : value.equals("60") ? 4 : value.equals("40") ? 3 : 2;
             case "frame_gen": return value.equals("on") ? 3 : 0;
             case "gpu_feed": return value.equals("on") ? 1 : 0;
             case "render_res": return value.equals("960x540") ? 1 : value.equals("1152x648") ? 2 : 3;

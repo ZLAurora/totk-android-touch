@@ -4,6 +4,10 @@
 #include "thread_place.h"
 #include <stdatomic.h>
 #include <sys/stat.h>
+#ifdef __ANDROID__
+/* This standalone scheduling fixture has no Android frontend/ADPF session. */
+void totk_perf_thread(const char *name) { (void)name; }
+#endif
 static _Atomic unsigned checks, failures;
 #define CHECK(c, text) do { checks++; if (!(c)) { failures++; fprintf(stderr, "FAIL: %s\n", text); } } while (0)
 static cpu_set_t original;

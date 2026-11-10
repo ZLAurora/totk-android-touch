@@ -12,7 +12,7 @@ enum { VK_OVERLAY_PAD = 2, VK_OVERLAY_ROW_H = 11, VK_OVERLAY_CELL_W = 6, VK_OVER
        VK_OVERLAY_COMPACT_COLS = sizeof("FPS 999.9") - 1, VK_OVERLAY_COMPACT_FG_COLS = sizeof("FPS 999.9->999.9") - 1,
        VK_OVERLAY_W = VK_OVERLAY_COLS * VK_OVERLAY_CELL_W + 2 * VK_OVERLAY_PAD,
        VK_OVERLAY_GRAPH = VK_OVERLAY_W - 2 * VK_OVERLAY_PAD, VK_OVERLAY_GRAPH_H = 12,
-       VK_OVERLAY_MAX_ROWS = 6, VK_OVERLAY_MAX_H = 2 * VK_OVERLAY_PAD + VK_OVERLAY_MAX_ROWS * VK_OVERLAY_ROW_H + VK_OVERLAY_GRAPH_H,
+       VK_OVERLAY_MAX_ROWS = 8, VK_OVERLAY_MAX_H = 2 * VK_OVERLAY_PAD + VK_OVERLAY_MAX_ROWS * VK_OVERLAY_ROW_H + VK_OVERLAY_GRAPH_H,
        VK_OVERLAY_MAX_SCALE = 6, VK_OVERLAY_SLOTS = VK_PRESENT_SLOT_CAPACITY };
 typedef enum {
     VK_OVERLAY_SCALE_NONE, VK_OVERLAY_SCALE_LINEAR, VK_OVERLAY_SCALE_FSR1, VK_OVERLAY_SCALE_SGSR
@@ -27,8 +27,8 @@ typedef enum {
 } vk_overlay_fg_state;
 typedef struct { uint32_t x, y, w, h, scale; } vk_overlay_rect;
 typedef struct {
-    unsigned width, height, graph_x, graph_y, graph_w, rows, compile_row, power_row;
-    int framegen, power, handheld, compact;
+    unsigned width, height, graph_x, graph_y, graph_w, rows, compile_row, power_row, system_row;
+    int framegen, power, handheld, compact, system;
     vk_overlay_rect rect;
     unsigned generation, position;
     uint32_t output_w, output_h;
@@ -45,7 +45,14 @@ typedef struct {
     struct { int real, incremental, budget, paired; unsigned shown, expected; } gpu;
     struct { int ms; unsigned count; } compile;
     struct { int power, input, temperature; } power;
+    struct { unsigned thermal, headroom, cpu, ratio, cap; } system;
+    struct { unsigned available, total, rss; } memory;
 } vk_overlay_display_key;
+/* Zero means unavailable; thermal/headroom/cpu/ratio encode value + 1. Memory is MiB.
+   cap: 0 unknown, 1 no policy cap, 2 scaling_max below hardware max. */
+typedef struct {
+    unsigned thermal, headroom, cpu, ratio, cap, available, total, rss;
+} vk_overlay_system;
 typedef struct {
     uint64_t timestamps[256], last_ns, text_ns;
     unsigned next, count;
@@ -60,6 +67,9 @@ typedef struct {
     uint32_t render_w, render_h, canvas_w, canvas_h, output_w, output_h;
     int handheld;
     int compact; /* fps mode: rate row only, no graph; configure re-lays out when it changes */
+    int system; /* full mode reserves thermal/CPU and memory rows when opted in */
+    vk_overlay_system sys;
+    char system_text[VK_OVERLAY_COLS + 1], memory_text[VK_OVERLAY_COLS + 1];
     vk_overlay_scale_method scale_stage[2];
     char resolution_text[VK_OVERLAY_COLS + 1], mode_text[3];
     vk_overlay_fg_engine engine;
@@ -109,6 +119,9 @@ typedef struct { int mw, input; } vk_overlay_power;
 vk_overlay_power vk_overlay_read_power(const char *supply_root);
 /* battery/temp is defined in tenths of a degree C. No arbitrary thermal-zone guess. */
 int vk_overlay_read_temperature(const char *supply_root);
+/* Explicit roots for deterministic host fixtures; production never overrides sensor paths.
+   cpu is the sampled g-main host CPU, not the sampler CPU; negative means unavailable. */
+vk_overlay_system vk_overlay_read_system(const char *cpu_root, const char *proc_root, int cpu);
 
 /* Recording thread owns staging; each slot may only be reused after its present ring slot is idle.
    The transfer restores the supplied image layout; caller retains queue-family ownership.

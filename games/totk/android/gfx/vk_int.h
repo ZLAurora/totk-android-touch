@@ -630,6 +630,10 @@ VkQueryPipelineStatisticFlags vk_gpuprof_stats_mask(void);
 void vk_gpuprof_secondary(int enabled);
 int vk_gpuprof_chunk_query(VkQueryPool *pool, uint32_t *query);
 void vk_gpuprof_draw(vk_shader *const shaders[6]);
+extern int vk_gpuprof_pipeline_on; /* launch-time group budget, 0 disables all group work */
+void vk_gpuprof_pipeline_begin(VkCommandBuffer cb, VkPipeline pipeline, vk_shader *const shaders[6]);
+void vk_gpuprof_pipeline_count(int prim, uint32_t count, uint32_t instances, int indexed);
+void vk_gpuprof_pipeline_break(VkCommandBuffer cb); /* before clears/pass end; secondary ends are ordered recorder events */
 void vk_gpuprof_dispatch_begin(VkCommandBuffer cb);
 void vk_gpuprof_present(void); /* recording lock; CPU closure; sampled sealed-CB path submits one end-marker slot */
 #ifdef TOTK_VK_TESTS

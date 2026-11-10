@@ -46,16 +46,37 @@ static void *liveness_timeout(void *unused) {
     }
     pthread_mutex_unlock(&liveness.mu); return NULL;
 }
+typedef struct {
+    pthread_t target; pthread_mutex_t mu; pthread_cond_t cv; int done, error;
+} bounded_join;
+static void *join_notify(void *arg) {
+    bounded_join *join = arg;
+    int error = pthread_join(join->target, NULL);
+    pthread_mutex_lock(&join->mu); join->error = error; join->done = 1;
+    pthread_cond_signal(&join->cv); pthread_mutex_unlock(&join->mu);
+    return NULL;
+}
 static void join_bounded(pthread_t thread,const char *phase) {
+    /* Bionic has no pthread_timedjoin_np. A join owner publishes completion to a
+       timed POSIX condition without opening any gate or releasing test resources. */
+    bounded_join join = {.target=thread,.mu=PTHREAD_MUTEX_INITIALIZER,.cv=PTHREAD_COND_INITIALIZER};
+    pthread_t owner; int error = pthread_create(&owner, NULL, join_notify, &join);
+    if (error) { fprintf(stderr,"FAIL: bounded join owner: %s (error=%d)\n",phase,error); _Exit(1); }
     struct timespec deadline;
     if (clock_gettime(CLOCK_REALTIME,&deadline)) { perror("join clock"); _Exit(1); }
     deadline.tv_sec+=10;
-    int error=pthread_timedjoin_np(thread,NULL,&deadline);
+    pthread_mutex_lock(&join.mu);
+    while (!join.done && !error) error=pthread_cond_timedwait(&join.cv,&join.mu,&deadline);
+    if (!error) error=join.error;
+    pthread_mutex_unlock(&join.mu);
     CHECK(!error,phase);
     if (error) {
         fprintf(stderr,"FAIL: bounded replay-pin join: %s (error=%d)\n",phase,error);
         fflush(stderr); _Exit(1);
     }
+    error=pthread_join(owner,NULL);
+    if (error) { fprintf(stderr,"FAIL: bounded join owner exit: %s (error=%d)\n",phase,error); _Exit(1); }
+    pthread_cond_destroy(&join.cv); pthread_mutex_destroy(&join.mu);
 }
 static void wait_ticket(uint64_t ticket,const char *label) {
     int complete=ticket && mtl_wait(ticket,UINT64_C(2000000000));

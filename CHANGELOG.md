@@ -6,14 +6,25 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
 ## Unreleased
 
 ### Developer tools
+- Add default-off `TOTK_OVERLAY_SYS=1` full-overlay rows for Android thermal status/headroom, the main game's
+  sampled CPU policy current/hardware-max clock ratio and cap marker, available/total RAM and game RSS.
+  The existing background sampler owns all reads (1 Hz; headroom at 10 s); absent fields never move the layout.
+- Release benchmark camera pans at the timed endpoint before snapshot reads, using one symmetric device-side batch.
+  Interrupt/failed-command cleanup cancels that owned batch promptly instead of queuing behind its busy root broker.
+  The fake-device cancellation regression measures the completed release within 6 s independently of a
+  load-tolerant 30 s host-teardown timeout.
+  Add an explicit restart-quartet O/B/B/O comparison rule with paired signs and reference-spread admission, without
+  changing in-session direction confirmation. Report window compile provenance and unavailable scene state;
+  optional bounded graphics-calm warm-up is off by default and never filters compiling measured windows.
 - Add opt-in rooted-device CPU profiling with NDK simpleperf frame-pointer stacks,
   exact-build symbol checks, shell-accessible staging, and verified perf-control restoration.
   Per-thread period-weighted self/inclusive reports separate walker, recorder, submit and game CPU.
 - Give newly linked `libtotk.so` a SHA-1 GNU build ID retained in the packaged library,
   so native profiles can identify matching unstripped symbols without relying on source revision alone.
-- Add experimental `TOTK_FRAME_RATE_HINT_HZ` (default off, needs `TOTK_FRAME_RATE_HINT=1`): request only integer
-  rates advertised by the current game-window display, through the existing FIXED_SOURCE window/AHB-child hints.
-  Invalid or unavailable rates retain the old hint policy; game pacing and Android settings remain unchanged.
+- Add experimental `TOTK_FRAME_RATE_HINT_HZ` (default off, needs `TOTK_FRAME_RATE_HINT=1`): request integer
+  rates advertised by the current game-window display, or `max` for its highest rate (including fractional Hz),
+  through the existing FIXED_SOURCE window/AHB-child hints. Invalid or unavailable rates retain the old hint
+  policy; game pacing and Android settings remain unchanged.
 
 ### Runtime
 - Keep `totk.log` as the direct primary log, but make its duplicate logcat mirror opt-in (`TOTK_LOGCAT=1`).
@@ -22,8 +33,38 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   Keep its directory watch until the control file appears instead of repeatedly waking on its own watch removals.
 - Keep the stall watchdog enabled, but reuse the present timestamp/frame instead of reading a second clock and
   incrementing an atomic counter every frame; publish immutable stage names only when they change.
+- Add default-off `TOTK_VK_GPU_PROFILE_PIPELINES=1..16`: bounded rotating GPU timestamp brackets for
+  contiguous actual-pipeline/full-shader-variant groups, including recorder secondaries and separate compute.
+  Schema-3 rows retain draw/primitive knownness and sampling/loss authority; the host analyzer ranks exact
+  pipelines and shader pairs without treating a pass's first shader or draw count as their cost.
+  Existing pass profiling stays unchanged when this switch is off; on-device overhead still needs calibration.
+- Make enabled pipeline profiling default to bounded sampled-key 300-frame compact JSONL windows,
+  suppressing per-group/per-frame rows while preserving parent pass/window aggregates. Explicit
+  `TOTK_VK_GPU_PROFILE_PIPELINES_RAW=1` restores the large raw stream; profiling with PIPELINES off is unchanged.
+  Intern exact pipeline/full-shader identities with bounded inactive-key eviction and per-file dictionary
+  authority. Preserve actual-denominator moments, completed-frame domain eligibility, population exposure
+  and explicit loss/overflow; flush partial windows once at close without inventing GPU retirement.
+  Publish worker CPU, cumulative output bytes, backlog/memory bounds and a deterministic no-GPU
+  4096-key churn fixture using the production queue/aggregation/output path. Host capacity is not device proof.
+- Amortize compact pipeline-window encoding across completed frames using one fixed report snapshot,
+  rather than holding query-lease service for the report-edge formatting burst. Close drains the snapshot;
+  headers include its bounded memory. Count and retire activated pipeline timestamps in the current
+  shutdown authority, retaining unavailable endpoints as outstanding. Profiling remains default-off.
+  Limit qualified pipeline captures to ≤30 fps (Duo or capped Thor); 45-fps/uncapped captures remain
+  unqualified and must fail closed on footer drops/missing coverage. The fixed lease pool is not enlarged.
 
 ### Menu
+- Add **Unlimited** to Frame rate: variable real-game updates up to the existing 120 fps safety ceiling, with
+  the realtime game clock unchanged, frame generation and frame lag off, and the scripted-camera 30 fps floor intact.
+  Request the window display's highest advertised refresh rate; Android may keep a lower mode. This choice is best
+  with a high-refresh screen and may run hotter and use more battery. Existing 30/40/60 choices and every preset
+  retain their exact settings; leaving Unlimited removes its timing and refresh request.
+- Enable protected frame lag only in the Snapdragon 8 Elite-class (Odin3, `CQ8725S` / `SM8750`) native60 fps
+  menu profile, with frame generation off, including first run and existing stores. Developer `totk.env`
+  `TOTK_FRAME_LAG=0` still wins; runtime-unset, other chips and non-60 settings remain unchanged.
+  Retain automatic600-draw chunking when lag resolves on and native VMA pressure is absent.
+  Capped Odin tests improved static/pan throughput and33 ms counts; a descriptive pan p99 tail worsened,
+  so this is not a tail or responsiveness guarantee. Duo/Thor do not gain the policy.
 - Add **40 fps** to Frame rate without changing existing presets or 30/60 settings. It caps real game updates
   at 40 with normal game speed and frame lag off, requesting 120 Hz when advertised. Presentation slots follow
   the actual display clock: smoothest on 120 Hz; on 60 Hz (including a user-imposed cap) it is uneven.

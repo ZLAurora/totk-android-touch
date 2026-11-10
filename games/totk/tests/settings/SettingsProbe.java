@@ -22,6 +22,7 @@ import java.util.Map;
  *    env locale k=v...             Settings.env(locale) with newlines as '|' ('-' = no locale)
  *    envset locale k=v...          defaults, sequential Settings.set, then env text (for mode transitions)
  *    envsoc soc locale k=v...      Settings.env(locale) from a stored map with this chip
+ *    envfirst soc locale          Settings.firstRun(soc).env(locale)
  *    envpreset name locale k=v...  apply a preset, then Settings.env(locale)
  *    envsocpreset name soc locale k=v...  firstRun(soc), apply a preset, optional overrides, then Settings.env(locale)
  *    envdir locale dir k=v...      Settings.env(locale, dir) ('-' = primary folder, no TOTK_DATA_DIR)
@@ -82,6 +83,7 @@ public final class SettingsProbe {
                     answer = s.env(w[1].equals("-") ? null : w[1]).replace('\n', '|'); break;
                 }
                 case "envsoc": answer = new Settings(pairs(w, 3), w[1]).env(w[2].equals("-") ? null : w[2]).replace('\n', '|'); break;
+                case "envfirst": answer = Settings.firstRun(w[1]).env(w[2].equals("-") ? null : w[2]).replace('\n', '|'); break;
                 case "envpreset": {
                     Settings s = new Settings(pairs(w, 3), null);
                     s.applyPreset(w[1]);

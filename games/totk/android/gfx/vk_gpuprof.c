@@ -3,6 +3,10 @@
    assembly never touches the walking thread's current pass. */
 #include "vk_int.h"
 #include "vk_gpuprof_time.h"
+#include "vk_gpuprof_pipe.h"
+#include "vk_gpuprof_compact.h"
+#include "vk_record.h"
+#include <sys/random.h>
 #include "../../runtime/thread_place.h"
 #include <stdarg.h>
 #include <time.h>
@@ -14,11 +18,19 @@
 #define GP_GROUPS 16384
 #define GP_WINDOW 300
 #define GP_SEGMENTS 64
-#define GP_SPAN_BASE (GP_RECORDS * 2)
+/* Pack queried coordinates to the configured sampled budget. The mark array
+   retains a compile-time full-mode bound, not a full-size driver query pool. */
+#define GP_MAX_TIMESTAMPS (GP_RECORDS * 2 + GP_SEGMENTS * 2 + 2)
+#define GP_SPAN_BASE (sample_budget ? sample_budget * 2 * GP_SEGMENTS : GP_RECORDS * 2)
 #define GP_PRE_QUERY (GP_SPAN_BASE + GP_SEGMENTS * 2 + 1)
 #define GP_TIMESTAMPS (GP_PRE_QUERY + 1)
+#define GP_OPTIONAL_PIPELINES 1024u
+#define GP_PIPELINE_QUERIES ((uint32_t)vk_gpuprof_pipeline_on * GP_SEGMENTS)
+#define GP_PIPELINE_RECORDS (GP_OPTIONAL_PIPELINES + GP_PIPELINE_QUERIES)
 #define GP_HISTOGRAM 272
-#define GP_BACKLOG 16
+/* Eight renderer slots bound GPU ownership. A paced 18-submit/frame report
+   burst exceeded 28 owners by one; 32 packed owners retain bounded margin. */
+#define GP_BACKLOG 32
 #define GP_CLOSURES 256
 enum { GP_IA_VERTICES, GP_IA_PRIMITIVES, GP_VS, GP_CLIP_INVOCATIONS, GP_CLIP_PRIMITIVES, GP_FS, GP_STATS };
 #define GP_STATS_MASK (VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_VERTICES_BIT | \
@@ -42,22 +54,32 @@ typedef struct {
 typedef struct {
     uint64_t frame;
     uint32_t first, last, first_valid, last_valid, timestamp_count;
+    uint32_t pipeline_observed, pipeline_dropped, pipeline_selected, pipeline_timestamps;
+    uint32_t pipeline_population, pipeline_phase, pipeline_unretained, pipeline_out_of_range;
 } gp_segment;
+typedef struct {
+    gp_compact_key key; /* borrows immutable, process-lifetime vk_shader names */
+    uint64_t frame, primitives, unknown_draws, draws, dispatches;
+    uint32_t parent, ordinal, query1, timestamps, selected, population;
+} gp_pipeline;
 struct vk_gpuprof_slot {
-    VkQueryPool pool, stats;
+    VkQueryPool pool, stats, pipeline_pool;
+    gp_pipeline *pipeline;
+    vk_gpuprof_timestamp *pipeline_ticks;
+    uint32_t npipeline, pipeline_timed, pipeline_unselected;
     uint32_t n, dropped, ns, nt, span_writes;
-    uint64_t sealed, sequence;
+    uint64_t sealed, sequence, lease, ready_ns;
     uint32_t nsegment, has_pre;
     int discard;
     VkCommandBuffer pre_cb;
     gp_segment segment[GP_SEGMENTS];
     vk_gpuprof_timestamp span_ticks[GP_SEGMENTS * 2 + 1], pre_tick;
     vk_gpuprof_time_domain domain;
-    uint8_t timestamp_marks[GP_TIMESTAMPS]; /* counted/invalid once per queried endpoint */
+    uint8_t timestamp_marks[GP_MAX_TIMESTAMPS]; /* counted/invalid once per queried endpoint */
     gp_record rec[GP_RECORDS];
     vk_gpuprof_timestamp ticks[GP_RECORDS * 2];
-    uint64_t counters[GP_RECORDS][GP_STATS];
-    uint32_t stats_owner[GP_RECORDS];
+    uint64_t (*counters)[GP_STATS]; /* allocated only with statistics enabled */
+    uint32_t *stats_owner;
 };
 typedef struct {
     gp_key key; uint64_t hash, count, draws, counters[GP_STATS], stats_count, stats_draws;
@@ -68,6 +90,31 @@ typedef struct {
 } gp_group;
 
 int vk_gpuprof_on;
+int vk_gpuprof_pipeline_on;
+static uint32_t pipeline_phase, pipeline_launch_phase, pipeline_ordinal;
+static int pipeline_raw;
+static gp_compact compact;
+static gp_compact *compact_pending; /* one enabled-only frozen report; never a queue */
+static unsigned compact_report_cursor;
+static double compact_report_cpu_ms;
+static uint64_t compact_report_dropped_slots, compact_report_dropped_closures;
+static uint64_t output_serialized_bytes, compact_bytes_start;
+static _Atomic uint64_t background_backlog_peak;
+static double compact_flush_cpu_ms, compact_close_cpu_ms;
+static double worker_cpu_start, worker_cpu_total_ms, worker_window_cpu_start, worker_window_cpu_peak_ms;
+static int compact_closing;
+static uint64_t compact_unclosed_groups, compact_unclosed_frames, output_write_calls;
+static void compact_report(void);
+static void compact_report_pump(unsigned budget);
+static void compact_finish_frame(uint64_t number, int complete);
+static uint32_t pipeline_population = VK_GPUPROF_PIPE_ORDINALS;
+static gp_pipeline *pipeline_open;
+static gp_record *pipeline_parent;
+static VkPipeline pipeline_last;
+static vk_shader *pipeline_shaders[3];
+static VkCommandBuffer pipeline_cb;
+static int pipeline_secondary, pipeline_random;
+static uint64_t pipeline_lease;
 static int stats_on, secondary_pass;
 static uint32_t sample_budget, sample_previous_passes, sample_selected;
 static uint64_t sample_cursor;
@@ -86,6 +133,7 @@ static uint32_t frame_instance;
 static uint64_t recording_sequence; /* increments only at actual slot seal, never cancellation */
 /* Aggregation/query/output state below belongs ONLY to totk-gpuprof. */
 static gp_group groups[GP_GROUPS];
+static uint64_t group_occupied[GP_GROUPS / 64]; /* avoid a cold multi-MiB report scan/clear */
 static struct {
     uint64_t frame, dropped, unavailable_timestamps, invalid_timestamps, timestamp_wraps;
     uint64_t timestamp_count, observed_passes, sampled_passes;
@@ -95,7 +143,7 @@ static struct {
     vk_gpuprof_time_domain first_domain, last_domain;
     vk_gpuprof_time_status status;
     double measured;
-    uint32_t scene_w, scene_h;
+    uint32_t scene_w, scene_h, pipeline_population;
     int has_ticks, has_end, failed;
 } completed;
 static uint64_t last_completed, window_frames;
@@ -153,7 +201,70 @@ static _Atomic uint64_t leases_acquired, leases_submitted, leases_retired, lease
 static _Atomic uint64_t queries_submitted, queries_retired, queries_cancelled;
 static pthread_mutex_t shutdown_mu = PTHREAD_MUTEX_INITIALIZER;
 static int query_drain_timed_out;
+enum { GP_IDLE, GP_READBACK, GP_AGGREGATE, GP_RESET, GP_REPORT };
+static _Atomic unsigned background_phase;
+static unsigned background_consuming;
+#define GP_DROP_FRAMES 64
+typedef struct { uint64_t frame, count; uint32_t queued, active, inflight, phases; } gp_drop_frame;
+static gp_drop_frame background_drop_frame[GP_DROP_FRAMES];
+static unsigned background_ndrop_frame;
+static uint64_t background_drop_frame_overflow, background_drop_queued, background_drop_inflight_only;
+static int background_effective_nice, background_nice_error;
+static char background_effective_affinity[512];
+static uint64_t worker_service_count;
+static double worker_service_cpu_ms, worker_service_wall_ms, worker_service_wall_max_ms;
+static double worker_query_wall_ms, worker_reset_wall_ms, worker_report_wall_ms, worker_queue_wait_max_ms;
+static uint64_t monotonic_ns(void) {
+    struct timespec ts;
+    return clock_gettime(CLOCK_MONOTONIC, &ts) ? 0 :
+        (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
+}
+static int background_acquire(vk_gpuprof_slot **owner) {
+    pthread_mutex_lock(&background_mu);
+    if (background_stop || atomic_load_explicit(&background_closing, memory_order_relaxed)) {
+        pthread_mutex_unlock(&background_mu); return 0;
+    }
+    if (background_nfree) {
+        *owner = background_free[--background_nfree];
+        pthread_mutex_unlock(&background_mu); return 1;
+    }
+    atomic_fetch_add_explicit(&background_dropped_slots, 1, memory_order_relaxed);
+    unsigned queued = (unsigned)(background_tail - background_head), active = background_consuming;
+    unsigned inflight = GP_BACKLOG - queued - active;
+    if (queued || active) background_drop_queued++;
+    else background_drop_inflight_only++;
+    gp_drop_frame *d = background_ndrop_frame ? &background_drop_frame[background_ndrop_frame - 1] : NULL;
+    if (!d || d->frame != frame) {
+        if (background_ndrop_frame < GP_DROP_FRAMES) {
+            d = &background_drop_frame[background_ndrop_frame++]; d->frame = frame;
+        } else { background_drop_frame_overflow++; d = NULL; }
+    }
+    if (d) {
+        d->count++;
+        if (queued > d->queued) d->queued = queued;
+        if (active > d->active) d->active = active;
+        if (inflight > d->inflight) d->inflight = inflight;
+        d->phases |= 1u << atomic_load_explicit(&background_phase, memory_order_relaxed);
+    }
+    pthread_mutex_unlock(&background_mu);
+    return 0;
+}
 #ifdef TOTK_VK_TESTS
+static int fixture_mode;
+static unsigned fixture_worker_scale = 1000;
+static unsigned fixture_coupled_stall_ms;
+static int fixture_coupled_stalled;
+static double fixture_service_delay_ns(double cpu_ms, uint64_t elapsed_ns, unsigned scale) {
+    double target = cpu_ms * scale * 1000;
+    return target > elapsed_ns ? target - elapsed_ns : 0;
+}
+static VkResult fixture_query_results(VkDevice device, VkQueryPool pool, uint32_t first, uint32_t count,
+        size_t size, void *data, VkDeviceSize stride, VkQueryResultFlags flags) {
+    if (fixture_mode) return VK_SUCCESS; /* deterministic available/unavailable payloads already supplied */
+    return vkGetQueryPoolResults(device, pool, first, count, size, data, stride, flags);
+}
+#undef vkGetQueryPoolResults
+#define vkGetQueryPoolResults fixture_query_results
 static int background_paused;
 static uint64_t background_flush_requested, background_flush_done;
 #endif
@@ -167,6 +278,9 @@ static uint64_t env_u64(const char *name, uint64_t fallback, uint64_t minimum, u
     return end && !*end && value >= minimum && value <= maximum ? value : fallback;
 }
 typedef struct { char data[8192]; size_t used; int failed; } gp_json;
+static void json_init(gp_json *row) {
+    row->used = 0; row->failed = 0; row->data[0] = 0;
+}
 static void json_add(gp_json *row, const char *format, ...) {
     if (row->failed) return;
     va_list args; va_start(args, format);
@@ -176,13 +290,19 @@ static void json_add(gp_json *row, const char *format, ...) {
     row->used += (size_t)n;
 }
 static gp_json output_header;
+static gp_json compact_report_diagnostics;
 static void json_string(gp_json *row, const char *text) {
     if (!text) { json_add(row, "null"); return; }
     json_add(row, "\"");
-    for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
-        if (*p == '"' || *p == '\\') json_add(row, "\\%c", *p);
-        else if (*p < 32) json_add(row, "\\u%04x", *p);
-        else json_add(row, "%c", *p);
+    const unsigned char *p = (const unsigned char *)text;
+    while (*p && !row->failed) {
+        const unsigned char *start = p;
+        while (*p >= 32 && *p != '"' && *p != '\\') p++;
+        size_t n = (size_t)(p - start);
+        if (n >= sizeof row->data - row->used) { row->failed = 1; return; }
+        memcpy(row->data + row->used, start, n); row->used += n; row->data[row->used] = 0;
+        if (*p == '"' || *p == '\\') json_add(row, "\\%c", *p++);
+        else if (*p) json_add(row, "\\u%04x", *p++);
     }
     json_add(row, "\"");
 }
@@ -198,13 +318,83 @@ void vk_gpuprof_identity(const char *commit, const char *package, uint64_t versi
     }
     pthread_mutex_unlock(&output_mu);
 }
+/* Called only by the file owner, after bytes for the previous file drained. */
+static FILE *output_rotate_file(FILE *file) {
+    int failed = fflush(file);
+    if (fclose(file)) failed = 1;
+    if (failed) return NULL;
+    char from[PATH_MAX], to[PATH_MAX];
+    for (int i = 3; i > 0; i--) {
+        snprintf(to, sizeof to, "%s.%d", output_path, i);
+        if (i == 1) snprintf(from, sizeof from, "%s", output_path);
+        else snprintf(from, sizeof from, "%s.%d", output_path, i - 1);
+        if (rename(from, to) && access(from, F_OK) == 0) return NULL;
+    }
+    return fopen(output_path, "wb");
+}
+#include "vk_gpuprof_sink.h"
+static void output_worker_diagnostics(gp_json *row, int drops) {
+    pthread_mutex_lock(&background_mu);
+    json_add(row, ",\"background_dropped_with_worker_backlog\":%llu,\"background_dropped_inflight_only\":%llu,"
+        "\"background_drop_frame_overflow\":%llu",
+        (unsigned long long)background_drop_queued, (unsigned long long)background_drop_inflight_only,
+        (unsigned long long)background_drop_frame_overflow);
+    if (drops) {
+        json_add(row, ",\"background_drop_frames\":[");
+        for (unsigned i = 0; i < background_ndrop_frame; i++) {
+            const gp_drop_frame *d = &background_drop_frame[i];
+            json_add(row, "%s[%llu,%llu,%u,%u,%u,%u]", i ? "," : "",
+                (unsigned long long)d->frame, (unsigned long long)d->count,
+                d->queued, d->active, d->inflight, d->phases);
+        }
+        json_add(row, "]");
+    }
+    pthread_mutex_unlock(&background_mu);
+    pthread_mutex_lock(&output_sink.mu);
+    json_add(row, ",\"output_sink_overflows\":%llu,\"output_sink_peak_bytes\":%llu",
+        (unsigned long long)output_sink.overflows, (unsigned long long)output_sink.peak);
+    pthread_mutex_unlock(&output_sink.mu);
+    json_add(row, ",\"worker_service_count\":%llu,\"worker_service_cpu_ms\":%.6f,"
+        "\"worker_service_wall_ms\":%.6f,\"worker_service_wall_max_ms\":%.6f,"
+        "\"worker_query_wall_ms\":%.6f,\"worker_reset_wall_ms\":%.6f,"
+        "\"worker_report_wall_ms\":%.6f,\"worker_queue_wait_max_ms\":%.6f",
+        (unsigned long long)worker_service_count, worker_service_cpu_ms, worker_service_wall_ms,
+        worker_service_wall_max_ms, worker_query_wall_ms, worker_reset_wall_ms,
+        worker_report_wall_ms, worker_queue_wait_max_ms);
+}
+static void output_flush_locked(int wait) {
+    if (!output_file) return;
+    if (output_sink.started) gp_sink_flush(wait);
+    else if (fflush(output_file)) atomic_fetch_add_explicit(&output_failures, 1, memory_order_relaxed);
+}
 static int output_write_locked(const char *text, size_t n) {
+#ifdef TOTK_VK_TESTS
+    if (fixture_coupled_stall_ms && !fixture_coupled_stalled && output_serialized_bytes >= 65536) {
+        fixture_coupled_stalled = 1;
+        struct timespec delay = {fixture_coupled_stall_ms / 1000,
+            (long)(fixture_coupled_stall_ms % 1000) * 1000000};
+        while (nanosleep(&delay, &delay) && errno == EINTR) {}
+    }
+#endif
+    if (output_sink.started) {
+        if (!gp_sink_write(text, n)) { output_failures++; return 0; }
+    } else
     if (fwrite(text, 1, n, output_file) != n) {
         LOGV("[gpu-profile] JSONL write failed path=%s", output_path);
         fclose(output_file); output_file = NULL; output_failures++; return 0;
     }
     output_bytes += n;
+    output_serialized_bytes += n;
+    output_write_calls++;
     return 1;
+}
+static size_t background_lease_bytes(void) {
+    size_t bytes = sizeof(vk_gpuprof_slot);
+    if (vk_gpuprof_pipeline_on)
+        bytes += GP_PIPELINE_RECORDS * sizeof(gp_pipeline) +
+            2 * GP_PIPELINE_QUERIES * sizeof(vk_gpuprof_timestamp);
+    if (stats_on) bytes += GP_RECORDS * (GP_STATS * sizeof(uint64_t) + sizeof(uint32_t));
+    return GP_BACKLOG * bytes;
 }
 static int output_header_locked(void) {
     gp_json row = output_header;
@@ -226,6 +416,20 @@ static void output_init(void) {
     output_limit = env_u64("TOTK_VK_GPU_PROFILE_MAX_BYTES", output_limit, 4096, UINT64_C(1) << 30);
     gp_json *row = &output_header;
     json_add(row, "{\"schema\":3,\"type\":\"header\",\"launch_id\":"); json_string(row, output_launch);
+    if (vk_gpuprof_pipeline_on) json_add(row,
+        ",\"pipeline_budget\":%d,\"pipeline_population\":%u,\"pipeline_phase\":%u,"
+        "\"pipeline_random_phase\":%s,\"pipeline_query_limit\":%u",
+        vk_gpuprof_pipeline_on, VK_GPUPROF_PIPE_ORDINALS, pipeline_launch_phase,
+        pipeline_random ? "true" : "false", 2 * GP_PIPELINE_QUERIES);
+    if (vk_gpuprof_pipeline_on) {
+        json_add(row, ",\"pipeline_output\":\"%s\",\"pipeline_compact_version\":1,\"pipeline_window_columns\":[",
+            pipeline_raw ? "raw" : "compact");
+        for (unsigned i = 0; i < GP_COMPACT_COLUMNS; i++) {
+            json_add(row, "%s", i ? "," : ""); json_string(row, gp_compact_columns[i]);
+        }
+        json_add(row, "],\"pipeline_aggregation_memory_bytes\":%zu,\"pipeline_key_capacity\":%u",
+            2 * sizeof compact + sizeof compact_report_diagnostics, GP_COMPACT_KEYS);
+    }
     json_add(row, ",\"build_commit\":"); json_string(row, output_commit[0] ? output_commit : NULL);
     json_add(row, ",\"build_asset\":"); json_string(row, output_build[0] ? output_build : NULL);
     json_add(row, ",\"build_identity_source\":"); json_string(row, output_commit[0] ? "apk:assets/build.txt" : "unavailable");
@@ -234,6 +438,19 @@ static void output_init(void) {
     json_add(row, ",\"package\":"); json_string(row, output_package[0] ? output_package : NULL);
     json_add(row, ",\"version_code\":");
     if (output_version) json_add(row, "%llu", (unsigned long long)output_version); else json_add(row, "null");
+    json_add(row, ",\"worker_effective_nice\":%d,\"worker_nice_errno\":%d,\"worker_affinity\":",
+        background_effective_nice, background_nice_error);
+    json_string(row, background_effective_affinity);
+    json_add(row, ",\"output_sink_capacity_bytes\":%u,\"worker_phase_names\":["
+        "\"idle\",\"query-readback\",\"aggregation\",\"query-reset\",\"window-report\"]",
+        vk_gpuprof_pipeline_on && !pipeline_raw ? GP_SINK_BYTES : 0);
+    json_add(row, ",\"output_sink_memory_bytes\":%zu,\"output_sink_stack_bytes\":%u",
+        vk_gpuprof_pipeline_on && !pipeline_raw ? sizeof output_sink : 0,
+        vk_gpuprof_pipeline_on && !pipeline_raw ? GP_SINK_STACK_BYTES : 0);
+    json_add(row, ",\"lease_memory_bytes\":%zu,\"parent_query_count_per_lease\":%u,"
+        "\"pipeline_record_capacity\":%u,\"pipeline_query_count_per_lease\":%u",
+        background_lease_bytes(), GP_TIMESTAMPS, vk_gpuprof_pipeline_on ? GP_PIPELINE_RECORDS : 0,
+        2 * GP_PIPELINE_QUERIES);
     json_add(row, ",\"apk_sha256\":null,\"apk_sha256_reason\":\"not computed in process; join capture APK hash\","
         "\"profile\":%d,\"stats\":%s,\"ordinals\":%s,\"max_bytes\":%llu,\"retained_files\":4,"
         "\"window_frames\":%d,\"span_limit_ms\":%.0f,\"timestamp_bits\":%u,\"timestamp_period_ns\":%.9f,"
@@ -248,6 +465,7 @@ static void output_init(void) {
     static const char *const names[] = {
         "TOTK_VK_DRIVER", "TOTK_VK_GPU_PROFILE", "TOTK_VK_GPU_PROFILE_STATS", "TOTK_VK_GPU_PROFILE_ORDINALS",
         "TOTK_VK_GPU_PROFILE_SAMPLE",
+        "TOTK_VK_GPU_PROFILE_PIPELINES", "TOTK_VK_GPU_PROFILE_PIPELINES_RAW",
         "TOTK_VK_GPU_PROFILE_LONG_MS", "TOTK_VK_GPU_PROFILE_LONG_FRAMES", "TOTK_VK_GPU_PROFILE_MAX_BYTES",
         "TOTK_VK_REC_THREADS", "TOTK_VK_REC_CHUNK_DRAWS", "TOTK_VK_REC_INLINE_DRAWS", "TOTK_VK_REC_LEAD_DRAWS",
         "TOTK_OPERATION_MODE", "TOTK_RENDER_RES", "TOTK_FPS60", "TOTK_SCENE_SCALE", "TOTK_VK_PRESENT",
@@ -259,32 +477,33 @@ static void output_init(void) {
     json_add(row, "}");
     output_file = fopen(output_path, "wb");
     if (!output_file) output_failures++;
-    else if (!output_header_locked()) { if (output_file) fclose(output_file); output_file = NULL; }
+    else {
+        if (vk_gpuprof_pipeline_on && !pipeline_raw) gp_sink_start(output_file);
+        if (!output_header_locked()) {
+            gp_sink_stop(); fclose(output_file); output_file = NULL;
+        }
+    }
     LOGV("[gpu-profile] JSONL %s path=%s max-bytes=%llu rotations=3 (TOTK_VK_GPU_PROFILE_MAX_BYTES)",
         output_file ? "enabled" : "unavailable", output_path, (unsigned long long)output_limit);
 done:
     pthread_mutex_unlock(&output_mu);
 }
-static int output_row_locked(const char *text) {
+static int output_reserve_locked(size_t n) {
     if (!output_file || output_closed) return 0;
-    size_t n = strlen(text);
     if (n + output_header.used + 64 > output_limit) { output_failures++; return 0; }
-    if (output_bytes + n > output_limit) {
-        fclose(output_file); output_file = NULL;
-        char from[PATH_MAX], to[PATH_MAX];
-        for (int i = 3; i > 0; i--) {
-            snprintf(to, sizeof to, "%s.%d", output_path, i);
-            if (i == 1) snprintf(from, sizeof from, "%s", output_path);
-            else snprintf(from, sizeof from, "%s.%d", output_path, i - 1);
-            if (rename(from, to) && access(from, F_OK) == 0) {
-                LOGV("[gpu-profile] JSONL rotation failed path=%s", from); output_failures++; return 0;
-            }
-        }
-        output_file = fopen(output_path, "wb"); output_bytes = 0; output_rotation++;
+    if (output_bytes + n <= output_limit) return 1;
+    if (output_sink.started) {
+        if (!gp_sink_rotate()) { output_failures++; return 0; }
+    } else {
+        output_file = output_rotate_file(output_file);
         if (!output_file) { output_failures++; return 0; }
-        if (!output_header_locked()) return 0;
     }
-    return output_write_locked(text, n);
+    output_bytes = 0; output_rotation++;
+    return output_header_locked();
+}
+static int output_row_locked(const char *text) {
+    size_t n = strlen(text);
+    return output_reserve_locked(n) && output_write_locked(text, n);
 }
 static void output_row(const char *text) {
     pthread_mutex_lock(&output_mu);
@@ -294,13 +513,13 @@ static void output_row(const char *text) {
 static void output_frame(const char *text, uint64_t number) {
     pthread_mutex_lock(&output_mu);
     if (output_row_locked(text)) output_last_frame = number;
-    if (output_file) fflush(output_file);
+    output_flush_locked(0);
     pthread_mutex_unlock(&output_mu);
 }
 static void output_window(const char *text, uint64_t sequence, uint64_t end) {
     pthread_mutex_lock(&output_mu);
     if (output_row_locked(text)) { output_last_window = sequence; output_last_window_end = end; }
-    if (output_file) fflush(output_file);
+    output_flush_locked(0);
     pthread_mutex_unlock(&output_mu);
 }
 /* Normal close seals/waits renderer work before stopping the reporter. Force-stop
@@ -316,8 +535,9 @@ void vk_gpuprof_shutdown(void) {
     uint64_t pending_closures = background_close_tail - background_close_head;
     pthread_mutex_unlock(&background_mu);
     pthread_mutex_lock(&output_mu);
+    output_flush_locked(1); /* observe sink failures before constructing footer authority */
     if (!output_closed && output_file) {
-        gp_json row = {0};
+        gp_json row; json_init(&row);
         json_add(&row, "{\"schema\":3,\"type\":\"session_end\",\"launch_id\":"); json_string(&row, output_launch);
         uint64_t acquired = atomic_load(&leases_acquired), submitted = atomic_load(&leases_submitted);
         uint64_t retired = atomic_load(&leases_retired), cancelled = atomic_load(&leases_cancelled);
@@ -327,22 +547,34 @@ void vk_gpuprof_shutdown(void) {
         json_add(&row, ",\"clean_end\":true,\"all_queries_retired\":%s,\"last_frame\":%llu,"
             "\"last_window_sequence\":%llu,\"last_window_end\":%llu,\"output_failures\":%llu,"
             "\"background_dropped_slots\":%llu,\"background_dropped_closures\":%llu,\"pending_frame_closures\":%llu,"
+            "\"serialized_bytes\":%llu,\"worker_backlog_peak\":%llu,\"aggregation_memory_bytes\":%zu,"
+            "\"aggregation_flush_cpu_ms\":%.6f,\"close_flush_cpu_ms\":%.6f,\"output_write_calls\":%llu,"
+            "\"aggregation_allocations\":0,\"unclosed_pipeline_groups\":%llu,\"unclosed_pipeline_frames\":%llu,"
             "\"query_drain_timed_out\":%s,"
             "\"query_retirement\":{\"leases_acquired\":%llu,\"leases_submitted\":%llu,\"leases_retired\":%llu,"
             "\"leases_cancelled\":%llu,\"leases_outstanding\":%llu,\"queries_submitted\":%llu,"
-            "\"queries_retired\":%llu,\"queries_cancelled\":%llu,\"queries_outstanding\":%llu}}\n",
+            "\"queries_retired\":%llu,\"queries_cancelled\":%llu,\"queries_outstanding\":%llu}",
             !outstanding && !qo ? "true" : "false",
             (unsigned long long)output_last_frame, (unsigned long long)output_last_window,
             (unsigned long long)output_last_window_end, (unsigned long long)atomic_load(&output_failures),
             (unsigned long long)atomic_load(&background_dropped_slots),
             (unsigned long long)atomic_load(&background_dropped_closures), (unsigned long long)pending_closures,
-            query_drain_timed_out ? "true" : "false",
+            (unsigned long long)output_serialized_bytes, (unsigned long long)background_backlog_peak,
+            vk_gpuprof_pipeline_on && !pipeline_raw ? 2 * sizeof compact + sizeof compact_report_diagnostics : 0,
+            compact_flush_cpu_ms, compact_close_cpu_ms,
+            (unsigned long long)output_write_calls, (unsigned long long)compact_unclosed_groups,
+            (unsigned long long)compact_unclosed_frames, query_drain_timed_out ? "true" : "false",
             (unsigned long long)acquired, (unsigned long long)submitted, (unsigned long long)retired,
             (unsigned long long)cancelled, (unsigned long long)outstanding,
             (unsigned long long)qs, (unsigned long long)qr, (unsigned long long)qc, (unsigned long long)qo);
-        output_row_locked(row.data);
-        if (output_file) { fflush(output_file); fclose(output_file); output_file = NULL; }
+        output_worker_diagnostics(&row, 1); json_add(&row, "}\n");
+        if (row.failed) atomic_fetch_add(&output_failures, 1);
+        else output_row_locked(row.data);
     }
+    int had_sink = output_sink.started;
+    gp_sink_stop();
+    if (had_sink) output_file = output_sink.file;
+    if (output_file) { output_flush_locked(1); fclose(output_file); output_file = NULL; }
     output_closed = 1;
     pthread_mutex_unlock(&output_mu);
     pthread_mutex_unlock(&shutdown_mu);
@@ -358,7 +590,7 @@ static unsigned sample_bucket(double ms) {
 }
 static void output_pass(const gp_group *g, const char *type, uint64_t pass_frame) {
     const gp_key *k = &g->key;
-    gp_json row = {0};
+    gp_json row; json_init(&row);
     uint64_t start = pass_frame ? (pass_frame - 1) / GP_WINDOW * GP_WINDOW + 1 : window * GP_WINDOW + 1;
     uint64_t end = pass_frame ? start + GP_WINDOW - 1 : report_end;
     json_add(&row, "{\"schema\":3,\"type\":\"%s\",\"window_start\":%llu,\"window_end\":%llu,"
@@ -503,7 +735,10 @@ static void aggregate_sample(const gp_group *sample) {
         ++tries < GP_GROUPS) at = (at + 1) % GP_GROUPS;
     if (tries == GP_GROUPS) { dropped_records++; completed.dropped++; return; }
     gp_group *g = &groups[at];
-    if (!g->count) { *g = *sample; g->ordinal = ordinal; }
+    if (!g->count) {
+        *g = *sample; g->ordinal = ordinal;
+        group_occupied[at / 64] |= UINT64_C(1) << (at % 64);
+    }
     else {
         g->count += sample->count; g->draws += sample->draws; g->ms += sample->ms;
         for (unsigned st = 0; st < GP_STATS; st++) g->counters[st] += sample->counters[st];
@@ -567,12 +802,20 @@ static int rank_cmp(const void *a, const void *b) {
     return x->ms < y->ms ? 1 : x->ms > y->ms ? -1 : x->hash < y->hash ? -1 : x->hash > y->hash;
 }
 static void report(void) {
+    uint64_t report_start = monotonic_ns();
+    unsigned previous_phase = atomic_exchange_explicit(&background_phase, GP_REPORT, memory_order_relaxed);
     gp_group *rank[GP_GROUPS]; size_t n = 0;
-    for (size_t i = 0; i < GP_GROUPS; i++) if (groups[i].count) rank[n++] = &groups[i];
+    for (size_t word = 0; word < GP_GROUPS / 64; word++) {
+        uint64_t bits = group_occupied[word];
+        while (bits) {
+            unsigned bit = (unsigned)__builtin_ctzll(bits);
+            rank[n++] = &groups[word * 64 + bit]; bits &= bits - 1;
+        }
+    }
     qsort(rank, n, sizeof *rank, rank_cmp);
     if (!partial_report) report_end = (window + 1) * GP_WINDOW;
     for (size_t i = 0; i < n; i++) output_pass(rank[i], "pass", 0);
-    gp_json summary = {0};
+    gp_json summary; json_init(&summary);
     json_add(&summary, "{\"schema\":3,\"type\":\"window\",\"window_start\":%llu,\"window_end\":%llu,"
         "\"sequence\":%llu,\"ordinals\":%s,\"frames\":%llu,\"partial\":%s,\"measured_ms\":%.9f,"
         "\"span_valid\":%s,\"valid_span_ms\":%.9f,\"valid_gap_ms\":%.9f,\"span_frames\":%llu,",
@@ -595,6 +838,7 @@ static void report(void) {
         (unsigned long long)atomic_load(&background_dropped_slots),
         (unsigned long long)atomic_load(&background_dropped_closures));
     output_window(summary.data, window + 1, report_end);
+    if (vk_gpuprof_pipeline_on && !pipeline_raw) compact_report();
     if (sample_budget) LOGV("[gpu-profile sample] budget=%u sampled=%llu observed=%llu timestamps=%llu frames=%llu; pass sums are sampled only, not frame totals",
         sample_budget, (unsigned long long)window_sample_count, (unsigned long long)window_observed_passes,
         (unsigned long long)window_timestamp_count, (unsigned long long)window_frames);
@@ -628,8 +872,11 @@ static void report(void) {
              g->counters[0] ? g->stats_ms * 1e6 / g->counters[0] : 0,
              g->counters[1] ? g->stats_ms * 1e6 / g->counters[1] : 0);
     }
-    if (sample_budget) for (size_t i = 0; i < n; i++) free(rank[i]->histogram);
-    memset(groups, 0, sizeof groups);
+    for (size_t i = 0; i < n; i++) {
+        if (sample_budget) free(rank[i]->histogram);
+        memset(rank[i], 0, sizeof *rank[i]);
+    }
+    memset(group_occupied, 0, sizeof group_occupied);
     total_records = dropped_records = failed_slots = loads = clears = stores = discards = 0;
     if (stats_on) LOGV("[gpu-profile scale] pipeline-stat failed slots=%llu; counts are implementation-defined invocations, not covered pixels", (unsigned long long)stats_failures);
     stats_failures = 0;
@@ -637,6 +884,8 @@ static void report(void) {
     window_frames = 0; window_span = window_gap = 0;
     window_unavailable_timestamps = window_invalid_timestamps = window_invalid_spans = window_valid_span_frames = 0;
     window_sample_count = window_observed_passes = window_timestamp_count = 0;
+    worker_report_wall_ms += (monotonic_ns() - report_start) / 1e6;
+    atomic_store_explicit(&background_phase, previous_phase, memory_order_relaxed);
 }
 static void advance(uint64_t target) { while (window < target) { report(); window++; } }
 static vk_gpuprof_time_domain current_time_domain(void) {
@@ -671,6 +920,8 @@ static void check_interval(vk_gpuprof_slot *slot, uint32_t last_query, vk_gpupro
 }
 static void finish_frame(void) {
     if (!completed.frame) return;
+    if (vk_gpuprof_pipeline_on && !pipeline_raw)
+        compact_finish_frame(completed.frame, completed.closure_source != NULL);
     finalize_passes();
     vk_gpuprof_interval interval = {.status = GP_TIME_MISSING};
     if (completed.has_ticks && completed.has_end) interval = vk_gpuprof_interval_check(completed.first, completed.last,
@@ -686,6 +937,17 @@ static void finish_frame(void) {
     if (completed.status == GP_TIME_OK && (completed.failed || completed.dropped)) frame_time_failure(GP_TIME_INCOMPLETE);
     if (!sample_budget && completed.status == GP_TIME_OK && gap < -epsilon) frame_time_failure(GP_TIME_NEGATIVE_GAP);
     int valid = completed.status == GP_TIME_OK;
+    if (vk_gpuprof_pipeline_on && !pipeline_raw) {
+        if (valid) {
+            window_span += interval.ms; window_gap += gap; window_valid_span_frames++;
+            (void)long_finish(completed.frame, interval.ms, completed.measured, gap);
+        } else window_invalid_spans++;
+        if (sample_budget) {
+            window_observed_passes += completed.observed_passes; window_timestamp_count += completed.timestamp_count;
+        }
+        output_last_frame = completed.frame;
+        goto frame_done;
+    }
     char span_text[64] = "null", gap_text[64] = "null", raw_text[64] = "null", first_text[32] = "null", last_text[32] = "null";
     if (interval.has_value) snprintf(raw_text, sizeof raw_text, "%.9f", interval.ms);
     if (valid) {
@@ -702,7 +964,7 @@ static void finish_frame(void) {
     if (completed.has_ticks && completed.first.available) snprintf(first_text, sizeof first_text, "%llu", (unsigned long long)completed.first.ticks);
     if (completed.has_ticks && completed.last.available) snprintf(last_text, sizeof last_text, "%llu", (unsigned long long)completed.last.ticks);
     uint64_t long_dropped = valid ? long_finish(completed.frame, interval.ms, completed.measured, gap) : 0;
-    gp_json row = {0};
+    gp_json row; json_init(&row);
     json_add(&row, "{\"schema\":3,\"type\":\"frame\",\"frame\":%llu,\"span_ms\":%s,"
         "\"measured_ms\":%.9f,\"gap_ms\":%s,\"raw_span_ms\":%s,\"span_valid\":%s,\"span_reason\":\"%s\","
         "\"unavailable_timestamps\":%llu,\"invalid_timestamps\":%llu,\"timestamp_wraps\":%llu,"
@@ -727,6 +989,7 @@ static void finish_frame(void) {
     }
     json_add(&row, "}\n");
     output_frame(row.data, completed.frame);
+frame_done:
     window_frames++; last_completed = completed.frame;
     memset(&completed, 0, sizeof completed);
 }
@@ -762,6 +1025,26 @@ void vk_gpuprof_slot_begin(vk_gpuprof_slot **slot, VkCommandBuffer cb) {
             sample_budget = (uint32_t)env_u64("TOTK_VK_GPU_PROFILE_SAMPLE", 0, 0, 16);
             LOGV("[gpu-profile] sample-budget=%u (TOTK_VK_GPU_PROFILE_SAMPLE; 0=full, 1..16=rotating passes; timestamps/frame <=2k+2)",
                 sample_budget);
+            vk_gpuprof_pipeline_on = (int)env_u64("TOTK_VK_GPU_PROFILE_PIPELINES", 0, 0, VK_GPUPROF_PIPE_BUDGET);
+            if (!vk_gpuprof_on) vk_gpuprof_pipeline_on = 0;
+            const char *raw = getenv("TOTK_VK_GPU_PROFILE_PIPELINES_RAW");
+            pipeline_raw = raw && !strcmp(raw, "1");
+            LOGV("[gpu-profile] pipeline-output=%s (TOTK_VK_GPU_PROFILE_PIPELINES_RAW=%d; default=0)",
+                pipeline_raw ? "raw" : "compact", pipeline_raw);
+            if (vk_gpuprof_pipeline_on) {
+                uint32_t random;
+                ssize_t n;
+                do { n = getrandom(&random, sizeof random, 0); } while (n < 0 && errno == EINTR);
+                pipeline_random = n == sizeof random;
+                if (!pipeline_random) {
+                    /* No deterministic fallback may masquerade as a probability sample. */
+                    LOGV("[gpu-profile] pipeline sampling unavailable: random launch phase failed");
+                    vk_gpuprof_pipeline_on = 0;
+                } else {
+                    pipeline_launch_phase = random;
+                    pipeline_phase = random & (pipeline_population - 1);
+                }
+            }
             if (vk_gpuprof_on) {
                 const char *mode = getenv("TOTK_OPERATION_MODE"), *resolution = getenv("TOTK_RENDER_RES");
                 int handheld = mode && !strcmp(mode, "handheld");
@@ -786,21 +1069,22 @@ void vk_gpuprof_slot_begin(vk_gpuprof_slot **slot, VkCommandBuffer cb) {
             }
             if (vk_gpuprof_on) background_start();
         } else LOGV("[gpu-profile] disabled (TOTK_VK_GPU_PROFILE=%s; default=0)", e ? e : "unset");
+        LOGV("[gpu-profile] pipeline-budget=%d (TOTK_VK_GPU_PROFILE_PIPELINES; default=0; population=%u; phase=%u; extra timestamps/frame<=2k)",
+            vk_gpuprof_pipeline_on, VK_GPUPROF_PIPE_ORDINALS, pipeline_launch_phase);
     }
     current = NULL;
     if (!vk_gpuprof_on || atomic_load_explicit(&background_closing, memory_order_acquire)) { *slot = NULL; return; }
     if (*slot) DIE("GPU profiler lease reused before completion/cancel handoff");
-    pthread_mutex_lock(&background_mu);
-    if (!background_stop && !atomic_load_explicit(&background_closing, memory_order_relaxed) && background_nfree)
-        *slot = background_free[--background_nfree];
-    pthread_mutex_unlock(&background_mu);
-    if (!*slot) { atomic_fetch_add_explicit(&background_dropped_slots, 1, memory_order_relaxed); return; }
+    if (!background_acquire(slot)) return;
     current = *slot; current->n = current->dropped = 0; current->sealed = 0;
     atomic_fetch_add_explicit(&leases_acquired, 1, memory_order_relaxed);
     current->span_writes = 0;
     current->ns = current->nt = 0; current->has_pre = 0; current->pre_cb = VK_NULL_HANDLE;
+    current->npipeline = current->pipeline_timed = current->pipeline_unselected = 0;
     current->discard = 0; current->sequence = 0;
-    current->nsegment = 1; current->segment[0] = (gp_segment){frame, 0, 0};
+    current->lease = ++pipeline_lease;
+    current->nsegment = 1; current->segment[0] = (gp_segment){.frame = frame,
+        .pipeline_population = pipeline_population, .pipeline_phase = pipeline_phase};
     current->domain = current_time_domain();
     if (sample_budget) sampled_frame_begin(cb);
     else {
@@ -829,6 +1113,7 @@ void vk_gpuprof_slot_cancel(vk_gpuprof_slot **slot) {
     if (current == *slot) {
         if (sample_budget && current && current->segment[0].first_valid) sample_frame_started = 0;
         current = NULL; open_record = NULL; scope_n = scope_overflow = 0;
+        pipeline_open = NULL; pipeline_parent = NULL; pipeline_last = VK_NULL_HANDLE;
     }
     background_enqueue(slot, 1);
 }
@@ -843,13 +1128,16 @@ static void frame_marker(VkCommandBuffer cb) {
     current->segment[marker - 1].last = query;
     current->segment[marker - 1].last_valid = 1; current->segment[marker - 1].timestamp_count++;
     current->segment[marker] = (gp_segment){.frame = frame + 1,
-        .first = sample_budget ? marker * 2 : marker, .last = sample_budget ? marker * 2 : marker};
+        .first = sample_budget ? marker * 2 : marker, .last = sample_budget ? marker * 2 : marker,
+        .pipeline_population = pipeline_population, .pipeline_phase = pipeline_phase};
     if (sample_budget) sample_frame_started = 0;
     current->nsegment++;
 }
 /* Activated query instances, not unused pool capacity or individual counters. */
 static uint64_t slot_queries(const vk_gpuprof_slot *slot) {
-    return (uint64_t)(sample_budget ? slot->nt : slot->n) * 2 + slot->span_writes + slot->ns;
+    uint64_t queries = (uint64_t)(sample_budget ? slot->nt : slot->n) * 2 + slot->span_writes + slot->ns;
+    for (uint32_t i = 0; i < slot->nsegment; i++) queries += slot->segment[i].pipeline_timestamps;
+    return queries;
 }
 void vk_gpuprof_slot_seal(vk_gpuprof_slot *slot) {
     uint64_t sequence = ++recording_sequence;
@@ -859,6 +1147,273 @@ void vk_gpuprof_slot_seal(vk_gpuprof_slot *slot) {
         atomic_fetch_add_explicit(&queries_submitted, slot_queries(slot), memory_order_relaxed);
     }
     current = NULL;
+}
+static double thread_cpu_ms(void) {
+    struct timespec ts;
+    return clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) ? 0 : ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+static void compact_finish_frame(uint64_t number, int complete) {
+    double start = thread_cpu_ms();
+    if (!compact.frame) gp_compact_begin(&compact, number, completed.pipeline_population,
+        (uint32_t)vk_gpuprof_pipeline_on);
+    if (!complete || !compact.frame_population) { compact.frame_overflow++; complete = 0; }
+    if (compact.frame != number) { compact.frame_overflow++; compact.frame_bad = 1; }
+    gp_compact_finish(&compact, complete);
+    compact.cpu_ms += thread_cpu_ms() - start;
+    compact_report_pump(64);
+}
+static void compact_segment(vk_gpuprof_slot *slot, const gp_segment *s, VkResult result, uint32_t *cursor) {
+    if (!s->pipeline_observed) return; /* an empty trailing marker is not a population observation */
+    double start = thread_cpu_ms();
+    gp_compact_begin(&compact, s->frame, s->pipeline_population, (uint32_t)vk_gpuprof_pipeline_on);
+    if (slot->discard) {
+        compact.discarded += s->pipeline_observed; compact.frame_bad = 1; compact.counts_complete = 0;
+    }
+    else {
+        compact.observed += s->pipeline_observed; compact.selected += s->pipeline_selected;
+        compact.timestamps += s->pipeline_timestamps; compact.dropped += s->pipeline_dropped;
+        compact.unretained += s->pipeline_unretained; compact.out_of_range += s->pipeline_out_of_range;
+        compact.frame_observed += s->pipeline_observed; compact.frame_selected += s->pipeline_selected;
+        compact.frame_out_of_range += s->pipeline_out_of_range; compact.frame_dropped += s->pipeline_dropped;
+        if (s->pipeline_unretained || s->pipeline_dropped) compact.counts_complete = 0;
+    }
+    /* Recording appends groups in frame order. Carry the cursor across frame
+       segments instead of scanning the entire lease up to 64 times. */
+    while (*cursor < slot->npipeline) {
+        const gp_pipeline *p = &slot->pipeline[*cursor];
+        if (p->frame > s->frame) break;
+        (*cursor)++;
+        if (p->frame != s->frame) continue;
+        vk_gpuprof_interval timing = {.status = GP_TIME_MISSING};
+        if (!slot->discard && p->selected && p->query1 && p->timestamps == 2) {
+            if (!query_readable(result)) timing.status = GP_TIME_QUERY_FAILED;
+            else timing = vk_gpuprof_interval_check(slot->pipeline_ticks[p->query1 - 1],
+                slot->pipeline_ticks[p->query1], slot->domain, slot->domain);
+        }
+        int valid = !slot->discard && timing.status == GP_TIME_OK && (p->draws || p->dispatches);
+        if (p->selected && !slot->discard) {
+            compact.valid += valid; compact.missing += !valid;
+            if (!valid) {
+                compact.unavailable += timing.status == GP_TIME_UNAVAILABLE;
+                compact.query_failures += timing.status == GP_TIME_QUERY_FAILED;
+                compact.invalid += timing.status != GP_TIME_UNAVAILABLE && timing.status != GP_TIME_QUERY_FAILED;
+            }
+        }
+        gp_compact_observe(&compact, &p->key, p->selected, valid, slot->discard,
+            p->ordinal >= p->population, timing.ms, p->population, (uint32_t)vk_gpuprof_pipeline_on,
+            p->draws, p->dispatches, p->primitives, p->unknown_draws);
+    }
+    compact.cpu_ms += thread_cpu_ms() - start;
+}
+static void compact_report_pump(unsigned budget) {
+    gp_compact *c = compact_pending;
+    if (!c || !c->frames) return;
+    uint64_t wall_start = monotonic_ns();
+    unsigned previous_phase = atomic_exchange_explicit(&background_phase, GP_REPORT, memory_order_relaxed);
+    double start = thread_cpu_ms();
+    unsigned end_index = compact_report_cursor + budget;
+    if (end_index > GP_COMPACT_KEYS) end_index = GP_COMPACT_KEYS;
+    for (unsigned i = compact_report_cursor; i < end_index; i++) {
+        gp_compact_entry *e = &c->key[i];
+        if (!e->id) continue;
+        if (!e->v[GC_SELECTED].integer && !e->selected_discarded) {
+            c->unretained += e->v[GC_OBSERVED].integer;
+            if (e->v[GC_OBSERVED].integer) c->counts_complete = 0;
+            continue;
+        }
+        gp_json row; json_init(&row);
+        _Static_assert(GP_COMPACT_COLUMNS == 20, "update the compact numeric encoder with its schema");
+        json_add(&row, "{\"schema\":3,\"type\":\"pipeline_window\",\"window_start\":%llu,\"window_end\":%llu,"
+            "\"key_id\":%llu,\"v\":[%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,"
+            "%.12g,%.12g,%.0f,%.12g,%.12g,%.12g,%.0f,%llu,%llu,%llu,%.12g]}\n",
+            (unsigned long long)c->start, (unsigned long long)c->end, (unsigned long long)e->id,
+            (unsigned long long)e->v[GC_OBSERVED].integer, (unsigned long long)e->v[GC_SELECTED].integer,
+            (unsigned long long)e->v[GC_VALID].integer, (unsigned long long)e->v[GC_MISSING].integer,
+            (unsigned long long)e->v[GC_DISCARDED].integer, (unsigned long long)e->v[GC_DRAWS].integer,
+            (unsigned long long)e->v[GC_DISPATCHES].integer, (unsigned long long)e->v[GC_PRIMITIVES].integer,
+            (unsigned long long)e->v[GC_UNKNOWN_DRAWS].integer, e->v[GC_MS].real, e->v[GC_SQUARE].real, e->v[GC_ELIGIBLE].real,
+            e->v[GC_ELIGIBLE_MS].real, e->v[GC_ELIGIBLE_WEIGHTED].real, e->v[GC_ELIGIBLE_SQUARE].real, e->v[GC_ELIGIBLE_MISSING].real,
+            (unsigned long long)e->v[GC_OUT_OF_RANGE].integer, (unsigned long long)e->v[GC_SAMPLED_DRAWS].integer,
+            (unsigned long long)e->v[GC_SAMPLED_DISPATCHES].integer, e->v[GC_WEIGHTED].real);
+        pthread_mutex_lock(&output_mu);
+        /* Reserve only this key/row pair. A tiny rotation cannot evict its
+           authority before its reference, or recursively repeat a dictionary. */
+        if (row.failed) output_failures++;
+        else {
+            int dictionary = e->announced_rotation != output_rotation + 1 || output_bytes + row.used > output_limit;
+            gp_json key; json_init(&key);
+            if (dictionary) {
+                json_add(&key, "{\"schema\":3,\"type\":\"pipeline_key\",\"id\":%llu,\"kind\":\"%s\","
+                    "\"pipeline\":\"%016llx\",\"vs\":", (unsigned long long)e->id,
+                    e->key.compute ? "compute" : "render", (unsigned long long)e->key.pipeline);
+                json_string(&key, e->shader[0][0] ? e->shader[0] : NULL);
+                json_add(&key, ",\"fs\":"); json_string(&key, e->shader[1][0] ? e->shader[1] : NULL);
+                json_add(&key, ",\"cs\":"); json_string(&key, e->shader[2][0] ? e->shader[2] : NULL);
+                json_add(&key, "}\n");
+            }
+            if (key.failed) output_failures++;
+            else if (output_reserve_locked(row.used + key.used)) {
+                if (!dictionary || output_write_locked(key.data, key.used)) {
+                    e->announced_rotation = output_rotation + 1;
+                    if (compact.key[i].id == e->id) compact.key[i].announced_rotation = e->announced_rotation;
+                    output_write_locked(row.data, row.used);
+                }
+            }
+        }
+        pthread_mutex_unlock(&output_mu);
+    }
+    double elapsed = thread_cpu_ms() - start;
+    compact_report_cpu_ms += elapsed; compact_flush_cpu_ms += elapsed;
+    compact_report_cursor = end_index;
+    if (end_index != GP_COMPACT_KEYS) {
+        if (previous_phase != GP_REPORT) worker_report_wall_ms += (monotonic_ns() - wall_start) / 1e6;
+        atomic_store_explicit(&background_phase, previous_phase, memory_order_relaxed);
+        return;
+    }
+    double flush = compact_report_cpu_ms;
+    uint64_t pending_closures = 0;
+    if (compact_closing) {
+        pthread_mutex_lock(&background_mu);
+        pending_closures = background_close_tail - background_close_head;
+        pthread_mutex_unlock(&background_mu);
+    }
+    gp_json row; json_init(&row);
+    json_add(&row, "{\"schema\":3,\"type\":\"pipeline_window_coverage\",\"window_start\":%llu,"
+        "\"window_end\":%llu,\"frames\":%llu,\"eligible_frames\":%llu,\"domain_excluded_frames\":%llu,"
+        "\"observed_groups\":%llu,\"selected_groups\":%llu,\"valid_samples\":%llu,\"missing_selected\":%llu,"
+        "\"timestamp_count\":%llu,\"dropped_groups\":%llu,\"unretained_groups\":%llu,"
+        "\"out_of_range_groups\":%llu,\"discarded_groups\":%llu,\"counts_complete\":%s,\"population_exposure\":[",
+        (unsigned long long)c->start, (unsigned long long)c->end, (unsigned long long)c->frames,
+        (unsigned long long)c->eligible_frames, (unsigned long long)c->domain_excluded_frames,
+        (unsigned long long)c->observed, (unsigned long long)c->selected, (unsigned long long)c->valid,
+        (unsigned long long)c->missing, (unsigned long long)c->timestamps, (unsigned long long)c->dropped,
+        (unsigned long long)c->unretained, (unsigned long long)c->out_of_range,
+        (unsigned long long)c->discarded, c->counts_complete ? "true" : "false");
+    for (unsigned i = 0; i < c->nexposure; i++) {
+        const gp_compact_exposure *e = &c->exposure[i];
+        json_add(&row, "%s[%u,%u,%u,%llu,%llu,%llu,%llu]", i ? "," : "", e->population, e->numerator, e->denominator,
+            (unsigned long long)e->frames, (unsigned long long)e->eligible_frames,
+            (unsigned long long)e->observed, (unsigned long long)e->selected);
+    }
+    json_add(&row, "],\"background_dropped_slots\":%llu,\"background_dropped_closures\":%llu,"
+        "\"unavailable_timestamps\":%llu,\"invalid_timestamps\":%llu,\"query_failures\":%llu,"
+        "\"aggregate_overflow\":%llu,\"key_overflow\":%llu,\"frame_overflow\":%llu,"
+        "\"pending_frame_closures\":%llu,\"aggregation_cpu_ms\":%.6f,\"aggregation_flush_cpu_ms\":%.6f,"
+        "\"serialized_bytes\":%llu,\"worker_peak_backlog\":%llu,\"aggregation_memory_bytes\":%zu",
+        (unsigned long long)compact_report_dropped_slots, (unsigned long long)compact_report_dropped_closures,
+        (unsigned long long)c->unavailable, (unsigned long long)c->invalid, (unsigned long long)c->query_failures,
+        (unsigned long long)c->aggregate_overflow, (unsigned long long)c->key_overflow,
+        (unsigned long long)c->frame_overflow, (unsigned long long)pending_closures, c->cpu_ms, flush,
+        (unsigned long long)(output_serialized_bytes - compact_bytes_start),
+        (unsigned long long)background_backlog_peak, 2 * sizeof compact + sizeof compact_report_diagnostics);
+    json_add(&row, "%s}\n", compact_report_diagnostics.data);
+    row.failed |= compact_report_diagnostics.failed;
+    if (row.failed) output_failures++; else output_row(row.data);
+    pthread_mutex_lock(&output_mu);
+    output_flush_locked(0);
+    pthread_mutex_unlock(&output_mu);
+    compact_bytes_start = output_serialized_bytes;
+    c->frames = 0;
+    if (previous_phase != GP_REPORT) worker_report_wall_ms += (monotonic_ns() - wall_start) / 1e6;
+    atomic_store_explicit(&background_phase, previous_phase, memory_order_relaxed);
+}
+/* Freeze one bounded window, then amortize its numeric/text encoding across
+   completed frames. Even a full dictionary drains in 128 of the 300 frames;
+   no extra thread, unbounded queue, or storage wait owns a query lease. */
+static void compact_report(void) {
+    if (!compact.frames) return;
+    compact_report_pump(GP_COMPACT_KEYS); /* sparse/jumped windows and terminal flush */
+    double start = thread_cpu_ms();
+    *compact_pending = compact;
+    compact_report_cursor = 0;
+    compact_report_dropped_slots = atomic_load(&background_dropped_slots);
+    compact_report_dropped_closures = atomic_load(&background_dropped_closures);
+    json_init(&compact_report_diagnostics);
+    output_worker_diagnostics(&compact_report_diagnostics, 0);
+    gp_compact_reset(&compact);
+    compact_report_cpu_ms = thread_cpu_ms() - start;
+    compact_flush_cpu_ms += compact_report_cpu_ms;
+    double end = thread_cpu_ms(), worker_window_cpu = end - worker_window_cpu_start;
+    if (worker_window_cpu_peak_ms < worker_window_cpu) worker_window_cpu_peak_ms = worker_window_cpu;
+    worker_window_cpu_start = end;
+}
+static uint64_t pipeline_retired_queries(const vk_gpuprof_slot *slot, VkResult result) {
+    if (slot->discard || !query_readable(result)) return 0;
+    uint64_t retired = 0;
+    for (uint32_t i = 0; i < slot->npipeline; i++) {
+        const gp_pipeline *p = &slot->pipeline[i];
+        if (!p->query1) continue;
+        for (uint32_t q = 0; q < p->timestamps; q++)
+            retired += !!slot->pipeline_ticks[p->query1 - 1 + q].available;
+    }
+    return retired;
+}
+static void output_pipelines(vk_gpuprof_slot *slot) {
+    if (!slot->pipeline_pool) return;
+    VkResult result = !slot->discard && slot->pipeline_timed ? vkGetQueryPoolResults(V.dev,
+        slot->pipeline_pool, 0, slot->pipeline_timed * 2,
+        slot->pipeline_timed * 2 * sizeof *slot->pipeline_ticks, slot->pipeline_ticks,
+        sizeof *slot->pipeline_ticks, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) : VK_SUCCESS;
+    atomic_fetch_add_explicit(&queries_retired, pipeline_retired_queries(slot, result), memory_order_relaxed);
+    for (uint32_t i = 0; i < slot->npipeline; i++) {
+        const gp_pipeline *p = &slot->pipeline[i];
+        const gp_record *parent = &slot->rec[p->parent];
+        const char *status = p->ordinal >= p->population ? "out-of-range" : "not-selected";
+        vk_gpuprof_interval timing = {.status = GP_TIME_MISSING};
+        if (p->selected && !slot->discard) {
+            status = "query-overflow";
+            if (p->query1) {
+                uint32_t q = p->query1 - 1;
+                if (p->timestamps != 2) status = "incomplete";
+                else if (!query_readable(result)) status = "query-failed";
+                else {
+                    timing = vk_gpuprof_interval_check(slot->pipeline_ticks[q], slot->pipeline_ticks[q + 1],
+                        slot->domain, slot->domain);
+                    status = vk_gpuprof_time_reason(timing.status);
+                }
+            }
+        }
+        if (slot->discard) status = "discarded";
+        if (!p->draws && !p->dispatches && !slot->discard) status = "no-work";
+        int valid = !slot->discard && timing.status == GP_TIME_OK && p->timestamps == 2 && (p->draws || p->dispatches);
+        gp_json row; json_init(&row);
+        json_add(&row, "{\"schema\":3,\"type\":\"pipeline\",\"frame\":%llu,\"group\":%u,"
+            "\"pass_ordinal\":%u,\"pass_key\":\"%016llx\",\"kind\":\"%s\","
+            "\"pipeline\":\"%016llx\",\"pipeline_identity\":\"launch-local-vulkan-handle\",\"vs\":",
+            (unsigned long long)p->frame, p->ordinal, parent->instance, (unsigned long long)key_hash(&parent->key),
+            parent->key.compute == 1 ? "compute" : "render", (unsigned long long)p->key.pipeline);
+        json_string(&row, p->key.shader[0] && p->key.shader[0][0] ? p->key.shader[0] : NULL);
+        json_add(&row, ",\"fs\":"); json_string(&row, p->key.shader[1] && p->key.shader[1][0] ? p->key.shader[1] : NULL);
+        json_add(&row, ",\"cs\":"); json_string(&row, p->key.shader[2] && p->key.shader[2][0] ? p->key.shader[2] : NULL);
+        json_add(&row, ",\"draws\":%llu,\"dispatches\":%llu,\"known_primitives\":%llu,"
+            "\"unknown_primitive_draws\":%llu,\"primitives\":",
+            (unsigned long long)p->draws, (unsigned long long)p->dispatches,
+            (unsigned long long)p->primitives, (unsigned long long)p->unknown_draws);
+        if (p->unknown_draws || parent->key.compute) json_add(&row, "null");
+        else json_add(&row, "%llu", (unsigned long long)p->primitives);
+        json_add(&row, ",\"primitive_reason\":");
+        json_string(&row, parent->key.compute ? "not-graphics" : p->unknown_draws ? "indexed-restart-or-unknown-count" : NULL);
+        json_add(&row, ",\"selected\":%s,\"status\":\"%s\",\"gpu_ms\":",
+            p->selected ? "true" : "false", status);
+        if (valid) json_add(&row, "%.9f", timing.ms); else json_add(&row, "null");
+        json_add(&row, ",\"timestamp_count\":%u,\"selection_numerator\":%u,\"selection_denominator\":%u}\n",
+            p->timestamps, p->ordinal < p->population ? (unsigned)vk_gpuprof_pipeline_on : 0, p->population);
+        if (row.failed) output_failures++; else output_row(row.data);
+    }
+    for (uint32_t i = 0; i < slot->nsegment; i++) {
+        const gp_segment *s = &slot->segment[i];
+        if (!s->pipeline_observed) continue;
+        gp_json row; json_init(&row);
+        json_add(&row, "{\"schema\":3,\"type\":\"pipeline_coverage\",\"frame\":%llu,\"slot_sequence\":%llu,"
+            "\"lease\":%llu,\"observed_groups\":%u,\"dropped_groups\":%u,\"selected_groups\":%u,"
+            "\"timestamp_count\":%u,\"unretained_groups\":%u,\"out_of_range_groups\":%u,"
+            "\"population\":%u,\"phase\":%u,\"discarded\":%s}\n",
+            (unsigned long long)s->frame, (unsigned long long)slot->sequence, (unsigned long long)slot->lease,
+            s->pipeline_observed, s->pipeline_dropped, s->pipeline_selected, s->pipeline_timestamps,
+            s->pipeline_unretained, s->pipeline_out_of_range, s->pipeline_population, s->pipeline_phase,
+            slot->discard ? "true" : "false");
+        output_row(row.data);
+    }
 }
 static void ingest_record(gp_record *r, double ms, int stats_valid, int sampled) {
     completed.measured += ms;
@@ -877,6 +1432,8 @@ static void ingest_record(gp_record *r, double ms, int stats_valid, int sampled)
     }
 }
 static void process_slot(vk_gpuprof_slot *slot) {
+    uint64_t read_start = monotonic_ns();
+    atomic_store_explicit(&background_phase, GP_READBACK, memory_order_relaxed);
     const VkQueryResultFlags flags = VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT;
     uint32_t timed = sample_budget ? slot->nt : slot->n;
     VkResult result = timed ? vkGetQueryPoolResults(V.dev, slot->pool, 0, timed * 2,
@@ -888,6 +1445,13 @@ static void process_slot(vk_gpuprof_slot *slot) {
         sizeof slot->pre_tick, &slot->pre_tick, sizeof slot->pre_tick, flags) : VK_SUCCESS;
     VkResult sr = stats_on && slot->ns ? vkGetQueryPoolResults(V.dev, slot->stats, 0, slot->ns,
         slot->ns * sizeof slot->counters[0], slot->counters, sizeof slot->counters[0], VK_QUERY_RESULT_64_BIT) : VK_SUCCESS;
+    VkResult pipeline_result = VK_SUCCESS;
+    if (vk_gpuprof_pipeline_on && !pipeline_raw && slot->pipeline_timed)
+        pipeline_result = vkGetQueryPoolResults(V.dev, slot->pipeline_pool, 0, slot->pipeline_timed * 2,
+            slot->pipeline_timed * 2 * sizeof *slot->pipeline_ticks, slot->pipeline_ticks,
+            sizeof *slot->pipeline_ticks, flags);
+    worker_query_wall_ms += (monotonic_ns() - read_start) / 1e6;
+    atomic_store_explicit(&background_phase, GP_AGGREGATE, memory_order_relaxed);
     for (uint32_t q = 0; sr == VK_SUCCESS && q < slot->ns; q++)
         for (unsigned st = 0; st < GP_STATS; st++)
             slot->rec[slot->stats_owner[q]].counters[st] += slot->counters[q][st];
@@ -897,11 +1461,14 @@ static void process_slot(vk_gpuprof_slot *slot) {
     if (query_readable(span_result)) for (uint32_t q = 0; q < spans; q++)
         read_queries += !!slot->span_ticks[q].available;
     if (slot->has_pre && query_readable(pre_result)) read_queries += !!slot->pre_tick.available;
+    if (vk_gpuprof_pipeline_on && !pipeline_raw)
+        read_queries += pipeline_retired_queries(slot, pipeline_result);
     atomic_fetch_add_explicit(&queries_retired, read_queries, memory_order_relaxed);
     atomic_fetch_add_explicit(&leases_retired, 1, memory_order_relaxed);
     int slot_failed = sample_budget ? !query_readable(result) || !query_readable(span_result) :
         result != VK_SUCCESS || span_result != VK_SUCCESS || pre_result != VK_SUCCESS;
     int slot_reported = 0;
+    uint32_t pipeline_cursor = 0;
     for (uint32_t s = 0; s < slot->nsegment; s++) {
         const gp_segment *segment = &slot->segment[s];
         if (completed.frame && completed.frame != segment->frame) {
@@ -912,11 +1479,17 @@ static void process_slot(vk_gpuprof_slot *slot) {
         }
         advance((segment->frame - 1) / GP_WINDOW);
         completed.frame = segment->frame;
+        if (!completed.pipeline_population || segment->pipeline_observed)
+            completed.pipeline_population = segment->pipeline_population;
         if (!s) {
             completed.dropped += slot->dropped; dropped_records += slot->dropped;
             stats_failures += sr != VK_SUCCESS;
-            if (slot->sequence > background_processed_sequence + 1) frame_time_failure(GP_TIME_INCOMPLETE);
+            if (slot->sequence > background_processed_sequence + 1) {
+                frame_time_failure(GP_TIME_INCOMPLETE);
+                if (vk_gpuprof_pipeline_on && !pipeline_raw) { compact.frame_bad = 1; compact.frame_overflow++; }
+            }
         }
+        if (vk_gpuprof_pipeline_on && !pipeline_raw) compact_segment(slot, segment, pipeline_result, &pipeline_cursor);
         uint32_t first_query = !s && slot->has_pre ? GP_PRE_QUERY : GP_SPAN_BASE + segment->first;
         VkResult first_result = !s && slot->has_pre ? pre_result : span_result;
         vk_gpuprof_timestamp first = query_readable(first_result) ?
@@ -991,47 +1564,87 @@ static void complete_closure(gp_closure close) {
     advance(close.frame / GP_WINDOW);
 }
 static void background_prepare(vk_gpuprof_slot *slot) {
+#ifdef TOTK_VK_TESTS
+    if (fixture_mode) { memset(slot->timestamp_marks, 0, GP_TIMESTAMPS); return; }
+#endif
+    if (slot->pipeline_pool) vkResetQueryPool(V.dev, slot->pipeline_pool, 0, 2 * GP_PIPELINE_QUERIES);
     vkResetQueryPool(V.dev, slot->pool, 0, GP_TIMESTAMPS);
     if (stats_on) vkResetQueryPool(V.dev, slot->stats, 0, GP_RECORDS);
-    memset(slot->timestamp_marks, 0, sizeof slot->timestamp_marks);
+    memset(slot->timestamp_marks, 0, GP_TIMESTAMPS);
 }
 static void background_flush(void) {
-    if (!window_frames) return;
-    partial_report = 1; report_end = last_completed; report(); partial_report = 0;
+    if (vk_gpuprof_pipeline_on && !pipeline_raw && compact.frame) {
+        if (compact.frame_observed || compact.frame_selected || compact.ntouched) {
+            /* Retain incomplete observations and loss, never manufacture a
+               completed frame for a trailing marker or an unclosed lease. */
+            uint64_t end = compact.end;
+            uint32_t population = compact.frame_population, numerator = compact.frame_numerator;
+            compact_unclosed_groups += compact.frame_observed; compact_unclosed_frames++;
+            compact.frame_overflow++;
+            gp_compact_finish(&compact, 0);
+            compact.frames--; compact.domain_excluded_frames--; compact.end = end;
+            for (unsigned i = 0; i < compact.nexposure; i++) if (compact.exposure[i].population == population &&
+                compact.exposure[i].numerator == numerator) { compact.exposure[i].frames--; break; }
+        } else {
+            compact.frame = 0; compact.frame_population = compact.frame_numerator = 0; compact.frame_bad = 0;
+        }
+        memset(&completed, 0, sizeof completed);
+    }
+    if (window_frames) {
+        partial_report = 1; report_end = last_completed; report(); partial_report = 0;
+    }
+    compact_report_pump(GP_COMPACT_KEYS);
 }
 static void *background_main(void *unused) {
     (void)unused;
     totk_thread_start("totk-gpuprof", NULL);
 #if defined(__linux__)
-    /* Same conservative background policy as pipeline-cache/seed IO: never
-       widen the inherited CPU mask and never contend at render priority. */
-    int nice_error = setpriority(PRIO_PROCESS, 0, 10) ? errno : 0, affinity_error = 0;
-    cpu_set_t allowed, preferred, actual; const char *source = "unavailable", *decision = "unchanged";
-    if (sched_getaffinity(0, sizeof allowed, &allowed)) affinity_error = errno;
-    else {
-        unsigned capacity[CPU_SETSIZE];
-        totk_thread_background_select("/sys/devices/system/cpu", &allowed, &preferred, capacity, &source, &decision);
-        if (!CPU_EQUAL(&preferred, &allowed) && sched_setaffinity(0, sizeof preferred, &preferred)) affinity_error = errno;
-    }
-    char mask[CPU_SETSIZE * 6];
-    if (sched_getaffinity(0, sizeof actual, &actual)) strcpy(mask, "?");
-    else totk_thread_mask_text(&actual, mask, sizeof mask);
+    /* The bounded lease consumer is latency-sensitive, unlike the IO sink.
+       Keep the inherited CPU mask and lower priority only mildly. */
+    int nice_error = setpriority(PRIO_PROCESS, 0, 5) ? errno : 0;
     errno = 0; int nice_value = getpriority(PRIO_PROCESS, 0), nice_get_error = errno;
-    LOGV("[gpu-profile] background placement nice=%d nice_set_errno=%d nice_get_errno=%d affinity=%s source=%s decision=%s affinity_errno=%d",
-        nice_value, nice_error, nice_get_error, mask, source, decision, affinity_error);
+    background_effective_nice = nice_value; background_nice_error = nice_error;
+    cpu_set_t mask;
+    if (sched_getaffinity(0, sizeof mask, &mask)) strcpy(background_effective_affinity, "unavailable");
+    else totk_thread_mask_text(&mask, background_effective_affinity, sizeof background_effective_affinity);
+    LOGV("[gpu-profile] background placement nice=%d nice_set_errno=%d nice_get_errno=%d affinity=%s",
+        nice_value, nice_error, nice_get_error, background_effective_affinity);
 #endif
     if (long_frames) {
         long_ring = calloc(long_frames, sizeof *long_ring);
         if (!long_ring) DIE("GPU profiler long-frame ring allocation");
     }
+    if (vk_gpuprof_pipeline_on && !pipeline_raw) {
+        compact_pending = calloc(1, sizeof *compact_pending);
+        if (!compact_pending) DIE("GPU profiler report snapshot allocation");
+    }
     output_init();
+    worker_cpu_start = worker_window_cpu_start = thread_cpu_ms();
     for (unsigned i = 0; i < GP_BACKLOG; i++) {
         vk_gpuprof_slot *slot = calloc(1, sizeof *slot);
         if (!slot) DIE("GPU profiler lease allocation");
         VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
             .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = GP_TIMESTAMPS};
+#ifdef TOTK_VK_TESTS
+        if (fixture_mode) slot->pool = (VkQueryPool)(uintptr_t)1;
+        else
+#endif
         VKCHECK(vkCreateQueryPool(V.dev, &qi, NULL, &slot->pool));
+        if (vk_gpuprof_pipeline_on) {
+            slot->pipeline = calloc(GP_PIPELINE_RECORDS, sizeof *slot->pipeline);
+            slot->pipeline_ticks = calloc(2 * GP_PIPELINE_QUERIES, sizeof *slot->pipeline_ticks);
+            if (!slot->pipeline || !slot->pipeline_ticks) DIE("GPU pipeline profiler allocation");
+            qi.queryCount = 2 * GP_PIPELINE_QUERIES;
+#ifdef TOTK_VK_TESTS
+            if (fixture_mode) slot->pipeline_pool = (VkQueryPool)(uintptr_t)2;
+            else
+#endif
+            VKCHECK(vkCreateQueryPool(V.dev, &qi, NULL, &slot->pipeline_pool));
+        }
         if (stats_on) {
+            slot->counters = calloc(GP_RECORDS, sizeof *slot->counters);
+            slot->stats_owner = calloc(GP_RECORDS, sizeof *slot->stats_owner);
+            if (!slot->counters || !slot->stats_owner) DIE("GPU profiler statistics allocation");
             qi.queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS; qi.queryCount = GP_RECORDS; qi.pipelineStatistics = GP_STATS_MASK;
             VKCHECK(vkCreateQueryPool(V.dev, &qi, NULL, &slot->stats));
         }
@@ -1061,14 +1674,46 @@ static void *background_main(void *unused) {
         }
         if (background_head != background_tail) {
             vk_gpuprof_slot *slot = background_queue[background_head++ % GP_BACKLOG];
-            background_active = 1;
+            background_active = background_consuming = 1;
             pthread_mutex_unlock(&background_mu);
+            uint64_t service_wall_start = monotonic_ns();
+            double service_cpu_start = thread_cpu_ms();
+            double queue_wait = slot->ready_ns ? (service_wall_start - slot->ready_ns) / 1e6 : 0;
+            if (queue_wait > worker_queue_wait_max_ms) worker_queue_wait_max_ms = queue_wait;
+#ifdef TOTK_VK_TESTS
+            double service_start = fixture_mode && fixture_worker_scale > 1000 ? thread_cpu_ms() : 0;
+#endif
+            if (pipeline_raw) output_pipelines(slot);
             if (!slot->discard) process_slot(slot);
+            else if (vk_gpuprof_pipeline_on && !pipeline_raw) {
+                uint32_t cursor = 0;
+                for (unsigned i = 0; i < slot->nsegment; i++)
+                    compact_segment(slot, &slot->segment[i], VK_SUCCESS, &cursor);
+            }
+            atomic_store_explicit(&background_phase, GP_RESET, memory_order_relaxed);
+            uint64_t reset_start = monotonic_ns();
             background_prepare(slot);
+            worker_reset_wall_ms += (monotonic_ns() - reset_start) / 1e6;
+#ifdef TOTK_VK_TESTS
+            if (service_start) {
+                /* Charge the configured multiplier to measured thread CPU,
+                   never scheduler wall time. Tiny per-lease nanosleeps turn
+                   the fixture into a timer/wakeup stress rather than slower
+                   aggregation; explicit coupled/sink stalls model IO instead. */
+                double cpu = thread_cpu_ms() - service_start;
+                while (fixture_service_delay_ns(cpu,
+                    (uint64_t)((thread_cpu_ms() - service_start) * 1e6), fixture_worker_scale) > 0) {}
+            }
+#endif
+            double service_wall = (monotonic_ns() - service_wall_start) / 1e6;
+            worker_service_count++; worker_service_wall_ms += service_wall;
+            worker_service_cpu_ms += thread_cpu_ms() - service_cpu_start;
+            if (service_wall > worker_service_wall_max_ms) worker_service_wall_max_ms = service_wall;
+            atomic_store_explicit(&background_phase, GP_IDLE, memory_order_relaxed);
             atomic_fetch_add_explicit(&background_processed_slots, 1, memory_order_relaxed);
             pthread_mutex_lock(&background_mu);
             if (!slot->discard) background_processed_sequence = slot->sequence;
-            background_free[background_nfree++] = slot; background_active = 0;
+            background_free[background_nfree++] = slot; background_active = background_consuming = 0;
             pthread_cond_broadcast(&background_cv);
             continue;
         }
@@ -1084,17 +1729,31 @@ static void *background_main(void *unused) {
 #endif
     }
     pthread_mutex_unlock(&background_mu);
+    compact_closing = 1;
+    double close_cpu_start = thread_cpu_ms();
     background_flush();
+    compact_close_cpu_ms = thread_cpu_ms() - close_cpu_start;
     /* Only idle leases are owned here. GPU work not yet handed off remains
        deliberately outside shutdown authority and must not be destroyed. */
     while (background_nfree) {
         vk_gpuprof_slot *slot = background_free[--background_nfree];
-        if (slot->stats) vkDestroyQueryPool(V.dev, slot->stats, NULL);
-        vkDestroyQueryPool(V.dev, slot->pool, NULL); free(slot);
+#ifdef TOTK_VK_TESTS
+        if (!fixture_mode) {
+#endif
+            if (slot->stats) vkDestroyQueryPool(V.dev, slot->stats, NULL);
+            if (slot->pipeline_pool) vkDestroyQueryPool(V.dev, slot->pipeline_pool, NULL);
+            vkDestroyQueryPool(V.dev, slot->pool, NULL);
+#ifdef TOTK_VK_TESTS
+        }
+#endif
+        free(slot->pipeline); free(slot->pipeline_ticks);
+        free(slot->counters); free(slot->stats_owner); free(slot);
     }
     for (uint32_t i = 0; i < long_frames; i++) free(long_ring[i].pass);
     free(long_ring); long_ring = NULL;
     free(frame_pending.pass); frame_pending.pass = NULL;
+    free(compact_pending); compact_pending = NULL;
+    worker_cpu_total_ms = thread_cpu_ms() - worker_cpu_start;
     return NULL;
 }
 static void background_start(void) {
@@ -1129,10 +1788,13 @@ static void background_enqueue(vk_gpuprof_slot **owner, int discard) {
         atomic_fetch_add_explicit(&queries_cancelled, slot_queries(slot), memory_order_relaxed);
     }
     slot->discard = discard;
+    slot->ready_ns = monotonic_ns();
     pthread_mutex_lock(&background_mu);
     if (!background_stop) {
         if (background_tail - background_head == GP_BACKLOG) DIE("GPU profiler lease queue overflow");
         background_queue[background_tail++ % GP_BACKLOG] = slot;
+        uint64_t backlog = background_tail - background_head + !!background_active;
+        if (background_backlog_peak < backlog) background_backlog_peak = backlog;
         atomic_fetch_add_explicit(&background_queued_slots, 1, memory_order_relaxed);
         pthread_cond_signal(&background_cv);
     }
@@ -1188,6 +1850,71 @@ void vk_gpuprof_begin(VkCommandBuffer cb, const VkRenderingInfo *ri, const VkFor
         k->a[j] = (gp_attachment){formats[j], widths[j], heights[j], a->loadOp, a->storeOp, bytes};
     }
 }
+/* Walker only. Query events copy pool/index/stage into the recorder's immutable
+   job stream. A boundary can land in a later chunk; GPU execute order, not CPU
+   worker completion order, joins the two endpoints. No worker reads these globals. */
+static void pipeline_timestamp(VkCommandBuffer cb, uint32_t query) {
+    if (pipeline_secondary) vk_record_timestamp(current->pipeline_pool, query, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+    else vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, current->pipeline_pool, query);
+    current->segment[current->nsegment - 1].pipeline_timestamps++;
+}
+void vk_gpuprof_pipeline_break(VkCommandBuffer cb) {
+    if (pipeline_open && pipeline_open->query1) {
+        pipeline_timestamp(cb, pipeline_open->query1);
+        pipeline_open->timestamps++;
+    }
+    pipeline_open = NULL; pipeline_parent = NULL; pipeline_last = VK_NULL_HANDLE;
+}
+void vk_gpuprof_pipeline_begin(VkCommandBuffer cb, VkPipeline pipeline, vk_shader *const shaders[6]) {
+    if (!vk_gpuprof_pipeline_on || !current) return;
+    int compute = open_record && open_record->key.compute == 1;
+    vk_shader *selected[3] = {compute ? NULL : shaders[0], compute ? NULL : shaders[1], compute ? shaders[5] : NULL};
+    if (pipeline_last && pipeline == pipeline_last && pipeline_cb == cb &&
+        !memcmp(selected, pipeline_shaders, sizeof selected)) return;
+    vk_gpuprof_pipeline_break(pipeline_cb);
+    pipeline_parent = open_record;
+    gp_segment *segment = &current->segment[current->nsegment - 1];
+    segment->pipeline_population = pipeline_population; segment->pipeline_phase = pipeline_phase;
+    segment->pipeline_observed++;
+    uint32_t ordinal = pipeline_ordinal++;
+    int timed = vk_gpuprof_pipe_selected(ordinal, pipeline_phase, (uint32_t)vk_gpuprof_pipeline_on, pipeline_population);
+    segment->pipeline_out_of_range += ordinal >= pipeline_population;
+    /* Unselected detail is optional. Reserve the maximum selected count so a
+       long pass can never crowd later selected groups out of immutable storage. */
+    if (!timed && current->pipeline_unselected == GP_OPTIONAL_PIPELINES) {
+        pipeline_last = pipeline; pipeline_cb = cb;
+        memcpy(pipeline_shaders, selected, sizeof selected);
+        segment->pipeline_unretained++; return;
+    }
+    pipeline_last = pipeline; pipeline_cb = cb;
+    memcpy(pipeline_shaders, selected, sizeof selected);
+    if (!open_record || current->npipeline == GP_PIPELINE_RECORDS) { segment->pipeline_dropped++; return; }
+    gp_pipeline *p = &current->pipeline[current->npipeline++];
+    /* Published shader names are immutable, process-lifetime cache objects.
+       Borrow them instead of copying 240 bytes at every group boundary. */
+    p->frame = frame; p->key.pipeline = (uint64_t)(uintptr_t)pipeline; p->key.compute = compute;
+    p->primitives = p->unknown_draws = p->draws = p->dispatches = 0;
+    p->parent = (uint32_t)(open_record - current->rec); p->ordinal = ordinal;
+    p->population = pipeline_population; p->query1 = p->timestamps = 0;
+    pipeline_open = p;
+    pipeline_secondary = secondary_pass && !open_record->key.compute;
+    for (unsigned i = 0; i < 3; i++) p->key.shader[i] = selected[i] ? selected[i]->key : NULL;
+    p->selected = timed;
+    current->pipeline_unselected += !timed;
+    segment->pipeline_selected += timed;
+    if (!p->selected || current->pipeline_timed == GP_PIPELINE_QUERIES) return;
+    p->query1 = current->pipeline_timed++ * 2 + 1;
+    pipeline_timestamp(cb, p->query1 - 1); p->timestamps++;
+}
+void vk_gpuprof_pipeline_count(int prim, uint32_t count, uint32_t instances, int indexed) {
+    if (!pipeline_open) return;
+    if (prim < 0) { pipeline_open->dispatches++; return; }
+    pipeline_open->draws++;
+    uint64_t primitives;
+    if (vk_gpuprof_pipe_primitives(prim, count, instances, indexed, &primitives))
+        pipeline_open->primitives += primitives;
+    else pipeline_open->unknown_draws++;
+}
 void vk_gpuprof_dispatch_begin(VkCommandBuffer cb) { begin_record(cb, 1); }
 void vk_gpuprof_draw(vk_shader *const shaders[6]) {
     if (!open_record) return;
@@ -1218,6 +1945,10 @@ void vk_gpuprof_end_emit(VkCommandBuffer cb, const vk_gpuprof_end_token *token) 
     if (token->timestamp_count) (*token->timestamp_count)++;
 }
 void vk_gpuprof_end_deferred(vk_pass_end_kind reason, uint32_t detail, vk_gpuprof_end_token *token) {
+    /* A nested pre-upload record must not close its still-open main group.
+       Only the exact record owning the group may terminate its query lease. */
+    if (vk_gpuprof_pipeline_on && pipeline_parent == open_record)
+        vk_gpuprof_pipeline_break(pipeline_cb);
     memset(token, 0, sizeof *token);
     if (!open_record) return;
     open_record->reason = (uint32_t)reason; open_record->detail = detail;
@@ -1231,6 +1962,7 @@ void vk_gpuprof_end(VkCommandBuffer cb, vk_pass_end_kind reason, uint32_t detail
     vk_gpuprof_end_emit(cb, &token);
 }
 void vk_gpuprof_scope_begin(VkCommandBuffer cb, const char *label) {
+    if (vk_gpuprof_pipeline_on && cb == pipeline_cb) vk_gpuprof_pipeline_break(cb);
     if (scope_n == sizeof scopes / sizeof *scopes) { scope_overflow++; return; }
     gp_scope *scope = &scopes[scope_n++];
     *scope = (gp_scope){.parent = open_record, .parent_cb = open_cb,
@@ -1265,6 +1997,15 @@ static void present_at(VkCommandBuffer cb) {
     if (sample_budget) {
         sample_previous_passes = frame_instance;
         sample_cursor += sample_budget; sample_selected = 0;
+    }
+    if (vk_gpuprof_pipeline_on) {
+        /* Retain all launch-random bits: shrinking them to the initial domain
+           would bias selection after domain growth. Growth never removes tails
+           from stable layouts, and needs no per-frame random syscall. */
+        pipeline_population = vk_gpuprof_pipe_population(pipeline_population, pipeline_ordinal);
+        pipeline_phase = (pipeline_launch_phase + (uint32_t)frame * (uint32_t)vk_gpuprof_pipeline_on) &
+            (pipeline_population - 1);
+        pipeline_ordinal = 0;
     }
     frame++;
     frame_instance = 0;
@@ -1317,5 +2058,7 @@ void vk_gpuprof_test_flush(void) {
         while (background_flush_done != request) pthread_cond_wait(&background_cv, &background_mu);
     }
     pthread_mutex_unlock(&background_mu);
+    pthread_mutex_lock(&output_mu); output_flush_locked(1); pthread_mutex_unlock(&output_mu);
 }
+#include "vk_gpuprof_fixture.h"
 #endif

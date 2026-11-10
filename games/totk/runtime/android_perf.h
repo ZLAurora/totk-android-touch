@@ -23,10 +23,11 @@ struct ASurfaceTransaction;
 struct ASurfaceControl;
 void totk_perf_window(struct ANativeWindow *window);
 void totk_perf_surface(struct ASurfaceTransaction *tx, struct ASurfaceControl *surface);
-unsigned totk_perf_rate(void);
-/* Startup override: frontend validates against the current window display before publishing; 0 restores policy. */
+float totk_perf_rate(void);
+/* Startup override: request UINT32_MAX means highest advertised rate; frontend validates before publishing.
+ * Fractional display rates remain exact floats. 0 restores the existing content-rate policy. */
 unsigned totk_perf_rate_request(void);
-void totk_perf_rate_override(unsigned hz);
+void totk_perf_rate_override(float hz);
 void totk_perf_generated(void);   /* the presenter queued a generated frame (frame generation is running) */
 #else
 static inline void totk_perf_thread(const char *name) { (void)name; }
