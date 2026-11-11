@@ -6,6 +6,9 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
 ## Unreleased
 
 ### Developer tools
+- Add launch-only, default-off `TOTK_BENCH_TIME=HH:MM` for restored-save benchmark arms.
+  It pins the native effective clock, overriding timeline/sleep/day progression; weather and randomness remain uncontrolled.
+  Host guards and ARM64 state fixtures do not establish device HUD/sky or unchanged-save behavior.
 - Add default-off `TOTK_OVERLAY_SYS=1` full-overlay rows for Android thermal status/headroom, the main game's
   sampled CPU policy current/hardware-max clock ratio and cap marker, available/total RAM and game RSS.
   The existing background sampler owns all reads (1 Hz; headroom at 10 s); absent fields never move the layout.

@@ -3918,6 +3918,13 @@ fixtures cover integer/max/fractional requests, display migration, JNI refusal a
 thermal-load or camera-floor smoke result is claimed. The attempted smoke did not reach the menu or game; RC8,
 the unchanged 60-fps/GPU-busy profile and stayon 0 were restored, with the device left asleep.
 
+**Benchmark clock (not a frame-rate policy):** launch with `TOTK_BENCH_TIME=HH:MM` (`00:00`–`23:59`),
+using the same value in both arms; absent/`off` leaves all clock bytes unchanged and allocates no veneer.
+Malformed values log one rejection and stay off. This overrides cutscene/sleep time changes, schedules,
+day rollover and blood-moon progression: use restored saves only, never normal play. Weather, wind, clouds
+and randomness remain uncontrolled. Retain the single `[totk-bench-time]` effective-time line and qualify
+HUD/sky through load, static, pan and reload; unchanged save behavior is not yet device-qualified.
+
 | Frame-rate option | Android default | Effect |
 | --- | --- | --- |
 | `TOTK_FPS60` | `0` | `1` permits the game's 60-fps controller; `0` retains the shipping 30-fps minimum interval. |
