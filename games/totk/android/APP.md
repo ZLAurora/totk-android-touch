@@ -1748,6 +1748,48 @@ To export data while preserving it, install a dev APK signed with the same key o
 uninstalling**, run the export, then install the release APK again if wanted. Do not uninstall between builds: that
 deletes app data, including saves. Both builds must use the same signing key for an in-place update.
 
+### November 11 list-only shader update
+
+The current list adds 301 applicable V rows from MacNativeGames `a8ff9bc429bf451dd1040807c6dae6fa2a0cba55`,
+selected through switch2mac's engine pin. `UPSTREAM_MERGE.md` records the exact provenance, exclusions
+and previous import. All existing R/S/C and V rows remain; no upstream packed R or A/B/T/S rows are imported.
+The list digest is now `9b00d9a9083df6d2d8667969f9b105192851fd7e52d7fa93874ff0a7e5eb90b9`.
+The October 27 identity/count tables below are historical, not the identity of this refreshed list.
+
+Installing an updated APK alone keeps an already completed seed usable: there is no automatic
+shader-list epoch gate in `InstallState`. Use the setup UI's explicit shader rebuild to gain the
+new coverage; it rebuilds the full default-plus-listed seed from the player's existing game files,
+not just the added rows. The changed digest prevents reuse of an interrupted old-list preparation.
+The translation chain remains `totk-native-v5-unverified`; no translator update or forced cache wipe
+is part of this data refresh. Driver pipeline caches are keyed by driver/TU_DEBUG/Vulkan identity,
+not the APK/list digest. Seed-bound warm-run comparisons must nevertheless use the same rebuilt seed;
+new variants/pipelines can still need first-use work. Preserve saves and never uninstall to refresh.
+For desktop-generated seeds, retain existing exact loose variant names and use explicit `--shaders`
+as described below; these host measurements do not replace that retention/deployment gate.
+
+Fresh host runs of the production Android C seed stage (four services, current-source isolated
+Linux Vulkan translator, same authenticated 1.4.3 inputs) measure:
+
+| Quantity | Before | Refreshed |
+|---|---:|---:|
+| Default translation requests / completed default variants | 12,456 | 12,456 |
+| Listed translation requests | 24,864 | 25,165 |
+| Completed listed variants after dependency deduplication | 12,327 | 12,576 |
+| SPIR-V modules / total completed variants | 24,783 | 25,032 |
+| Packed bytes | 1,479,997,164 | 1,509,968,940 |
+| Full generation wall time (seconds, one run each) | 37.43 | 40.56 |
+
+That is **249 net modules and 29,971,776 bytes** more, not 301 modules. Both runs have zero
+failed translations; these are not the historical Metal/SPIRV-Cross seed or a retained deployed seed.
+Fresh dependency deduplication selects two different listed representative names; their old SPIR-V
+and reflection bytes have identical same-key replacements. Desktop deployment must still retain
+persisted exact names. Host timings are observations, not phone update-time estimates or a controlled
+performance benchmark. Source/prebuilt translators, installed seeds and caches were not replaced.
+
+Device qualification remains required: time the update's cold full shader rebuild and scratch/storage
+cost, compare first-use hitches on the same cold-area route, and inspect the picture (depth/alpha,
+textures, effects and UI). No steady-state FPS gain or hitch elimination is promised.
+
 ### Refresh the shader seed after the October 27 upstream additions
 
 The installation command above preserves an existing seed. Add **`--shaders`** when refreshing it; an ordinary full

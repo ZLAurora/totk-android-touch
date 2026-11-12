@@ -55,6 +55,11 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   shutdown authority, retaining unavailable endpoints as outstanding. Profiling remains default-off.
   Limit qualified pipeline captures to ≤30 fps (Duo or capped Thor); 45-fps/uncapped captures remain
   unqualified and must fail closed on footer drops/missing coverage. The fixed lease pool is not enlarged.
+- Refresh the shared shader list with the 301 upstream variant rows that apply to game 1.4.3
+  (upstream list commit `a8ff9bc429bf`, V rows only): a full shader rebuild now prepares 25,032 variants
+  instead of 24,783 and the shader pack grows by about 29 MiB. Existing shader packs stay valid; the added
+  variants arrive when the user runs the full shader rebuild. Upstream's new compressed pipeline-row and
+  recipe-row formats are not imported.
 
 ### Menu
 - Add **Unlimited** to Frame rate: variable real-game updates up to the existing 120 fps safety ceiling, with
