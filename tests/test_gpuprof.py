@@ -4,6 +4,8 @@ Pure suite: python -m unittest discover -s tests -p test_gpuprof.py
 Real matrix (build vkgpuproftest first): GPUPROF_TEST_BIN=<absolute binary>
 TOTK_SHADER_SEED_DIR=<absolute vkdraw-seed> python -m unittest discover -s tests -p test_gpuprof.py
 The caller runs the matrix under the repository's taskset/nice/flock policy.
+The one-primary recorder/profiler matrix is Lavapipe.test_one_primary_preserves_queries_and_pass_metadata;
+it explicitly compares switch off/on at 0/2/3 workers, rather than inheriting a shell switch.
 """
 import io
 import json
@@ -2010,14 +2012,16 @@ class Lavapipe(unittest.TestCase):
     def launch(self, mode, workers, stats, *, unsupported=False, rotate=False, areas=False, ordinals=None,
                unavailable_span=False, sampling=False, sample_budget=None, backpressure=False, cancel=False,
                sealed_present=False, last_closed=False, shutdown_inflight=False, shutdown_timeout=False,
-               pipeline_budget=None, pipeline_groups=False, pipeline_overflow=False, pipeline_raw=None):
+               pipeline_budget=None, pipeline_groups=False, pipeline_overflow=False, pipeline_raw=None,
+               one_primary=0, framegen='off'):
         binary = Path(os.environ['GPUPROF_TEST_BIN']).resolve()
         self.assertTrue(binary.is_file(), f'no fixture binary: {binary}')
         seed = Path(os.environ.get('TOTK_SHADER_SEED_DIR', binary.parent / 'vkdraw-seed')).resolve()
         self.assertTrue(seed.is_dir(), f'no shader seed: {seed}')
         with tempfile.TemporaryDirectory(prefix='gpuprof-test-') as temporary:
             env = dict(os.environ, TOTK_SHADER_SEED_DIR=str(seed), TOTK_VK_GPU_PROFILE=str(mode),
-                       TOTK_VK_REC_THREADS=str(workers), TOTK_VK_GPU_PROFILE_STATS=str(stats),
+                       TOTK_VK_REC_THREADS=str(workers), TOTK_VK_REC_ONE_PRIMARY=str(one_primary), TOTK_FRAMEGEN=framegen,
+                       TOTK_VK_GPU_PROFILE_STATS=str(stats),
                        TOTK_VK_GPU_PROFILE_LONG_MS='0', TOTK_VK_GPU_PROFILE_LONG_FRAMES='2',
                        TOTK_VK_GPU_PROFILE_MAX_BYTES='4096' if rotate else '134217728',
                        TOTK_RENDER_RES='1280x720')
@@ -2054,6 +2058,13 @@ class Lavapipe(unittest.TestCase):
             result = subprocess.run([str(binary), *arguments], cwd=temporary, env=env,
                                     capture_output=True, text=True, timeout=180)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            inline_capture = framegen in ('1', 'interp', 'hybrid', 'locked', 'adaptive')
+            effective_primary = int(bool(one_primary) and not (stats == 1 and (workers == 0 or inline_capture)))
+            self.assertIn(f'[nvn-vk] TOTK_VK_REC_ONE_PRIMARY={effective_primary} (requested={one_primary};',
+                          result.stderr, 'the requested arm must be effective, except documented inline-query fallback')
+            if one_primary and not effective_primary:
+                self.assertIn('one-primary fallback: primary occlusion/inline statistics query inheritance unavailable',
+                              result.stderr)
             match = re.search(r'gpuprof-fixture frames=(\d+) passes=(\d+) draws=(\d+) mode=(\d+) workers=(\d+) '
                               r'stats_supported=(\d+) stats_enabled=(\d+)', result.stdout)
             self.assertIsNotNone(match, result.stdout + result.stderr)
@@ -2292,6 +2303,64 @@ class Lavapipe(unittest.TestCase):
             else:
                 self.assertEqual(report['coverage']['long_frames'], 0)
             return report
+
+    def test_one_primary_preserves_queries_and_pass_metadata(self):
+        fields = ('key', 'kind', 'count', 'draws', 'window_start', 'window_end', 'ordinal',
+                  'render_width', 'render_height', 'reference_width', 'reference_height',
+                  'scene_relative', 'shader', 'samples', 'attachments', 'stats', 'stats_valid')
+
+        def signature(report):
+            passes = []
+            for row in report['_fixture_rows']:
+                if row['type'] != 'pass':
+                    continue
+                metadata = {key: row[key] for key in fields if key in row}
+                if 'sampling' in row:
+                    metadata['sampling'] = {key: row['sampling'][key] for key in
+                                            ('budget', 'observed_count', 'sample_count',
+                                             'observed_frames', 'sampled_frames')}
+                passes.append(json.dumps(metadata, sort_keys=True))
+            retirement = report['sessions'][0]['query_retirement']
+            # Pipeline groups use independent random launch phases. Selected
+            # endpoints can also create event-only worker chunks with their
+            # own statistics queries. Raw allocation totals are therefore not
+            # comparable between these launches; exact query conservation is.
+            pipeline = [row for row in report['_fixture_rows'] if row['type'] == 'pipeline_coverage']
+            pipeline_queries = sum(row['timestamp_count'] for row in pipeline)
+            self.assertGreaterEqual(retirement['queries_submitted'], pipeline_queries)
+            self.assertEqual(retirement['queries_submitted'], retirement['queries_retired'])
+            self.assertEqual(retirement['queries_outstanding'], 0)
+            queries = ((retirement['queries_outstanding'],
+                        retirement['queries_submitted'] == retirement['queries_retired']) if pipeline else
+                       (retirement['queries_submitted'], retirement['queries_retired'], retirement['queries_outstanding']))
+            return sorted(passes), (queries, retirement['queries_cancelled'], retirement['leases_cancelled'])
+
+        for case in ('full', 'sampled', 'pipelines', 'cancel'):
+            for stats in (0, 1):
+                metadata_reference = None
+                for workers in (0, 2, 3):
+                    # Worker statistics use one query per chunk, unlike the
+                    # inline query. Compare counts only at the same worker
+                    # count, and compare results across all worker counts.
+                    reference = None
+                    for one_primary in (0, 1):
+                        with self.subTest(case=case, stats=stats, workers=workers, one_primary=one_primary):
+                            report = self.launch(3 if case == 'sampled' else 1, workers, stats,
+                                                 one_primary=one_primary, sampling=case == 'sampled',
+                                                 sample_budget=2 if case == 'sampled' else None,
+                                                 pipeline_budget=16 if case == 'pipelines' else None,
+                                                 pipeline_groups=case == 'pipelines',
+                                                 pipeline_raw=True if case == 'pipelines' else None,
+                                                 cancel=case == 'cancel')
+                            observed = signature(report)
+                            if metadata_reference is None:
+                                metadata_reference = observed[0]
+                            self.assertEqual(observed[0], metadata_reference,
+                                             'pass and statistics results must match across worker counts')
+                            if reference is None:
+                                reference = observed
+                            self.assertEqual(observed, reference,
+                                             'sections preserve exact paired pass metadata and accounted queries')
 
     def test_pipeline_groups_direct_and_deferred(self):
         for workers in (0, 2):

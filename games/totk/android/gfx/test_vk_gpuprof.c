@@ -575,7 +575,7 @@ static int run_sealed_present(uint8_t *memory, tex_t targets[2], prog_t programs
         memset(present, 0, 256);
         if (pending) {
             VKCHECK(reset_event(V.dev, gate.event));
-            wait_events(cb, 1, &gate.event, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            wait_events(VK_SECTION_CB(cb), 1, &gate.event, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                 0, NULL, 0, NULL, 0, NULL);
         }
         if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "present");

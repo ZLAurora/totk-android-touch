@@ -1,4 +1,8 @@
-/* Fresh-process comparisons: no Vulkan objects or caches shared across modes. */
+/* Fresh-process comparisons: no Vulkan objects or caches shared across modes. Every invocation runs
+   TOTK_VK_REC_ONE_PRIMARY=0/1; binary fixtures compare every output byte between those launch arms.
+   Run vkrectest for identity/boundaries/mixed sections (including deferred payload/storage/cancel)/split passes,
+   --job-reuse for the 4096-pass storage oracle/leases/failures, --lag-guards for backend copy/guard liveness plus
+   private uniforms, and --launch-policy for hardware-free framegen/statistics startup decisions. Pixel fixtures need the completed draw seed. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -9,7 +13,7 @@
 #include <errno.h>
 #include <signal.h>
 
-static int run(const char *binary, const char *mode, const char *output, const char *threads, int widen) {
+static int run_arm(const char *binary, const char *mode, const char *output, const char *threads, int widen, int one_primary) {
     int fault = !strncmp(mode, "--rec-fail-", 11), reuse = !strcmp(mode, "--rec-job-reuse") ||
         !strcmp(mode, "--rec-vma-fallback") || !strcmp(mode, "--rec-storage") ||
         !strcmp(mode, "--rec-leases") || !strcmp(mode, "--rec-leases-unlimited") || !strcmp(mode, "--rec-storage-warm");
@@ -18,6 +22,7 @@ static int run(const char *binary, const char *mode, const char *output, const c
     if (!pid) {
         setenv("TOTK_VK_REC_THREADS", threads, 1);
         setenv("TOTK_VK_COMPILE_THREADS", "0", 1); /* a cold cache must not intentionally omit asynchronous pipelines */
+        setenv("TOTK_VK_REC_ONE_PRIMARY", one_primary ? "1" : "0", 1);
         if (strcmp(mode, "--rec-identity")) { /* deterministic worker gates and same-chunk memo reuse */
             setenv("TOTK_VK_REC_INLINE_DRAWS", "0", 1); setenv("TOTK_VK_REC_CHUNK_DRAWS", "128", 1);
             setenv("TOTK_VK_REC_LEAD_DRAWS", "32", 1);
@@ -25,9 +30,19 @@ static int run(const char *binary, const char *mode, const char *output, const c
         if (widen) setenv("TOTK_VK_TEST_WIDEN_U8", "1", 1); else unsetenv("TOTK_VK_TEST_WIDEN_U8");
         unsetenv("TOTK_VK_OCCLUSION"); unsetenv("TOTK_VK_PASS_DUMP"); unsetenv("TOTK_VK_PASS_PROFILE"); unsetenv("TOTK_VK_PASSPROBE"); unsetenv("TOTK_VK_GPU_PROFILE");
         unsetenv("TOTK_VK_PASS_MERGE");
+        if (!strcmp(mode, "--one-primary-launch")) {
+            execl(binary, binary, mode, (char *)NULL); perror(binary); _exit(127);
+        }
+        setenv("TOTK_FRAMEGEN", "off", 1); unsetenv("TOTK_VK_GPU_PROFILE_STATS");
         if (!strcmp(mode, "--xlate-stats")) {
             setenv("TOTK_VK_XLATE_STATS", "1", 1);
             if (!freopen(output, "w", stdout) || dup2(STDOUT_FILENO, STDERR_FILENO) < 0) _exit(127);
+            execl(binary, binary, mode, (char *)NULL); perror(binary); _exit(127);
+        }
+        if (!strcmp(mode, "--lag-uniform") || !strcmp(mode, "--lag-guards")) {
+            setenv("TOTK_FRAME_LAG", "1", 1); setenv("TOTK_VK_REC_ASYNC_SUBMIT", "1", 1);
+            setenv("TOTK_VK_OFF", "block", 1);
+            unsetenv("TOTK_VK_LAG_CAPTURE"); unsetenv("TOTK_VK_LAG_MODE"); unsetenv("TOTK_VK_UB_RENAME");
             execl(binary, binary, mode, (char *)NULL); perror(binary); _exit(127);
         }
         if (fault || reuse) {
@@ -134,7 +149,7 @@ static int identical(const char *a, const char *b, uint64_t magic) {
         if (nl != nr || memcmp(l, r, nl)) { fprintf(stderr, "identity differs at byte block %zu\n", total); ok = 0; break; }
         total += nl;
         if (!nl) {
-            if (magic < (1u<<20)) { ok = !ferror(left) && !ferror(right) && total == magic; break; } /* raw pixel fixture size */
+            if (magic < (1u<<20)) { ok = !ferror(left) && !ferror(right) && total && (!magic || total == magic); break; } /* raw fixture size, or any nonempty exact output */
             uint64_t footer[2];
             ok = !ferror(left) && !ferror(right) && total > sizeof footer && !fseek(left, -(long)sizeof footer, SEEK_END)
                 && fread(footer, sizeof footer, 1, left) == 1 && footer[0] == magic && footer[1] == 12;
@@ -145,16 +160,54 @@ static int identical(const char *a, const char *b, uint64_t magic) {
     printf("%s: %zu byte identity including rendered pixels, actual passes/draws, ordered samples and timestamp assertions\n", ok ? "ok" : "FAIL", total);
     return ok;
 }
+/* Every fixture invocation owns both launch arms, so specialized matrices cannot accidentally omit exact1.
+   Compare the complete binary payload, never stdout timings or the inherently variable timestamp values. */
+static int run(const char *binary, const char *mode, const char *output, const char *threads, int widen) {
+    int payload = !strcmp(mode, "--rec-identity") || !strcmp(mode, "--rec-boundaries") ||
+        !strcmp(mode, "--rec-submit") || !strcmp(mode, "--rec-sections") ||
+        !strncmp(mode, "--split-", 8) || !strcmp(mode, "--load-elide") || !strcmp(mode, "--feedback-narrow");
+    char enabled[PATH_MAX];
+    if (payload && snprintf(enabled, sizeof enabled, "%s-one-primary", output) >= (int)sizeof enabled) return 0;
+    int off = run_arm(binary, mode, output, threads, widen, 0);
+    if (off && !strcmp(mode, "--xlate-stats")) off = xlate_log(output);
+    int on = run_arm(binary, mode, payload ? enabled : output, threads, widen, 1);
+    int ok = off && on;
+    if (payload) {
+        printf("%s workers=%s widening=%d one-primary off vs on: ", mode, threads, widen);
+        if (ok) ok = identical(output, enabled, 0);
+        unlink(enabled);
+    }
+    return ok;
+}
 int main(int argc, char **argv) {
     char binary[PATH_MAX]; ssize_t len = readlink("/proc/self/exe", binary, sizeof binary - 1);
     if (len < 0) { perror("/proc/self/exe"); return 1; } binary[len] = 0;
     char *base = strrchr(binary, '/'); if (!base) return 1; strcpy(base + 1, "vkdrawtest");
     char dir[] = "./vkrecord-XXXXXX"; if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
+    if (argc == 2 && !strcmp(argv[1], "--launch-policy")) {
+        const char *framegen[] = {"off", "1", "interp", "hybrid", "locked", "adaptive"};
+        const char *workers[] = {"0", "2"}; int ok = 1;
+        for (unsigned f = 0; f < sizeof framegen / sizeof *framegen; f++) for (int stats = 0; stats < 2; stats++) {
+            setenv("TOTK_FRAMEGEN", framegen[f], 1); setenv("TOTK_VK_GPU_PROFILE_STATS", stats ? "1" : "0", 1);
+            for (unsigned w = 0; w < sizeof workers / sizeof *workers; w++)
+                ok &= run(binary, "--one-primary-launch", NULL, workers[w], 0);
+        }
+        rmdir(dir); return !ok;
+    }
     if (argc==2 && !strcmp(argv[1],"--alpha-clear")) {
         int ok=1;
         for (unsigned workers=0;workers<2;workers++) {
             ok &= run(binary,"--alpha-test","unused",workers?"2":"0",0);
             ok &= run(binary,"--clear-on-read","unused",workers?"2":"0",0);
+        }
+        rmdir(dir); return !ok;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--lag-guards")) {
+        char backend[PATH_MAX]; strcpy(backend, binary); strcpy(strrchr(backend, '/') + 1, "vktest");
+        const char *workers[] = {"0", "2", "3"}; int ok = 1;
+        for (unsigned i = 0; i < sizeof workers / sizeof *workers; i++) {
+            ok &= run(backend, "--lag-guards", NULL, workers[i], 0);
+            ok &= run(binary, "--lag-uniform", NULL, workers[i], 0);
         }
         rmdir(dir); return !ok;
     }
@@ -193,6 +246,14 @@ int main(int argc, char **argv) {
     const char *threads[] = {"0", "2", "3"}, *modes[] = {"--rec-identity", "--rec-boundaries", "--rec-submit"};
     const uint64_t magic[] = {0x5245434944454e33ull, 0x524543424e445933ull, 0x524543424e445933ull}; int ok = 1;
     if (!split_only) {
+    char sections_reference[PATH_MAX]; snprintf(sections_reference, sizeof sections_reference, "%s/sections-reference.bin", dir);
+    for (unsigned i = 0; i < sizeof threads / sizeof *threads; i++) {
+        char output[PATH_MAX]; snprintf(output, sizeof output, "%s/sections-%s.bin", dir, threads[i]);
+        ok &= run(binary, "--rec-sections", output, threads[i], 0);
+        if (!i) { if (rename(output, sections_reference)) ok = 0; }
+        else { ok &= identical(sections_reference, output, 0); unlink(output); }
+    }
+    unlink(sections_reference);
     for (int i = 0; i < 2; i++) {
         char log[PATH_MAX]; snprintf(log, sizeof log, "%s/xlate-%d.log", dir, i);
         ok &= run(binary, "--xlate-stats", log, i ? "2" : "0", 0);

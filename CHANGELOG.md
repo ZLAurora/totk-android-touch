@@ -30,6 +30,26 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   policy; game pacing and Android settings remain unchanged.
 
 ### Runtime
+- Fix shader translation for compute texture gathers with runtime offsets.
+  The translator now lowers those offsets before emitting SPIR-V instead of putting runtime values in constants.
+  Existing generated shader seeds need replacement to receive the corrected modules.
+  Replace seeds while the game is stopped; stale loose shader files must not override the corrected pack.
+- Enable the companion's opaque cover by default on devices with a built-in second screen;
+  `TOTK_COMPANION_COVER=0` turns it off. A companion window alone does not make Android stop the app
+  underneath it; an opaque activity does. Tested only with the Cocoon launcher: it was stopped in every
+  cover-on launch on both the Retroid Pocket Duo and AYN Thor.
+  On Duo, launches started from the launcher pooled 28.70 fps and 101 frames over 50 ms per 24 windows
+  without the cover, versus 29.22 fps and 40 with it. The frame-rate difference is inside the comparison
+  tool's tolerance; the tool rates the pooled result better.
+  On Thor, launcher CPU use during gameplay fell from about 27% of one core to about 0.05%, and compositor
+  CPU use from about 19% to about 17%, with no frame-rate change (44.80 → 45.32 fps standing;
+  44.65 → 44.69 fps panning).
+- Add experimental `TOTK_VK_REC_ONE_PRIMARY=1`, off by default: record each submitted chunk into one main
+  command buffer instead of one per render pass. On the AYN Thor, measured GPU time per frame was about 5% lower:
+  18.67 → 17.65 ms standing and 18.64 → 17.63 ms while panning. Frame rate was about 2% higher
+  (45.20 → 46.04 fps standing; 44.45 → 45.34 fps panning), which is inside the comparison tool's tolerance,
+  so it is not counted as confirmed. The AYN Odin 3 showed no frame-rate change;
+  adoption remains undecided on the Retroid Pocket Duo.
 - Keep `totk.log` as the direct primary log, but make its duplicate logcat mirror opt-in (`TOTK_LOGCAT=1`).
   Normal launches no longer start its tail thread or wake logd for every frame log. Crash reports remain enabled.
 - Let the live-control reader sleep when `totk.ctl` is absent, including after unrelated files are created or deleted.

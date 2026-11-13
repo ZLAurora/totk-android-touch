@@ -20,8 +20,29 @@ Android-device result.
 **Round-eight default record (historical):** Android tried AHB with automatic copy fallback; explicit
 `TOTK_VK_PRESENT=copy` remained the control. The then-current chunk rule was 600 only with
 `TOTK_FRAME_LAG=1`, otherwise 75, and lag was recorded as off pending separate VMA safety work.
-`TOTK_COMPANION=0` suppresses secondary presentation, polling and action injection after `totk.env` loads;
-omit `--dex/--assets` in the low-level APK packer for the Java-free variant (`build_android.py --no-companion`
+`TOTK_COMPANION=0` suppresses secondary presentation, polling and action injection after `totk.env` loads.
+The cover defaults on for built-in secondary displays with the companion enabled. Exact
+`TOTK_COMPANION_COVER=0` opts out; unset, `1` and other values keep it on.
+Start waits for owner window focus and top-resumed readiness. Ordinary touch/game-input reclaim
+keeps its window-focus guard; a separate one-use, token-bound 1000 ms recovery may front the verified, still-resumed
+game after the live cover takes top-resumed state. Creation waits for no gesture; recovery remains within its original
+deadline and is checked on final UP/CANCEL. Pause, close, competing top-resumed loss, or a stale/expired token
+suppresses it. The cover is non-focusable/non-interactive and intentionally has no `noHistory`.
+
+Tested only with Cocoon: the launcher was stopped in every cover-on launch on Retroid Pocket Duo and AYN Thor.
+Duo launches started from the launcher pooled 28.70 → 29.22 fps and 101 → 40 frames over 50 ms per 24 windows;
+the frame-rate difference is inside the comparison tool's tolerance, while the tool rates the pooled result better.
+Thor launcher CPU use fell from about 27% of one core to about 0.05%, and compositor CPU use from about 19% to
+about 17%, with no frame-rate change (44.80 → 45.32 fps standing; 44.65 → 44.69 fps panning).
+The policy log shows the raw startup request: `requested=unset effective=true` for an eligible default-on
+launch, or `requested=0 effective=false` for explicit opt-out. Built-in-panel gating still uses `DisplayClass`.
+Cover start/finish/refusal/restart/policy/recovery lines use `[TotkCompanion] cover ...` in canonical
+`<game>/totk.log`; the optional `TOTK_LOGCAT=1` mirror uses Android tag `totk` but platform filtering may still drop
+INFO. Inspect the file, not logcat alone. With the switch off, no cover activity/window, reclaim or cover lifecycle
+callback registration occurs, though the native query, disabled CoverSession allocation and policy log remain.
+The policy line also records read-only `logcat_min_priority`, `logcat_info`, and `logcat_warn` admission queries;
+it does not change the process priority or Android log properties.
+Omit `--dex/--assets` in the low-level APK packer for the Java-free variant (`build_android.py --no-companion`
 selects it, but that script is not part of integration verification).
 
 **Round-ten status (historical, superseded for frame lag):** SGSR and automatic 60/30 selection are optional;

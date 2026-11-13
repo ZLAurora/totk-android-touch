@@ -4603,6 +4603,11 @@ enum { DS_CACHE = 2048 };
 static struct { uint64_t sub, hash[2]; VkDescriptorSetLayout dsl; size_t n; VkDescriptorSet set; } g_dsc[DS_CACHE];
 static struct { uint64_t sub; VkPipelineLayout layout; VkDescriptorSet set; } g_bound_set[2][6];   /* [graphics, compute][set index] */
 static void descriptor_unbind(void) { memset(g_bound_set, 0, sizeof g_bound_set); }
+/* A fresh walker secondary inherits no pipeline, dynamic or descriptor state.
+ * Descriptor contents remain cached; only binding-elision state is invalid. */
+void vk_draw_secondary_reset(void) {
+    descriptor_unbind(); g_bound_pipe = VK_NULL_HANDLE; g_dyn_dirty = 1;
+}
 static uint64_t g_stat_sets_new, g_stat_sets_reused;
 /* Hash both identities in one word-wise pass over the zero-filled infos. The second uses add/multiply/rotate rather
    than the first's xor/multiply/shift, not just another seed of the same hash. */

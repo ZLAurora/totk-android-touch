@@ -111,6 +111,9 @@ static class SwshXlate
         // a retry for shaders that actually emit FP64 in the first pass.
         public bool QueryHostSupportsShaderFloat64() => _job["softfloat64"] is not JsonValue v || !(v.TryGetValue<bool>(out bool b) && b);
         public bool QueryHostSupportsTextureShadowLod() => true;
+        // SPIR-V ConstOffset/ConstOffsets require constant instructions, not runtime
+        // register values. Lower dynamic guest offsets into coordinates before codegen.
+        public bool QueryHostSupportsNonConstantTextureOffset() => false;
         // TOTK (2026-10-22): Adreno picks a different textureGather 2x2 footprint than NVIDIA when the coordinate lands
         // on a texel centre; TOTK's quarter-res sun shadow mask (its depth gathers) then self-shadows whole 64 px
         // terrain tiles - the black squares. Ryujinx compensates on AMD/Intel via GatherBiasPrecision (half a subtexel

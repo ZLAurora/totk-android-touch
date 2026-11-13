@@ -725,3 +725,5 @@ typedef struct { tex_t t; int ok; view_t v; int has_v; } vk_treg;
 int vk_treg_get(int tid, vk_treg *out);      /* a copy, taken under the registry lock (the game registers from its own threads) */
 int vk_treg_kind(int tid, int *format, int *target);   /* effective format/target, atomically published by registry writers */
 uint64_t vk_treg_revision(void);                    /* acquire: every registration, texture epoch or pool-size change invalidates stage signatures */
+
+#include "vk_sections.h"

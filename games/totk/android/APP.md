@@ -1518,6 +1518,28 @@ other than exactly `0` retain the existing default-on behavior; an eligible seco
 This is a startup option, not a live file watcher: edit `totk.env` before restarting the app. `--no-companion`
 instead omits the companion Java and assets at build time and keeps the original `android.app.NativeActivity`.
 
+The companion uses an opaque, non-interactive cover beneath the unchanged Presentation on built-in secondary
+displays by default. Exact `TOTK_COMPANION_COVER=0` in `totk.env` turns it off; unset, `1` and other values keep
+it on. It requires the companion enabled and does nothing for single-screen or external displays.
+Start waits for owner window focus and top-resumed readiness.
+Ordinary touch/game-input reclaim keeps its window-focus guard; separate one-use, token-bound 1000 ms startup recovery
+may front the verified, still-resumed game task after the cover takes top-resumed state. Creation waits for no gesture;
+recovery stays within its deadline and is checked on final UP/CANCEL. Pause, close, competing top-resumed loss, or a
+stale/expired token suppresses it. The cover remains non-focusable and non-interactive.
+
+Tested only with Cocoon: the launcher was stopped in every cover-on launch on Retroid Pocket Duo and AYN Thor.
+Duo launches started from the launcher pooled 28.70 → 29.22 fps and 101 → 40 frames over 50 ms per 24 windows;
+the frame-rate difference is inside the comparison tool's tolerance, while the tool rates the pooled result better.
+Thor launcher CPU use fell from about 27% of one core to about 0.05%, and compositor CPU use from about 19% to
+about 17%, with no frame-rate change (44.80 → 45.32 fps standing; 44.65 → 44.69 fps panning).
+Cover start/finish/refusal/restart/policy/recovery diagnostics use `[TotkCompanion] cover ...` in canonical
+`<game>/totk.log`, independently of Android INFO filtering. The policy line retains the raw startup request:
+`requested=unset effective=true` for an eligible default-on launch, or `requested=0 effective=false` for opt-out.
+The existing `TOTK_LOGCAT=1` opt-in mirrors the file to Android logcat under tag `totk`, where platform filtering may
+still drop INFO; inspect `totk.log`. With the switch off, the native query, disabled CoverSession allocation and
+policy log remain, but no cover activity/window, reclaim or cover lifecycle callback registration occurs.
+Owner stop/dismiss/close and process teardown clean up the cover. This startup setting requires restarting the app.
+
 Startup ordering is deliberate: `TotkActivity.onCreate` first calls `NativeActivity.super.onCreate`, which invokes
 `ANativeActivity_onCreate`; its `start_game` reads `totk.env` synchronously. Only after `super.onCreate` returns does
 Java query the native runtime switch and, if enabled, construct the controller. There is no second environment-file
@@ -3977,6 +3999,7 @@ HUD/sky through load, static, pan and reload; unchanged save behavior is not yet
 | `TOTK_VK_CHUNK_DRAWS` | `75` by default; `600` when resolved lag is on and native VMA pressure is absent | Explicit positive value or `0` wins (`0` disables automatic chunking). The resolved startup policy is logged once. |
 | `TOTK_VK_SPLIT_PASS_DRAWS` | `0` (off) | `n > 0` ends a still-open pass after `n` draws, submits that part through the chunk path and reopens the same targets with `loadOp=LOAD`. Each split adds a store and load of every attachment on tiled GPUs; try 512 or 256 and read `[split-pass]` every 300 presents (VULKAN.md). |
 | `TOTK_VK_REC_THREADS` | `2` on Android; `0` on other platforms | Explicit `0` keeps the synchronous recorder for A/B; positive overrides select up to four workers. `TOTK_VK_GPU_PROFILE` retains workers, including when pass sampling is enabled; other diagnostic guards still force inline recording. Keep profiler and sample/statistics settings fixed when comparing worker counts (VULKAN.md). |
+| `TOTK_VK_REC_ONE_PRIMARY` | `0` (off) | Experimental, startup-only: exact `1` records each submitted chunk into one main command buffer instead of one per render pass. Auxiliary command buffers retain their order; diagnostic fallbacks and recorder details are documented in VULKAN.md. |
 | `TOTK_VK_GPU_PROFILE` | `0` (off) | `1` collects pass-part timings with recorder workers; `2` also logs every split; `3` also retains a per-frame ring and dumps every over-threshold frame's observed passes. Every 300-frame window writes schema-3 aggregates by exact key + scene reference + scene role; ordinal `0` means all frame ordinals. Without `GPU_PROFILE_SAMPLE`, every pass is timed as before. Absolute areas remain available for driver joins and DRS-aware families (VULKAN.md). Compare profiling-off/on separately before interpreting performance. |
 | `TOTK_VK_GPU_PROFILE_SAMPLE` | `0` (full profiling unchanged) | With `GPU_PROFILE=1/2/3`, a strict positive integer `1`–`16` limits timestamped/statistics-enabled pass parts per frame; recommended **`2`**, initially with stats off. Deterministic ordinal rotation retains all observed keys, draws and scene metadata. Each frame also has one completion-accurate whole-main-frame timestamp pair; actual profiler-owned `vkCmdWriteTimestamp2` `timestamp_count` (including deferred assembly ends, excluding independent game reports) is at most `2k+2`, without pre/slot envelopes. If Android has already submitted the final command buffer before CPU present, SAMPLE adds **one small marker-only main submission** for the real end timestamp; the query-count bound still holds, but that extra submission has explicit cost. Pass `gpu_ms` is sampled-only, never an extrapolated total. Use the analyzer's whole-interval coverage, sampled mean and histogram percentiles; absent/`0` keeps the old full mode. |
 | `TOTK_VK_GPU_PROFILE_PIPELINES` | `0` (off) | With `GPU_PROFILE=1/2/3`, `1`–`16` adds at most `2k` GPU timestamp writes/frame for contiguous actual-pipeline + full VS/FS-variant groups (compute separate), independently of pass sampling. Start with `GPU_PROFILE=1 SAMPLE=2 PIPELINES=4 STATS=0`. Default output is sampled-key 300-frame compact windows with interned exact variants, actual inclusion weights and explicit coverage/loss; global per-frame JSON rows are suppressed, pass/window aggregates remain. Estimates are withheld on true loss/missing authority. Calibrate off/on with the same APK in ABBA order (VULKAN.md). |
