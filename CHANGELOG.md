@@ -88,9 +88,13 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   With this port: pictures were correct on the Odin (six scenes) and the Duo (15 minutes). On the Duo, uncapped,
   frame rate was unchanged (31.81 → 31.85 fps standing, 30.67 → 30.52 panning) and GPU time per frame fell from
   24.61 to 23.93 ms and from 25.08 to 24.47 ms; no measured value was worse, but the comparison counts as
-  inconclusive because the GPU clock differed by 3.3% between the two settings. Not yet re-measured on the Thor
-  or, for speed, on the Odin. The driver's pipeline cache is rebuilt once in the background after this change
-  (about 5 minutes on the Odin; much longer on the Duo while playing); the shipped shader set stays valid.
+  inconclusive because the GPU clock differed by 3.3% between the two settings. On the Thor, on against off:
+  45.44 → 48.24 fps standing and 45.03 → 46.84 fps panning, GPU time 18.57 → 18.00 ms and 18.53 → 17.94 ms
+  (both rated better); the slowest 1% of frames changed by -1.3 / +1.4 ms, inside this device's
+  launch-to-launch spread. On the Odin: 75.68 → 75.88 fps standing and 71.65 → 71.99 fps panning (same),
+  GPU time 9.36 → 8.87 ms and 9.46 → 9.00 ms, nothing worse. The driver's pipeline cache is rebuilt once in
+  the background after this change (about 5 minutes on the Odin, about 17 minutes on the Thor, much longer on
+  the Duo while playing); the shipped shader set stays valid.
 
 ### Menu
 - Add **Unlimited** to Frame rate: variable real-game updates up to the existing 120 fps safety ceiling, with
