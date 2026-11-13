@@ -29,6 +29,18 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
+          
+      - name: Pin .NET SDK 10
+        run: |
+          cat > global.json <<'EOF'
+          {
+            "sdk": {
+              "version": "10.0.100",
+              "rollForward": "latestFeature"
+            }
+          }
+          EOF
+          dotnet --version
 
       - name: Install Python dependency
         run: pip install cryptography==50.0.2
