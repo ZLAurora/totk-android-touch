@@ -33,7 +33,7 @@ final class Settings {
     static final String[] LANGUAGES = {"auto", "en-US", "ja", "de", "fr", "es", "it", "nl", "ru", "ko", "zh-Hans", "zh-Hant", "pt-BR"};
     /** Every option in menu order; the fallback is the shipping default (an absent settings.env behaves the same). */
     static final Option[] OPTIONS = {
-        new Option("frame_rate", PERFORMANCE, "30", "30", "40", "60"),
+        new Option("frame_rate", PERFORMANCE, "30", "30", "40", "60", "unlimited"),
         new Option("frame_gen", PERFORMANCE, "off", "off", "on"),
         new Option("render_res", PERFORMANCE, "game", "game", "1280x720", "1152x648", "960x540"),
         new Option("latency", PERFORMANCE, "balanced", "responsive", "balanced", "smoothest"),
@@ -104,7 +104,7 @@ final class Settings {
     String get(String key) { return values.get(option(key).key); }
     int number(String key) { return Integer.parseInt(get(key)); }
 
-    /** Set one option, then apply the rules that tie options together: 40/60 fps turn frame generation off,
+    /** Set one option, then apply the rules that tie options together: rates above 30 turn frame generation off,
      * frame generation needs 30 fps. Invalid values are ignored. */
     void set(String key, String value) {
         Option option = option(key);
@@ -120,8 +120,8 @@ final class Settings {
         int n = option.values.length, i = option.index(get(key));
         set(key, option.values[((i + direction) % n + n) % n]);
     }
-    /** Frame generation fixes latency; the 40 fps producer must not queue acquire slack. */
-    boolean latencyLocked() { return "on".equals(get("frame_gen")) || "40".equals(get("frame_rate")); }
+    /** Frame generation fixes latency; uncapped producers must not queue acquire slack. */
+    boolean latencyLocked() { return "on".equals(get("frame_gen")) || "40".equals(get("frame_rate")) || "unlimited".equals(get("frame_rate")); }
     /** Which sharpness slider the current upscaler uses, or null when there is no upscaler. */
     String sharpnessKey() {
         switch (get("upscaler")) {
@@ -213,10 +213,11 @@ final class Settings {
             line(out, "TOTK_DATA_DIR=" + dataDir);
         boolean framegen = "on".equals(get("frame_gen"));
         boolean forty = "40".equals(get("frame_rate"));
+        boolean unlimited = "unlimited".equals(get("frame_rate"));
         if (framegen) for (String line : FRAMEGEN_BLOCK) line(out, line);
         else {
             boolean sixty = "60".equals(get("frame_rate"));
-            line(out, "TOTK_FPS60=" + (sixty || forty ? "1" : "0"));
+            line(out, "TOTK_FPS60=" + (sixty || forty || unlimited ? "1" : "0"));
             if (forty) {
                 // Keep a 25 ms producer clock even when Android limits the display to 60 Hz.
                 for (String setting : new String[]{"TOTK_UNCAPPED=1", "TOTK_UNCAPPED_HZ=40", "TOTK_UNCAPPED_INTERVAL=1",
@@ -224,9 +225,19 @@ final class Settings {
                         "TOTK_ACQUIRE_SLACK=0", "TOTK_ACQUIRE_CLOCK=0", "TOTK_FRAME_RATE_HINT=1", "TOTK_FRAME_RATE_HINT_HZ=120"})
                     line(out, setting);
             }
+            if (unlimited) {
+                // The existing 120 Hz producer ceiling protects the realtime game clock.
+                for (String setting : new String[]{"TOTK_UNCAPPED=1", "TOTK_UNCAPPED_HZ=120", "TOTK_UNCAPPED_INTERVAL=1",
+                        "TOTK_REALTIME=1", "TOTK_FRAME_LAG=0", "TOTK_FPS_AUTO=0", "TOTK_PACE=0", "TOTK_PRESENT_SLOTS=0",
+                        "TOTK_ACQUIRE_SLACK=0", "TOTK_ACQUIRE_CLOCK=0", "TOTK_FRAME_RATE_HINT=1", "TOTK_FRAME_RATE_HINT_HZ=max"})
+                    line(out, setting);
+            }
             // The device-tested 60 fps profile reports hardware GPU time (the FPS60 default, latency, overstates it).
             if (sixty) line(out, "TOTK_GPU_TIME=hardware");
-            if (sixty && fps60Hysteresis) line(out, "TOTK_FPS60_HYSTERESIS=1");
+            if (sixty && fps60Hysteresis) {
+                line(out, "TOTK_FPS60_HYSTERESIS=1");
+                line(out, "TOTK_FRAME_LAG=1");
+            }
             // Extraction cannot split passes. Leave both hints out with frame generation, retaining its timing block.
             if ("on".equals(get("gpu_feed"))) {
                 line(out, "TOTK_VK_SPLIT_PASS_DRAWS=512");
@@ -234,7 +245,7 @@ final class Settings {
             }
         }
         if (!get("render_res").equals("game")) line(out, "TOTK_RENDER_RES=" + get("render_res"));
-        if (!framegen && !forty) line(out, "TOTK_ACQUIRE_SLACK=" + Arrays.asList("responsive", "balanced", "smoothest").indexOf(get("latency")));
+        if (!framegen && !forty && !unlimited) line(out, "TOTK_ACQUIRE_SLACK=" + Arrays.asList("responsive", "balanced", "smoothest").indexOf(get("latency")));
         String upscaler = get("upscaler");
         line(out, "TOTK_POST_SCALE=" + upscaler);
         if (upscaler.equals("fsr")) line(out, "TOTK_POST_SHARPNESS=" + decimal(number("sharpness_fsr"), 2));

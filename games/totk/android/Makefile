@@ -230,6 +230,7 @@ VKTEST_SRC := $(TOTK)/android/gfx/nvn_vk.c $(TOTK)/android/gfx/vk_load.c $(TOTK)
   $(TOTK)/third_party/d2r_gfx/gfx/tex/nvn_deswizzle.c $(TOTK)/android/gfx/host_test_support.c $(TOTK)/runtime/frame_timeline.c $(TOTK)/runtime/frame_fence.c \
   $(TOTK)/runtime/fps_hybrid_runtime.c $(TOTK)/runtime/fps_adaptive_runtime.c
 VKTEST_SRC += $(TOTK)/android/gfx/vk_framegen_qcom.c $(TOTK)/android/gfx/vk_framegen_lsfg.c
+VKTEST_SRC += $(TOTK)/android/gfx/vk_sections.h $(TOTK)/android/gfx/vk_sections.inc
 VKTEST_FLAGS := -O1 -g $(WARN) -Wno-unused-parameter -D_GNU_SOURCE -DGPU_VK -DTOTK_VK_TESTS -I$(TOTK)/runtime -I$(TOTK)/third_party/d2r_gfx/gfx/nvn \
   -I$(TOTK)/third_party/d2r_gfx/gfx/nvn/include $(COMPAT) -fPIE -pie
 VKTEST_LIBS := -ldl -lm $(if $(filter linux,$(TARGET)),-lpthread)
@@ -301,7 +302,7 @@ uploadpooltest: $(OUT)/uploadpooltest
 $(OUT)/uploadpooltest: $(TOTK)/android/gfx/test_upload_pool.c $(TOTK)/android/gfx/vk_upload_pool.c $(TOTK)/third_party/d2r_gfx/gfx/tex/nvn_deswizzle.c $(TOTK)/third_party/d2r_gfx/gfx/nvn/nvn_tex.c \
   $(TOTK)/android/gfx/vk_upload_pool.h $(TOTK)/third_party/d2r_gfx/gfx/tex/nvn_deswizzle.h $(TOTK)/third_party/d2r_gfx/gfx/nvn/nvn_tex.h
 	@mkdir -p $(dir $@)
-	$(CC) -O2 -g $(WARN) -D_GNU_SOURCE -o $@ $(filter %.c,$^) -lpthread
+	$(CC) -O2 -g $(WARN) -D_GNU_SOURCE -o $@ $(filter %.c,$^) $(if $(filter linux,$(TARGET)),-lpthread)
 $(addprefix $(OUT)/,vktest vkdrawtest vkrecspantest vkpipetest vkdrawtest-app vkoverlaytest vkposttest vkframegentest vknativeuitest vkxlatetest): $(TOTK)/android/gfx/vk_seed_io.h $(TOTK)/android/gfx/vk_seed_pack.h
 $(OUT)/vkseedpacktest: $(TOTK)/android/gfx/test_vk_seed_pack.c $(TOTK)/android/gfx/vk_seed_pack.h
 	@mkdir -p $(dir $@)
@@ -329,11 +330,15 @@ $(OUT)/vkdrawtest: $(TOTK)/android/gfx/test_vkdraw.c $(VKTEST_SRC) $(VKTEST_FRON
 	$(CC) $(VKTEST_FLAGS) -Wl,--gc-sections -o $@ $(filter %.c %.o,$^) $(VKTEST_LIBS)
 	@echo "built $@"
 # Real profiler/recorder integration; Python drives isolated launch modes and JSONL rotation.
-.PHONY: vkgpuproftest
+.PHONY: vkgpuproftest vkgpuprofcompacttest
 vkgpuproftest: $(OUT)/vkgpuproftest $(OUT)/vkdraw-seed/.done
+# Same production worker fixture, without shader seeds or a Vulkan instance.
+vkgpuprofcompacttest: $(OUT)/vkgpuproftest
 vktest: $(OUT)/vkgpuproftest
 $(OUT)/vkgpuproftest: $(TOTK)/android/gfx/test_vk_gpuprof.c $(VKTEST_SRC) $(TOTK)/android/gfx/vk_int.h $(TOTK)/android/gfx/vk_record.h $(TOTK)/android/gfx/vk_load_proof.h
-$(OUT)/vkgpuproftest: $(TOTK)/android/gfx/vk_gpuprof_time.h
+$(OUT)/vkgpuproftest: $(TOTK)/android/gfx/vk_gpuprof_time.h $(TOTK)/android/gfx/vk_gpuprof_pipe.h
+$(OUT)/vkgpuproftest: $(TOTK)/android/gfx/vk_gpuprof_compact.h $(TOTK)/android/gfx/vk_gpuprof_fixture.h
+$(OUT)/vkgpuproftest: $(TOTK)/android/gfx/vk_gpuprof_sink.h
 	@mkdir -p $(dir $@)
 	$(CC) $(VKTEST_FLAGS) -o $@ $(filter %.c,$^) $(VKTEST_LIBS)
 	@echo "built $@"

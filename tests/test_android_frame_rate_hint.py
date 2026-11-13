@@ -43,7 +43,8 @@ class AndroidFrameRateHint(unittest.TestCase):
 static pthread_once_t config_once = PTHREAD_ONCE_INIT;
 static int rate_on, fps60, framegen, lattice, auto40, hold_launch, hold_logged = -1;
 static unsigned rate_request;
-static _Atomic unsigned content_rate = 60, rate_override;
+static _Atomic unsigned content_rate = 60;
+static _Atomic float rate_override;
 static _Atomic uint64_t generated_presents;
 static uint64_t generated_seen, now = 1000000000;
 static totk_rate_hold rate_hold;
@@ -77,6 +78,7 @@ static void (*surface_rate)(ASurfaceTransaction *, ASurfaceControl *, float, int
 typedef void *jobject, *jclass, *jmethodID;
 typedef unsigned char jboolean;
 typedef int jint;
+typedef float jfloat;
 typedef const struct fake_jni *JNIEnv;
 #define JNI_FALSE 0
 typedef struct { JNIEnv *env; jobject clazz; } ANativeActivity;
@@ -86,7 +88,7 @@ struct fake_jni {
     void (*DeleteLocalRef)(JNIEnv *, jobject);
     jboolean (*ExceptionCheck)(JNIEnv *);
     void (*ExceptionClear)(JNIEnv *);
-    jboolean (*CallBooleanMethod)(JNIEnv *, jobject, jmethodID, jint);
+    jfloat (*CallFloatMethod)(JNIEnv *, jobject, jmethodID, jint);
 };
 static int jni_failure, jni_exception, jni_queries, jni_clears;
 static jclass object_class(JNIEnv *env, jobject obj) {
@@ -95,20 +97,21 @@ static jclass object_class(JNIEnv *env, jobject obj) {
     return obj;
 }
 static jmethodID method_id(JNIEnv *env, jclass cls, const char *name, const char *signature) {
-    (void)env; assert(!strcmp(name, "supportsFrameRateHint") && !strcmp(signature, "(I)Z"));
+    (void)env; assert(!strcmp(name, "selectFrameRateHint") && !strcmp(signature, "(I)F"));
     if (jni_failure == 2) { jni_exception = 1; return NULL; }
     return cls;
 }
 static void delete_ref(JNIEnv *env, jobject obj) { (void)env; (void)obj; }
 static jboolean exception_check(JNIEnv *env) { (void)env; return jni_exception; }
 static void exception_clear(JNIEnv *env) { (void)env; jni_exception = 0; jni_clears++; }
-static jboolean call_boolean(JNIEnv *env, jobject obj, jmethodID method, jint hz) {
-    (void)env; assert(obj && method && hz == 120);
+static float advertised_rate = 120;
+static jfloat call_float(JNIEnv *env, jobject obj, jmethodID method, jint hz) {
+    (void)env; assert(obj && method && (hz == 120 || hz == -1));
     if (jni_failure == 3) jni_exception = 1;
-    return jni_failure != 4;
+    return jni_failure == 4 ? 0 : advertised_rate;
 }
 static const struct fake_jni jni = {
-    object_class, method_id, delete_ref, exception_check, exception_clear, call_boolean
+    object_class, method_id, delete_ref, exception_check, exception_clear, call_float
 };
 '''
         source += section(frontend, 'static jmethodID surface_parent_method(',
@@ -127,7 +130,8 @@ int main(void) {
     assert(totk_frame_rate_hint_parse("120", &parsed) && parsed == 120);
     assert(totk_frame_rate_hint_parse("00120", &parsed) && parsed == 120);
     assert(totk_frame_rate_hint_parse("2147483647", &parsed) && parsed == 2147483647u);
-    const char *bad[] = {"120.0", "119.88", "+120", "-120", " 120", "120 ", "120Hz", "0x78", "nan", "inf", "2147483648", "9999999999999999999999999"};
+    assert(totk_frame_rate_hint_parse("max", &parsed) && parsed == UINT32_MAX);
+    const char *bad[] = {"MAX", "max ", " max", "120.0", "119.88", "+120", "-120", " 120", "120 ", "120Hz", "0x78", "nan", "inf", "2147483648", "9999999999999999999999999"};
     for (size_t i = 0; i < sizeof bad / sizeof *bad; i++) {
         parsed = 99; assert(!totk_frame_rate_hint_parse(bad[i], &parsed) && !parsed);
         settings("1", bad[i]); assert(!totk_perf_rate_request());
@@ -200,6 +204,21 @@ int main(void) {
     hold_launch = 0; rate_frame(2, 33333333); assert(totk_perf_rate() == 30);
     totk_perf_window(&window); totk_perf_surface(&tx, &surface);
     assert(window_calls == 2 && surface_calls == 2 && window_hz == 30 && surface_hz == 30);
+    settings("1", "max"); framegen = lattice = 0;
+    rate_frame(1, 16666667); assert(totk_perf_rate() == 60); /* Unknown display falls back. */
+    assert(totk_perf_rate_request() == UINT32_MAX);
+    advertised_rate = 119.88f;
+    frame_rate_hint_update(&activity); assert(totk_perf_rate() == 119.88f);
+    totk_perf_window(&window); totk_perf_surface(&tx, &surface);
+    assert(window_hz == 119.88f && surface_hz == 119.88f); /* No integer truncation on either target. */
+    advertised_rate = 144;
+    frame_rate_hint_update(&activity); assert(totk_perf_rate() == 144); /* Display migration revalidates. */
+    jni_failure = 4;
+    frame_rate_hint_update(&activity); assert(totk_perf_rate() == 60); /* Stale authority withdrawn. */
+    jni_failure = 0;
+    totk_perf_rate_override(0.0f / 0.0f); assert(totk_perf_rate() == 60);
+    totk_perf_rate_override(1.0f / 0.0f); assert(totk_perf_rate() == 60);
+    totk_perf_rate_override(-120); assert(totk_perf_rate() == 60);
     return 0;
 }
 '''
@@ -217,7 +236,7 @@ int main(void) {
         javac, java = shutil.which('javac'), shutil.which('java')
         if not javac or not java:
             self.skipTest('A JDK 17+ is required')
-        method = section(ACTIVITY.read_text(), '    public boolean supportsFrameRateHint(',
+        method = section(ACTIVITY.read_text(), '    public float selectFrameRateHint(',
                          '    /** Native UI thread only, after its explicit parent transaction succeeded.')
         source = r'''
 class Log { static int warnings; static void w(String tag, String text) { warnings++; } }
@@ -239,22 +258,30 @@ public class HintProbe {
     static void require(boolean value) { if (!value) throw new AssertionError(); }
     public static void main(String[] args) {
         HintProbe activity = new HintProbe();
-        require(!activity.supportsFrameRateHint(120)); // no default-display fallback
+        require(activity.selectFrameRateHint(120) == 0); // no default-display fallback
         activity.window.decor.display = new Display(4, 60, 120.00001f);
-        require(activity.supportsFrameRateHint(120));
-        require(!activity.supportsFrameRateHint(90));
-        require(!activity.supportsFrameRateHint(0));
+        require(activity.selectFrameRateHint(120) == 120);
+        require(activity.selectFrameRateHint(90) == 0);
+        require(activity.selectFrameRateHint(0) == 0);
+        require(activity.selectFrameRateHint(-1) == 120.00001f);
         activity.window.decor.display = new Display(7, 60); // moved/recreated on another display
-        require(!activity.supportsFrameRateHint(120));
-        require(activity.supportsFrameRateHint(60));
+        require(activity.selectFrameRateHint(120) == 0);
+        require(activity.selectFrameRateHint(60) == 60);
+        require(activity.selectFrameRateHint(-1) == 60);
         activity.window.decor.display = new Display(7, 119.88f, 120.02f, Float.NaN, Float.POSITIVE_INFINITY);
-        require(!activity.supportsFrameRateHint(120));
+        require(activity.selectFrameRateHint(120) == 0);
+        require(activity.selectFrameRateHint(-1) == 120.02f);
+        activity.window.decor.display = new Display(7, 60, 119.88f, 90);
+        require(activity.selectFrameRateHint(-1) == 119.88f);
         activity.window.decor.display = new Display(7);
-        require(!activity.supportsFrameRateHint(120));
+        require(activity.selectFrameRateHint(120) == 0);
+        require(activity.selectFrameRateHint(-1) == 0);
+        activity.window.decor.display = new Display(7, -1, 0, Float.NaN, Float.POSITIVE_INFINITY);
+        require(activity.selectFrameRateHint(-1) == 0);
         activity.window.decor.display.failed = true;
-        try { activity.supportsFrameRateHint(120); throw new AssertionError("exception must reach JNI refusal"); }
+        try { activity.selectFrameRateHint(120); throw new AssertionError("exception must reach JNI refusal"); }
         catch (IllegalStateException expected) {}
-        require(Log.warnings == 6);
+        require(Log.warnings == 8);
     }
 }
 '''

@@ -3,13 +3,16 @@
    JNI_OnLoad below; NativeActivity has already loaded the same library, so both share one runtime. Its drawings come
    from <game>/companion/, which the app's setup generates from the player's RomFS (Java AssetStore).
      boolean nativeEnabled()           -> TOTK_COMPANION != "0", queried after NativeActivity has read totk.env
+     boolean nativeCoverEnabled()      -> TOTK_COMPANION_COVER != "0" with companion enabled (default on)
+     String nativeCoverSetting()       -> raw requested cover option, or "unset", for the policy log
+     void nativeCoverLog(String message)-> native stderr / totk.log (also available when the companion is off)
      String snapshot(int detail)        -> companion_snapshot() JSON for the running game
      boolean action(int kind, int arg)  -> kind 1: press and release Switch button `arg` (libnx Npad bit index)
      int request(String action, String category, int slot, String actor, int partition, long pouchGen)
                                         -> companion_request(): an item action for the game's frame end (seq > 0, or
                                            -1 busy, -2 refused now, -3 unsupported / disabled, -4 invalid)
      String result(int seq)             -> companion_result() JSON, null for an unknown seq
-   With TOTK_COMPANION=0 every entry point returns its "off" value without reading or calling anything in the game. */
+   With TOTK_COMPANION=0 every game-facing entry point returns its "off" value without inspecting the game. */
 #include "companion.h"
 #include "autoload.h"
 #include "host_os.h"
@@ -17,6 +20,9 @@
 #include "world_survey.h"
 #include "android_pause.h"
 #include <jni.h>
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -42,6 +48,33 @@ static jboolean JNICALL native_enabled(JNIEnv *env, jclass cls) {
     (void)env; (void)cls;
     const char *option = getenv("TOTK_COMPANION");
     return !option || strcmp(option, "0") ? JNI_TRUE : JNI_FALSE;
+}
+static jboolean JNICALL native_cover_enabled(JNIEnv *env, jclass cls) {
+    const char *option = getenv("TOTK_COMPANION_COVER");
+    return native_enabled(env, cls) && (!option || strcmp(option, "0")) ? JNI_TRUE : JNI_FALSE;
+}
+static jstring JNICALL native_cover_setting(JNIEnv *env, jclass cls) {
+    (void)cls;
+    const char *option = getenv("TOTK_COMPANION_COVER");
+    return (*env)->NewStringUTF(env, option ? option : "unset");
+}
+/* Same sink as all native runtime diagnostics: frontend_android.c log_start redirects fd 2 to totk.log.
+   Do not gate diagnostics on native_enabled: the one cover-off policy line must remain observable too. */
+static void JNICALL native_cover_log(JNIEnv *env, jclass cls, jstring message) {
+    (void)cls;
+    if (!message) return;
+    const char *text = (*env)->GetStringUTFChars(env, message, NULL);
+    if (!text) return;
+#if defined(__ANDROID__)
+    if (!strncmp(text, "cover requested=", 16)) {
+        fprintf(stderr, "[TotkCompanion] %s logcat_min_priority=%d logcat_info=%d logcat_warn=%d\n", text,
+                __android_log_get_minimum_priority(),
+                __android_log_is_loggable(ANDROID_LOG_INFO, "TotkCompanion", ANDROID_LOG_INFO),
+                __android_log_is_loggable(ANDROID_LOG_WARN, "TotkCompanion", ANDROID_LOG_INFO));
+    } else
+#endif
+    fprintf(stderr, "[TotkCompanion] %s\n", text);
+    (*env)->ReleaseStringUTFChars(env, message, text);
 }
 
 static int guest_read(uint64_t a, void *out, size_t n) { return host_safe_read(a, out, n); }
@@ -162,6 +195,9 @@ __attribute__((visibility("default"))) jint JNI_OnLoad(JavaVM *vm, void *reserve
     if (!cls) { (*env)->ExceptionClear(env); fprintf(stderr, "[companion] CompanionNative class not found\n"); return JNI_VERSION_1_6; }
     static const JNINativeMethod methods[] = {
         {"nativeEnabled", "()Z", (void *)native_enabled},
+        {"nativeCoverEnabled", "()Z", (void *)native_cover_enabled},
+        {"nativeCoverSetting", "()Ljava/lang/String;", (void *)native_cover_setting},
+        {"nativeCoverLog", "(Ljava/lang/String;)V", (void *)native_cover_log},
         {"snapshot", "(I)Ljava/lang/String;", (void *)native_snapshot},
         {"action", "(II)Z", (void *)native_action},
         {"request", "(Ljava/lang/String;Ljava/lang/String;ILjava/lang/String;IJ)I", (void *)native_request},

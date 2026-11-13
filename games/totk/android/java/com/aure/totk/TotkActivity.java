@@ -88,19 +88,24 @@ public final class TotkActivity extends NativeActivity {
     }
 
     /** Native UI thread, on each window/display lifecycle update. This is an app-local content-rate request,
-     * not a preferred mode or Android setting; allow only integer Hz advertised by this window's own display.
-     * 0.01 Hz tolerates the float representation (e.g. 120.00001), not a distinct fractional refresh mode. */
-    public boolean supportsFrameRateHint(int hz) {
+     * not a preferred mode or Android setting. -1 selects the highest advertised rate, including fractional Hz.
+     * Integer requests retain the 0.01 Hz matching tolerance; 0 means no validated override. */
+    public float selectFrameRateHint(int hz) {
         Display display = getWindow().getDecorView().getDisplay();
-        if (hz > 0 && display != null) {
+        float highest = 0;
+        if ((hz > 0 || hz == -1) && display != null) {
             for (Display.Mode mode : display.getSupportedModes()) {
-                if (Math.abs((double)mode.getRefreshRate() - hz) <= 0.01) return true;
+                float rate = mode.getRefreshRate();
+                if (!Float.isFinite(rate) || rate <= 0) continue;
+                if (hz == -1) highest = Math.max(highest, rate);
+                else if (Math.abs((double)rate - hz) <= 0.01) return hz;
             }
         }
-        Log.w("TotkPerf", "TOTK_FRAME_RATE_HINT_HZ=" + hz + " refused: "
+        if (highest > 0) return highest;
+        Log.w("TotkPerf", "TOTK_FRAME_RATE_HINT_HZ=" + (hz == -1 ? "max" : hz) + " refused: "
                 + (display == null ? "window has no display" : "not advertised by window display " + display.getDisplayId())
                 + "; retaining existing policy");
-        return false;
+        return 0;
     }
 
     /** Native UI thread only, after its explicit parent transaction succeeded.

@@ -630,6 +630,10 @@ VkQueryPipelineStatisticFlags vk_gpuprof_stats_mask(void);
 void vk_gpuprof_secondary(int enabled);
 int vk_gpuprof_chunk_query(VkQueryPool *pool, uint32_t *query);
 void vk_gpuprof_draw(vk_shader *const shaders[6]);
+extern int vk_gpuprof_pipeline_on; /* launch-time group budget, 0 disables all group work */
+void vk_gpuprof_pipeline_begin(VkCommandBuffer cb, VkPipeline pipeline, vk_shader *const shaders[6]);
+void vk_gpuprof_pipeline_count(int prim, uint32_t count, uint32_t instances, int indexed);
+void vk_gpuprof_pipeline_break(VkCommandBuffer cb); /* before clears/pass end; secondary ends are ordered recorder events */
 void vk_gpuprof_dispatch_begin(VkCommandBuffer cb);
 void vk_gpuprof_present(void); /* recording lock; CPU closure; sampled sealed-CB path submits one end-marker slot */
 #ifdef TOTK_VK_TESTS
@@ -721,3 +725,5 @@ typedef struct { tex_t t; int ok; view_t v; int has_v; } vk_treg;
 int vk_treg_get(int tid, vk_treg *out);      /* a copy, taken under the registry lock (the game registers from its own threads) */
 int vk_treg_kind(int tid, int *format, int *target);   /* effective format/target, atomically published by registry writers */
 uint64_t vk_treg_revision(void);                    /* acquire: every registration, texture epoch or pool-size change invalidates stage signatures */
+
+#include "vk_sections.h"

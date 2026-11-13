@@ -303,8 +303,15 @@ static void lag_native_guard_liveness(uint8_t *base) {
             d->vertex[0].lag_reason = NVN_DIRTY_LAG_READONLY | NVN_DIRTY_LAG_COLD;
             d->count = 0; d->instances = 1; d->base_instance = 0;
             vk_record_draw_commit();
+            uint64_t pass_end_wait = vk_record_test_walk_wait();
             int parked = vk_gpuprof_on ? vk_record_pass_end_profiled(primary, NULL) : vk_record_pass_end(primary);
             CHECK(parked, "bind-only recorder pass is parked for worker assembly");
+            if (split) {
+                vk_record_test_flush_jobs();
+                CHECK(vk_record_test_wait_paused(), "bind-only pass worker remains gated at logical pass end");
+                CHECK(vk_record_test_walk_wait() == pass_end_wait,
+                    "bind-only logical pass end never waits for its gated recording worker");
+            }
             (void)vk_record_next_primary();
         }
         VkBufferCopy copy = {.srcOffset = offset, .size = 256};
@@ -1735,6 +1742,18 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < 16u << 20; i += 4) *(uint32_t *)(g + i) = (uint32_t)i ^ 0x9e3779b9u;
     uint8_t *P = g, *Q = g + (32u << 20);            /* pool P: 16 MiB at the start; Q: 1 MiB, later */
     mtl_init();
+    const char *one_primary = getenv("TOTK_VK_REC_ONE_PRIMARY");
+    const char *occlusion = getenv("TOTK_VK_OCCLUSION"), *statistics = getenv("TOTK_VK_GPU_PROFILE_STATS");
+    const char *framegen = getenv("TOTK_FRAMEGEN");
+    int inline_capture = framegen && (!strcmp(framegen, "1") || !strcmp(framegen, "interp") ||
+        !strcmp(framegen, "hybrid") || !strcmp(framegen, "locked") || !strcmp(framegen, "adaptive"));
+    int primary_queries = (occlusion && *occlusion && strcmp(occlusion, "0")) ||
+        (statistics && !strcmp(statistics, "1") && (!vk_record_enabled() || inline_capture));
+    CHECK(vk_one_primary_on == (one_primary && !strcmp(one_primary, "1") && !primary_queries),
+        "requested one-primary launch arm or documented query fallback is effective");
+    if (argc == 2 && !strcmp(argv[1], "--lag-guards"))
+        CHECK(vk_lag_capture_on(), "lag-guard matrix really enables protected frame lag");
+    uint64_t sections_before[6], sections_serial = vk_submit_serial(); vk_sections_test_counts(sections_before);
     uint64_t failure_ticket = mtl_last_fence() + 1;
     vk_record_lag_fail(failure_ticket); vk_record_lag_fail(failure_ticket + 1);
     CHECK(vk_record_test_take_failure(failure_ticket), "later failure cannot hide an earlier slot failure");
@@ -2013,6 +2032,12 @@ int main(int argc, char **argv) {
     CHECK(!memcmp(P + (4u << 20), keep, 4096), "contents kept when the pool is removed");
     CHECK(!mtl_addr((uint64_t)(uintptr_t)P, 16, &b, &off), "removed pool no longer resolves");
     P[0] = 0x55; CHECK(P[0] == 0x55, "guest memory writable after removal");
+    if (vk_one_primary_on) {
+        uint64_t sections_after[6]; vk_sections_test_counts(sections_after);
+        CHECK(sections_after[0] - sections_before[0] == vk_submit_serial() - sections_serial,
+            "copy/uniform/event/counter/lag-guard submissions each begin exactly one main primary");
+        CHECK(sections_after[5] == sections_before[5], "direct Vulkan and lag-guard sections require no fallback");
+    }
     printf("%s: %d checks, %d failed\n", fails ? "FAILED" : "ok", checks, fails);
     return fails != 0;
 }

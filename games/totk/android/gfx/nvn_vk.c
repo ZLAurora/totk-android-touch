@@ -48,6 +48,7 @@ extern void vk_fg_snapshot_pressure_trace(unsigned owner_states,unsigned generat
 VK_DEVICE_FUNCS(VK_DEF)
 #undef VK_DEF
 vk_dev V;
+#include "vk_sections.inc"
 #define g_dev V.dev
 static _Atomic uint64_t g_memory_live[VK_MEMORY_PURPOSES], g_memory_created[VK_MEMORY_PURPOSES];
 VkResult vk_memory_allocate(const VkMemoryAllocateInfo *info, VkDeviceMemory *memory, vk_memory_purpose purpose) {
@@ -854,6 +855,7 @@ static void vk_init_once(void) {
 #define DL(name) name = (PFN_##name)vkGetDeviceProcAddr(V.dev, #name);
     VK_DEVICE_FUNCS(DL)
 #undef DL
+    vk_sections_init();
 #if defined(__ANDROID__) && defined(TOTK_ANDROID_APP)
     vk_fg_qcom_device(gipa,vkGetDeviceProcAddr,qcom_interop);
     vk_fg_lsfg_device(gipa,vkGetDeviceProcAddr,qcom_interop);
@@ -2267,7 +2269,8 @@ void vk_submit_optional_cancel(void) {
     /* Only before signal/adoption: neither claimed slot has a submitted use. */
     if (!g_cur || !g_optional_next || g_replay_pending || g_cur->adopted)
         DIE("invalid optional pre-submit cancellation");
-    VKCHECK(vkEndCommandBuffer(g_cur->cb));
+    if (vk_one_primary_on) vk_sections_cancel();
+    else VKCHECK(vkEndCommandBuffer(g_cur->cb));
     if (vk_gpuprof_on) vk_gpuprof_slot_cancel(&g_cur->gpuprof);
     pthread_mutex_lock(&g_mu);
     g_cur->busy=g_optional_next->busy=0;
@@ -2399,6 +2402,7 @@ static void slot_descriptors_recycle(slot_t *s) {
     s->dstock_on = want;   /* switched on: the stock starts empty on reset pools */
 }
 static void slot_open(slot_t *s) {
+    if (ordered_fallback) atomic_fetch_add_explicit(&ordered_counts[5], 1, memory_order_relaxed);
     VK_REC_DO(VK_REC_O_RESET,
     if (!s->pool) {
         VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -2431,7 +2435,11 @@ static void slot_open(slot_t *s) {
     if (s->primary) s->cb = s->primary[0];
     s->nprimary = 1;
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
-    VK_REC_DO(VK_REC_O_PRIMARY, VKCHECK(vkBeginCommandBuffer(s->cb, &bi)));
+    if (vk_one_primary_on) vk_sections_reset((unsigned)(s - g_ring), s->cb);
+    else {
+        VK_REC_DO(VK_REC_O_PRIMARY, VKCHECK(vkBeginCommandBuffer(s->cb, &bi)));
+        ordered_note_primary(0);
+    }
     s->pre_open = 0; s->ts_on = 0;
     s->adopted=VK_NULL_HANDLE;
     if (ts_ok()) {
@@ -2460,6 +2468,7 @@ static void barrier_host(VkCommandBuffer cb) {   /* GPU writes become visible to
 VkCommandBuffer vk_cb(void) { if (!g_cur) slot_begin(); return g_cur->cb; }
 static VkCommandBuffer record_next_primary_inner(void) {
     slot_t *s = g_cur; if (!s) DIE("deferred rendering has no submission slot");
+    if (vk_one_primary_on) return s->cb;
     if (s->nprimary >= s->capprimary) {
         uint32_t old = s->capprimary, count = old ? old * 2 : 16;
         s->primary = VK_REALLOC(s->primary, (size_t)count * sizeof *s->primary);
@@ -2470,7 +2479,7 @@ static VkCommandBuffer record_next_primary_inner(void) {
     }
     s->cb = s->primary[s->nprimary++];
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
-    VKCHECK(vkBeginCommandBuffer(s->cb, &bi)); return s->cb;
+    VKCHECK(vkBeginCommandBuffer(s->cb, &bi)); ordered_note_primary(0); return s->cb;
 }
 VkCommandBuffer vk_record_next_primary(void) { return VK_REC_VALUE(VK_REC_O_PRIMARY, record_next_primary_inner()); }
 VkCommandBuffer vk_pre_cb(void) {
@@ -2478,6 +2487,7 @@ VkCommandBuffer vk_pre_cb(void) {
     if (!g_cur->pre_open) {
         VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
         VKCHECK(vkBeginCommandBuffer(g_cur->pre, &bi)); g_cur->pre_open = 1;
+        ordered_note_primary(1);
         if (vk_gpuprof_on) vk_gpuprof_slot_pre(g_cur->gpuprof, g_cur->pre);
         if ((g_gpu_time_hardware || (vk_fg_enabled() && vk_fg_interpolating())) && g_cur->ts_on) {
             vkCmdResetQueryPool(g_cur->pre, g_cur->ts, 2, 1);
@@ -2603,6 +2613,7 @@ static int submit_async_on(void) {
 }
 /* Exactly one queue caller per mode: the walking owner in inline mode, this FIFO owner in async mode. */
 static void slot_queue(slot_t *s, int background) {
+    if (vk_one_primary_on) vk_sections_finish((unsigned)(s - g_ring));
     VkCommandBufferSubmitInfo cbi[2] = {{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->pre}, {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->cb}};
     VkSubmitInfo2 si = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = s->pre_open ? 2 : 1, .pCommandBufferInfos = s->pre_open ? cbi : cbi + 1};
     VkSemaphoreSubmitInfo signal, wait;
@@ -2788,6 +2799,12 @@ static uint64_t slot_submit_inner(int with_posts, vk_pass_end_kind reason) {
     if (!ub_private_on()) ub_flush();
     vk_end_rendering_at(reason, 0);
     vk_wb_record();   /* settled copies share this ordinary slot, after the last pass and before sealing */
+    if (vk_one_primary_on) {
+        barrier_host(g_cur->cb);
+        if (g_cur->ts_on) vkCmdWriteTimestamp2(g_cur->cb, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, g_cur->ts, 1);
+        if (vk_gpuprof_on) vk_gpuprof_slot_end(g_cur->gpuprof, g_cur->cb);
+        vk_sections_seal();
+    }
     vk_record_slot_seal((unsigned)(g_cur - g_ring));
     totk_ft_count(FT_COUNT_CHUNKS, 1); /* one logical sealed slot, not each primary/secondary buffer */
     int asynchronous = submit_async_on();
@@ -2816,10 +2833,12 @@ static uint64_t slot_submit_inner(int with_posts, vk_pass_end_kind reason) {
         g_replay_releases=0;
         pthread_mutex_unlock(&g_mu);
     }
-    barrier_host(s->cb);
-    if (s->ts_on) vkCmdWriteTimestamp2(s->cb, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, s->ts, 1);
-    if (vk_gpuprof_on) vk_gpuprof_slot_end(s->gpuprof, s->cb);
-    VKCHECK(vkEndCommandBuffer(s->cb));
+    if (!vk_one_primary_on) {
+        barrier_host(s->cb);
+        if (s->ts_on) vkCmdWriteTimestamp2(s->cb, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, s->ts, 1);
+        if (vk_gpuprof_on) vk_gpuprof_slot_end(s->gpuprof, s->cb);
+        VKCHECK(vkEndCommandBuffer(s->cb));
+    }
     if (s->pre_open) { barrier_host(s->pre); VKCHECK(vkEndCommandBuffer(s->pre)); }
     if (with_posts && g_ncarry) {
         if (s->cap < g_ncarry) { s->cap = g_ncarry; s->post = VK_REALLOC(s->post, (size_t)s->cap * sizeof *s->post); }

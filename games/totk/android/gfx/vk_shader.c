@@ -217,6 +217,9 @@ static int deps_match(const char *deps, const answers_t *a) {
 
 /* ---------- shaders ---------- */
 typedef struct { char variant[80]; uint32_t early_tests, position_policy; } shader_key;
+/* Published objects and their inline key never move or die. Variant-list refresh,
+   program release and seed-IO shutdown do not own them; pipeline workers and the
+   asynchronous profiler borrow them for the process lifetime. */
 static nvn_hmap g_shaders = {.klen = sizeof(shader_key)};
 static int earlyz_on(void) { static int v = -1; if (v < 0) v = vk_earlyz_enabled(getenv("TOTK_VK_EARLYZ")); return v; }
 static inline uint32_t ctl_key_len(const uint8_t *control) { uint32_t n; memcpy(&n, control + 0x20, 4); return n >= 0x7cc && n < 0x880 ? n : 0x880; }

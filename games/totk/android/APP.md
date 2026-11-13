@@ -374,7 +374,16 @@ Final readback retained universal1b, the exact three-line profile and original d
 hashes matched the fresh user manifest (only CacheStorageKey.dat changed), no held slots remained,
 and both display controllers reported OFF after normal sleep.
 
-**Odin 3 ordinary play:** retain the existing opt-in profile:
+**Odin 3 ordinary play:** the menu's Snapdragon 8 Elite-class (`CQ8725S` / `SM8750`) 60 fps profile generates
+`TOTK_FPS60_HYSTERESIS=1` and `TOTK_FRAME_LAG=1` only at native 60 fps with frame generation off, including
+first run, existing stores and custom 60 fps mixes. Keep GPU busy retains its independent chip default.
+Developer `totk.env` is read afterward: explicit `TOTK_FRAME_LAG=0` disables lag. Other chips, 30/40/Unlimited
+and frame generation retain their prior settings. Do not add a chunk override: resolved lag automatically uses
+600 draws when native VMA pressure is absent (otherwise 75), preserving explicit developer overrides.
+Capped cross-device tests improved Odin static 57.1→59.8 / 59.2→59.9 fps and pan 58.4→59.5 / 58.2→59.5;
+33 ms counts fell 20/1800→1/1800 static and 148/5100→31/5400 pan. The descriptive pan p99 tail rose
+23.3→27.8 ms: throughput/cadence gains are not a tail or input-responsiveness guarantee. Duo tails worsened
+and capped Thor was neutral, so neither gains the default. Additional ordinary-play opt-ins remain:
 
 ```ini
 TOTK_VK_REC_THREADS=2
@@ -1509,6 +1518,28 @@ other than exactly `0` retain the existing default-on behavior; an eligible seco
 This is a startup option, not a live file watcher: edit `totk.env` before restarting the app. `--no-companion`
 instead omits the companion Java and assets at build time and keeps the original `android.app.NativeActivity`.
 
+The companion uses an opaque, non-interactive cover beneath the unchanged Presentation on built-in secondary
+displays by default. Exact `TOTK_COMPANION_COVER=0` in `totk.env` turns it off; unset, `1` and other values keep
+it on. It requires the companion enabled and does nothing for single-screen or external displays.
+Start waits for owner window focus and top-resumed readiness.
+Ordinary touch/game-input reclaim keeps its window-focus guard; separate one-use, token-bound 1000 ms startup recovery
+may front the verified, still-resumed game task after the cover takes top-resumed state. Creation waits for no gesture;
+recovery stays within its deadline and is checked on final UP/CANCEL. Pause, close, competing top-resumed loss, or a
+stale/expired token suppresses it. The cover remains non-focusable and non-interactive.
+
+Tested only with Cocoon: the launcher was stopped in every cover-on launch on Retroid Pocket Duo and AYN Thor.
+Duo launches started from the launcher pooled 28.70 → 29.22 fps and 101 → 40 frames over 50 ms per 24 windows;
+the frame-rate difference is inside the comparison tool's tolerance, while the tool rates the pooled result better.
+Thor launcher CPU use fell from about 27% of one core to about 0.05%, and compositor CPU use from about 19% to
+about 17%, with no frame-rate change (44.80 → 45.32 fps standing; 44.65 → 44.69 fps panning).
+Cover start/finish/refusal/restart/policy/recovery diagnostics use `[TotkCompanion] cover ...` in canonical
+`<game>/totk.log`, independently of Android INFO filtering. The policy line retains the raw startup request:
+`requested=unset effective=true` for an eligible default-on launch, or `requested=0 effective=false` for opt-out.
+The existing `TOTK_LOGCAT=1` opt-in mirrors the file to Android logcat under tag `totk`, where platform filtering may
+still drop INFO; inspect `totk.log`. With the switch off, the native query, disabled CoverSession allocation and
+policy log remain, but no cover activity/window, reclaim or cover lifecycle callback registration occurs.
+Owner stop/dismiss/close and process teardown clean up the cover. This startup setting requires restarting the app.
+
 Startup ordering is deliberate: `TotkActivity.onCreate` first calls `NativeActivity.super.onCreate`, which invokes
 `ANativeActivity_onCreate`; its `start_game` reads `totk.env` synchronously. Only after `super.onCreate` returns does
 Java query the native runtime switch and, if enabled, construct the controller. There is no second environment-file
@@ -1738,6 +1769,48 @@ the script checks `run-as` before creating an export and reports the limitation 
 To export data while preserving it, install a dev APK signed with the same key over the release APK **without
 uninstalling**, run the export, then install the release APK again if wanted. Do not uninstall between builds: that
 deletes app data, including saves. Both builds must use the same signing key for an in-place update.
+
+### November 11 list-only shader update
+
+The current list adds 301 applicable V rows from MacNativeGames `a8ff9bc429bf451dd1040807c6dae6fa2a0cba55`,
+selected through switch2mac's engine pin. `UPSTREAM_MERGE.md` records the exact provenance, exclusions
+and previous import. All existing R/S/C and V rows remain; no upstream packed R or A/B/T/S rows are imported.
+The list digest is now `9b00d9a9083df6d2d8667969f9b105192851fd7e52d7fa93874ff0a7e5eb90b9`.
+The October 27 identity/count tables below are historical, not the identity of this refreshed list.
+
+Installing an updated APK alone keeps an already completed seed usable: there is no automatic
+shader-list epoch gate in `InstallState`. Use the setup UI's explicit shader rebuild to gain the
+new coverage; it rebuilds the full default-plus-listed seed from the player's existing game files,
+not just the added rows. The changed digest prevents reuse of an interrupted old-list preparation.
+The translation chain remains `totk-native-v5-unverified`; no translator update or forced cache wipe
+is part of this data refresh. Driver pipeline caches are keyed by driver/TU_DEBUG/Vulkan identity,
+not the APK/list digest. Seed-bound warm-run comparisons must nevertheless use the same rebuilt seed;
+new variants/pipelines can still need first-use work. Preserve saves and never uninstall to refresh.
+For desktop-generated seeds, retain existing exact loose variant names and use explicit `--shaders`
+as described below; these host measurements do not replace that retention/deployment gate.
+
+Fresh host runs of the production Android C seed stage (four services, current-source isolated
+Linux Vulkan translator, same authenticated 1.4.3 inputs) measure:
+
+| Quantity | Before | Refreshed |
+|---|---:|---:|
+| Default translation requests / completed default variants | 12,456 | 12,456 |
+| Listed translation requests | 24,864 | 25,165 |
+| Completed listed variants after dependency deduplication | 12,327 | 12,576 |
+| SPIR-V modules / total completed variants | 24,783 | 25,032 |
+| Packed bytes | 1,479,997,164 | 1,509,968,940 |
+| Full generation wall time (seconds, one run each) | 37.43 | 40.56 |
+
+That is **249 net modules and 29,971,776 bytes** more, not 301 modules. Both runs have zero
+failed translations; these are not the historical Metal/SPIRV-Cross seed or a retained deployed seed.
+Fresh dependency deduplication selects two different listed representative names; their old SPIR-V
+and reflection bytes have identical same-key replacements. Desktop deployment must still retain
+persisted exact names. Host timings are observations, not phone update-time estimates or a controlled
+performance benchmark. Source/prebuilt translators, installed seeds and caches were not replaced.
+
+Device qualification remains required: time the update's cold full shader rebuild and scratch/storage
+cost, compare first-use hitches on the same cold-area route, and inspect the picture (depth/alpha,
+textures, effects and UI). No steady-state FPS gain or hitch elimination is promised.
 
 ### Refresh the shader seed after the October 27 upstream additions
 
@@ -2207,7 +2280,8 @@ one. `TOTK_INPUT_LOG=1` in `totk.env` logs each −/R decision as `[chord] …`.
 
 Set `TOTK_OVERLAY=fps` (or `1`) for the frame rate alone, or `full` for the native performance panel.
 The compact first row merges real/presented FPS, real-frame milliseconds and mode (`HH` handheld,
-`DK` docked, from `runtime_handheld_mode()`). With FG off, only the real FPS appears.
+`DK` docked, from `runtime_handheld_mode()`). With FG off, the real and presented handoffs are the same,
+so the single FPS value covers both; it is not a separate count of submitted/rendered-but-unpresented work.
 The second row uses `960x540->1920x1080 BILIN+BILIN`, for example; equal sizes print one size.
 `BILIN` means bilinear/linear stretch, `FSR1` the game's docked EASU or host FSR1, and `SGSR` host SGSR.
 Only non-1:1 stages appear, in game scene → guest canvas, then host canvas → front-buffer order.
@@ -2232,6 +2306,19 @@ readable battery discharge current × voltage shows `PWR`, meaningful USB/input 
 and standard `battery/temp` shows `BAT …C`. Unavailable sensors are silently omitted; temperature is the
 battery sensor, not an inferred GPU/SoC temperature. A dedicated background sampler reads sysfs at most 1 Hz.
 The option reserves its row even when sensors are unavailable, preventing layout jitter.
+
+System telemetry is separately **off by default**: `TOTK_OVERLAY_SYS=1` reserves two extra rows in `full`
+(never in `fps`). `THM 0 H0.42 CPU6 0.75 CAP`, for example, shows Android's thermal status (0–6),
+current thermal headroom, and the current/hardware-max frequency ratio of the policy containing `g-main`'s
+sampled last host CPU. `CAP` means readable `scaling_max_freq` is below `cpuinfo_max_freq`; no marker is
+not proof of no cap when the cap counter is unreadable. CPU migration follows the next sample, not a guessed cluster.
+`RAM available/totalM RSS residentM` uses `/proc/meminfo` MemAvailable/MemTotal and `/proc/self/status` VmRSS,
+all in MiB. Missing/invalid values are omitted; both rows keep their space. The existing background sampler
+does all proc/sysfs/thermal reads at most 1 Hz while full is shown, with no per-frame system work.
+Headroom (API 30+) refreshes at most every 10 seconds as Android requires; status needs API 29+.
+Unsupported APIs, denied sysfs and NaN headroom hide only their fields. Compare a screenshot with
+`dumpsys thermalservice`, `/proc/meminfo`, the game's `VmRSS` and that CPU's `cpufreq` files; use matching
+full-overlay runs with/without SYS to measure overhead. `[totk-overlay] sys=0|1` records the startup switch.
 `TOTK_OVERLAY=0` / `off` leaves the picture untouched (release default; dev default is `full`).
 `TOTK_OVERLAY_POS=tl|tr|bl|br` selects the corner (default `tr`). `TOTK_OVERLAY` is the start mode; in app builds
 the − then R shortcut (see Controls) changes it live, so presenter images always carry `TRANSFER_DST` and the
@@ -2286,9 +2373,10 @@ For device A/B use `TOTK_OVERLAY=full`, `TOTK_OVERLAY_POS=tr`, `TOTK_VK_PRESENT=
 `TOTK_VK_PRESENT=ahb` and verify the AHB log has no copy fallback.
 The host fixture is `make -C games/totk/android vktest-overlay TARGET=linux CC=cc OUT=<scratch>/overlay`;
 run `vkoverlaytest` in fresh processes with the desired env, or `vkoverlaytest --bench` for uncached CPU raster cost.
-`vkoverlaytest --power <absent scratch directory>` runs synthetic sysfs power-source fixtures without device access.
+`vkoverlaytest --power <absent scratch directory>` runs synthetic power, CPU-frequency and proc-memory fixtures without device access.
 `vkoverlaytest --render-layout <output.ppm>` renders a controlled FG example without a game/device;
-`TOTK_OVERLAY_POWER=1` adds its optional sensor row. `--bench-record` measures the warmed production
+`TOTK_OVERLAY_POWER=1` adds its optional sensor row; `TOTK_OVERLAY_SYS=1` adds deterministic system examples.
+`--bench-record` measures the warmed production
 recorder; `TOTK_OVERLAY=off` is the empty control and `TOTK_OVERLAY_BENCH_FG=qcom` exercises the FG template.
 `vkdrawtest --overlay-scene` (also `vkdrawtest-app`) submits real MRT/depth draws to check aligned DRS sizes,
 clear-open → viewport-change → first-draw ordering, same-pass viewport updates, scene exclusions, and disabled
@@ -3844,7 +3932,7 @@ Mac build uses lets the controller drop to one display tick whenever a frame's w
 60 then only renders a few surplus frames. On the AYN Thor that was 31.8 fps at 4.94 W against 30.0 fps at 4.81 W.
 `TOTK_FPS60=1` in `totk.env` turns the patch on.
 
-The menu's **Frame rate** choices are **30 / 40 / 60 fps**; no preset or device recommendation changes.
+The menu's **Frame rate** choices are **30 / 40 / 60 fps / Unlimited**; no preset or device recommendation changes.
 **40 fps** is a real-game-update cap, not frame generation, and keeps measured `TOTK_REALTIME=1` game speed.
 Smoothest on 120 Hz displays; on 60 Hz it is uneven. The app requests an advertised 120 Hz mode through its
 window/SurfaceControl hints, but cannot override the user's peak-refresh setting or other Android policy.
@@ -3871,18 +3959,51 @@ retain their existing behavior. It selects slots from the observed display clock
 Measure delivered-fence/SurfaceFlinger interval shares near 25 ms versus 16.7/33.3 ms and record effective
 display mode; producer fps alone cannot show even pacing.
 
+**Unlimited** lets real-game frame rate vary with available CPU/GPU headroom, up to the existing **120 fps safety
+ceiling**. It may run hotter and use more battery, and is best with a high-refresh screen. Frame generation and
+frame lag are off; latency is fixed. The 1.4.3 realtime clock is unchanged (five-sample measured step, 1/15 s hitch
+cap, no artificial minimum step that could accelerate jittery frames). Scripted cameras still impose a 33.333 ms
+producer floor. This is a variable producer, not a promise of 120 delivered fps or uniform panel intervals.
+The menu writes `TOTK_FPS60=1 TOTK_UNCAPPED=1 TOTK_UNCAPPED_HZ=120 TOTK_UNCAPPED_INTERVAL=1`,
+`TOTK_REALTIME=1 TOTK_FRAME_LAG=0 TOTK_FPS_AUTO=0 TOTK_PACE=0 TOTK_PRESENT_SLOTS=0`,
+`TOTK_ACQUIRE_SLACK=0 TOTK_ACQUIRE_CLOCK=0 TOTK_FRAME_RATE_HINT=1 TOTK_FRAME_RATE_HINT_HZ=max`.
+Fixed slots and acquire slack stay off so neither rounds the variable producer to a display lattice. The highest
+advertised refresh rate (fractional rates included) is requested through the existing window/AHB FIXED_SOURCE
+hints; missing display/query support falls back to the existing content-rate policy. Android/user refresh limits
+still win. Returning to 30/40/60 or any preset removes all Unlimited-only lines; frame generation returns to real30.
+For qualification, select Unlimited from the menu, warm its pipeline cache, and measure Hateno delivered fps,
+frame/fence intervals, actual panel mode, temperatures and HUD-clock progress against wall time. Check a
+scripted/title-screen camera separately for the 30 fps floor; an accepted refresh hint is not panel evidence.
+Host qualification: 800 Python tests passed (44 optional/configuration skips with the signed release APK),
+160 setup tests passed (20 skips), plus native FPS60 patch/floor, present-slot, acquire-clock, display-pace and
+acquire-slack fixtures. Settings probes pin the existing rate/preset bytes and every Unlimited transition; rate
+fixtures cover integer/max/fractional requests, display migration, JNI refusal and both hint targets.
+**Device qualification is pending (Odin locked):** no delivered-fps, interval, panel-mode, HUD-clock/game-speed,
+thermal-load or camera-floor smoke result is claimed. The attempted smoke did not reach the menu or game; RC8,
+the unchanged 60-fps/GPU-busy profile and stayon 0 were restored, with the device left asleep.
+
+**Benchmark clock (not a frame-rate policy):** launch with `TOTK_BENCH_TIME=HH:MM` (`00:00`–`23:59`),
+using the same value in both arms; absent/`off` leaves all clock bytes unchanged and allocates no veneer.
+Malformed values log one rejection and stay off. This overrides cutscene/sleep time changes, schedules,
+day rollover and blood-moon progression: use restored saves only, never normal play. Weather, wind, clouds
+and randomness remain uncontrolled. Retain the single `[totk-bench-time]` effective-time line and qualify
+HUD/sky through load, static, pan and reload; unchanged save behavior is not yet device-qualified.
+
 | Frame-rate option | Android default | Effect |
 | --- | --- | --- |
 | `TOTK_FPS60` | `0` | `1` permits the game's 60-fps controller; `0` retains the shipping 30-fps minimum interval. |
 | `TOTK_FPS60_HYSTERESIS` | `0` (native) when unset; menu writes `1` only for Snapdragon 8 Elite-class native 60 fps | Startup-only, FPS60/v143: raise after seven consecutive over-budget decisions instead of three, then reload cooldown 2 instead of 6. `<game>/totk.env` `=0` overrides the menu. Compare interval-2 share/episode length and missed-refresh tails; details below. |
 | `TOTK_FPS_AUTO` | `0` (off) | `1`, only with `TOTK_FPS60=1`, selects effective 60/30 presentation intervals from measured sustainability; guest code is not repatched. |
 | `TOTK_GPU_TIME` | `hardware` when `TOTK_FPS60` is unset/`0`; `latency` when `TOTK_FPS60=1` | Android shipping-30 mode defaults to replay-free hardware-equivalent GPU reports. Explicit `hardware` or `latency` overrides either mode; unknown values log and retain latency. DRS also consumes these reports; they are not physical busy-time measurements. |
-| `TOTK_FRAME_LAG` | `0` on every platform and in every FPS mode | Only explicit `TOTK_FRAME_LAG=1` enables protected lag; unset, `0` and every other value leave it off. |
+| `TOTK_FRAME_LAG` | Runtime unset: `0`; Android menu writes `1` only for Snapdragon 8 Elite-class native 60 fps | Only exact `1` enables protected lag. First-run and saved 60 fps settings without frame generation gain the line; every other chip/mode retains its prior policy. Developer `totk.env` `=0` wins. |
 | `TOTK_VK_CHUNK_DRAWS` | `75` by default; `600` when resolved lag is on and native VMA pressure is absent | Explicit positive value or `0` wins (`0` disables automatic chunking). The resolved startup policy is logged once. |
 | `TOTK_VK_SPLIT_PASS_DRAWS` | `0` (off) | `n > 0` ends a still-open pass after `n` draws, submits that part through the chunk path and reopens the same targets with `loadOp=LOAD`. Each split adds a store and load of every attachment on tiled GPUs; try 512 or 256 and read `[split-pass]` every 300 presents (VULKAN.md). |
 | `TOTK_VK_REC_THREADS` | `2` on Android; `0` on other platforms | Explicit `0` keeps the synchronous recorder for A/B; positive overrides select up to four workers. `TOTK_VK_GPU_PROFILE` retains workers, including when pass sampling is enabled; other diagnostic guards still force inline recording. Keep profiler and sample/statistics settings fixed when comparing worker counts (VULKAN.md). |
+| `TOTK_VK_REC_ONE_PRIMARY` | `0` (off) | Experimental, startup-only: exact `1` records each submitted chunk into one main command buffer instead of one per render pass. Auxiliary command buffers retain their order; diagnostic fallbacks and recorder details are documented in VULKAN.md. |
 | `TOTK_VK_GPU_PROFILE` | `0` (off) | `1` collects pass-part timings with recorder workers; `2` also logs every split; `3` also retains a per-frame ring and dumps every over-threshold frame's observed passes. Every 300-frame window writes schema-3 aggregates by exact key + scene reference + scene role; ordinal `0` means all frame ordinals. Without `GPU_PROFILE_SAMPLE`, every pass is timed as before. Absolute areas remain available for driver joins and DRS-aware families (VULKAN.md). Compare profiling-off/on separately before interpreting performance. |
 | `TOTK_VK_GPU_PROFILE_SAMPLE` | `0` (full profiling unchanged) | With `GPU_PROFILE=1/2/3`, a strict positive integer `1`–`16` limits timestamped/statistics-enabled pass parts per frame; recommended **`2`**, initially with stats off. Deterministic ordinal rotation retains all observed keys, draws and scene metadata. Each frame also has one completion-accurate whole-main-frame timestamp pair; actual profiler-owned `vkCmdWriteTimestamp2` `timestamp_count` (including deferred assembly ends, excluding independent game reports) is at most `2k+2`, without pre/slot envelopes. If Android has already submitted the final command buffer before CPU present, SAMPLE adds **one small marker-only main submission** for the real end timestamp; the query-count bound still holds, but that extra submission has explicit cost. Pass `gpu_ms` is sampled-only, never an extrapolated total. Use the analyzer's whole-interval coverage, sampled mean and histogram percentiles; absent/`0` keeps the old full mode. |
+| `TOTK_VK_GPU_PROFILE_PIPELINES` | `0` (off) | With `GPU_PROFILE=1/2/3`, `1`–`16` adds at most `2k` GPU timestamp writes/frame for contiguous actual-pipeline + full VS/FS-variant groups (compute separate), independently of pass sampling. Start with `GPU_PROFILE=1 SAMPLE=2 PIPELINES=4 STATS=0`. Default output is sampled-key 300-frame compact windows with interned exact variants, actual inclusion weights and explicit coverage/loss; global per-frame JSON rows are suppressed, pass/window aggregates remain. Estimates are withheld on true loss/missing authority. Calibrate off/on with the same APK in ABBA order (VULKAN.md). |
+| `TOTK_VK_GPU_PROFILE_PIPELINES_RAW` | `0` (compact) | Exact `1` restores per-group `pipeline`, per-lease/frame `pipeline_coverage` and global `frame` JSON rows when pipeline mode is enabled; other values stay compact. Read once and logged as `[gpu-profile] pipeline-output=compact/raw`. RAW is intentionally large and useful for same-run estimator/debug comparisons, not long captures. Pipeline profiling off leaves parent output unchanged. |
 | `TOTK_VK_GPU_PROFILE_STATS` | `0` (off) | `1` adds six pipeline counters when supported: IA vertices/primitives, VS invocations, clipping invocations/primitives and fragment invocations. Secondary-chunk queries sum into their pass; missing counters are absent, not fabricated zeros. In sampled mode only selected passes get queries; those queries still perturb sampled passes, so sampled durations are representative only if instrumentation does not serialize/change the GPU workload. Device A/Bs must compare GPU clock time-in-state against an unprofiled control, not only instantaneous MHz. |
 | `TOTK_VK_GPU_PROFILE_ORDINALS` | `0` (off) | `1` restores per-ordinal window aggregates; every other value uses compact ordinal-`0` aggregates. Read once at launch and logged as `[gpu-profile] window ordinals=0/1`. Raw mode-2 split logs and mode-3 `long_frame` rows always keep their actual positive frame ordinals. Compare row counts/JSONL bytes with the same route and profile/stats settings; not a measured device-cost reduction. |
 | `TOTK_VK_GPU_PROFILE_MAX_BYTES` | `134217728` (128 MiB) | Maximum bytes per JSONL file (4096–1073741824); rotate complete rows through `.1`, `.2`, `.3`, retaining at most four bounded files per launch. Each file repeats launch/build/package/config/driver metadata. Window sequences and rotation indices expose missing/evicted coverage; normal app close writes writer success and independent query-retirement accounting in `session_end`. |
@@ -3895,9 +4016,14 @@ display mode; producer fps alone cannot show even pacing.
 | `TOTK_ADPF` | Existing render-only session (unset/`legacy`) | `0` disables all CPU hints; `full` opts into the bounded critical-thread group, profile-derived targets and wait-stripped work reporting. |
 | `TOTK_ADPF_TARGET_MS` | `33.3` | Existing render-only target override; nonpositive disables the legacy session. Retained for existing profiles; ignored by `TOTK_ADPF=full`. |
 | `TOTK_FRAME_RATE_HINT` | `0` | `1` requests FIXED_SOURCE content cadence through the window and zero-copy SurfaceControl. It is only a request, never evidence of a panel-mode change. |
-| `TOTK_FRAME_RATE_HINT_HZ` | unset (`0`, off) | Startup-only integer decimal Hz override; needs `TOTK_FRAME_RATE_HINT=1` and a matching mode advertised by the current window display. Invalid/unavailable rates retain the existing policy. See below. |
+| `TOTK_FRAME_RATE_HINT_HZ` | unset (`0`, off) | Startup-only integer decimal Hz or `max` for the highest advertised window-display rate; needs `TOTK_FRAME_RATE_HINT=1`. Invalid/unavailable rates retain the existing policy. See below. |
 | `TOTK_RATE_HINT_HOLD` | unset (`0`) | With `TOTK_FRAME_RATE_HINT=1`: `N` ms requests the window's output rate (game interval, frame generation) held at the highest of the last N ms; 0 keeps the configured rate. Live through `totk.ctl`. See below. |
 | `TOTK_ADPF_GPU` | `0` (off) | `1` reports each frame's span (the game's frame origin, else its first submit, to its present, less acquire pacing) against 90 % of the configured period (15 ms native60, else 30 ms), plus on API 35+ the GPU time of the newest completed frame once. Live through `totk.ctl`. See below. |
+
+**Pipeline-profiler qualification limit: ≤30 fps captures** (Duo, or Thor with a 30-fps cap).
+The 600-second 30-fps model passes; 45-fps/uncapped Thor is **not qualified**. This is a
+capture-support boundary, not an automatic game-rate clamp. Uncapped captures must retain/check
+the footer and drop counters; any lost coverage fails closed in analysis. Profiling stays default-off.
 
 The timing profiler has no speculative LOAD-before-clear/STORE-without-observed-read audit.
 It retains static attachment load/store operations and logical byte estimates from pass keys.
@@ -4008,10 +4134,11 @@ change still logs `window frame-rate hint=`. Measure the number of those lines a
 
 `TOTK_FRAME_RATE_HINT_HZ=120` plus `TOTK_FRAME_RATE_HINT=1` is an experimental app-side FIXED_SOURCE
 request on both the native window and actual AHB child. Unset/empty/`0` keeps the exact existing hint
-policy. Only integer decimal Hz is accepted (no signs, fractions or suffixes); the current window's
+policy. Integer decimal Hz is accepted (no signs, fractions or suffixes); the current window's
 `decorView.getDisplay().getSupportedModes()` must advertise that rate within 0.01 Hz, allowing float
-rounding such as 120.00001 but not substituting a distinct fractional mode. There is no default-display
-fallback. Window creation/recreation and existing readiness/configuration/focus/resume callbacks
+rounding such as 120.00001 but not substituting a distinct fractional mode. `max` instead selects the highest finite
+positive rate advertised by that same display, retaining its fractional Hz through both native hint targets.
+There is no default-display fallback. Window creation/recreation and existing readiness/configuration/focus/resume callbacks
 revalidate against the current window display; a missing display, unadvertised rate or JNI failure logs
 a refusal and restores the old hint policy. A validated override takes precedence over per-frame
 content-rate recomputation and `TOTK_RATE_HINT_HOLD`, but changes no game/presentation pacing.
@@ -4695,10 +4822,11 @@ Historical latency-mode runs dropped Lookout Landing in the rain to the controll
 one-frame-late waits (`TOTK_FRAME_LAG=1`) then restored 30 fps at about 1.1 W more. Thor's newer
 comparison identifies overstated latency-mode GPU reports (about 9–12 ms), not missing frame lag,
 as the cause of those controller drops: lag off plus hardware reports reaches 29.93 fps, minimum
-29.6, versus 27.71 fps, minimum 22.6, with lag on plus latency. Protected lag now defaults **off on
-every platform and in every FPS mode**; only exact `TOTK_FRAME_LAG=1` enables it, and every other
-value leaves it off. Android shipping-30 defaults to hardware reports; FPS60=1 and other platforms/BOTW
-retain latency. Explicit GPU-time overrides and the hybrid lag opt-in remain unchanged.
+29.6, versus 27.71 fps, minimum22.6, with lag on plus latency. Protected lag remains runtime-unset **off
+on every platform**; the Android menu now generates `TOTK_FRAME_LAG=1` only for Snapdragon 8 Elite-class
+native60 without frame generation, using the capped Odin evidence above. Explicit developer `=0` wins;
+every other value besides exact `1` leaves lag off. Android shipping-30 defaults to hardware reports;
+FPS60=1 and other platforms/BOTW retain latency. Explicit GPU-time overrides and the hybrid opt-in are unchanged.
 The open shadow report occurred in a round-nine lag-plus-slab-driver run; lag causation remains unestablished.
 `TOTK_VK_CHUNK_DRAWS` defaults to **75** with default-off lag, or **600** when resolved lag is on
 and native VMA pressure is absent, otherwise **75**; an explicit value wins, including 0 to disable chunking.
@@ -4799,8 +4927,9 @@ interval 2 means 60 fps, not 30. This switch does not force the panel into a mod
 
 **Game speed:** do not equate 77.9 rendered fps with a proven 1.30x world clock. The stock frame-step producer is
 frame dependent, but this port defaults `TOTK_REALTIME` on. `game_patches_v143.c:runtime_frame_step_update`, called
-by `nvnQueuePresentTexture` before each present, averages five measured frame intervals, clamped to 1/120..1/15 s,
-and stores ratio = seconds × 30, seconds, and interval = seconds × 60. `patch_realtime` replaces the nominal
+by `nvnQueuePresentTexture` before each present, averages five measured frame intervals with a 1/15 s hitch cap
+(no 1/120 s minimum, so short/jittery frames do not accelerate game time), and stores ratio = seconds × 30,
+seconds, and interval = seconds × 60. `patch_realtime` replaces the nominal
 producer at main+0x3e5658, retaining its half-step selector and FrameRateMgr arithmetic; it also patches the global
 ratio producer at +0x2daa54..+0x2daa78. Thus 77.9 fps is inside the real-time patch's range: [INFERENCE] consumers of
 these steps should advance at wall-clock speed, not 77.9/60 speed. `patch_secondary_animation` separately corrects

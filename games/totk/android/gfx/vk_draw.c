@@ -1087,6 +1087,7 @@ static void end_rendering_inner(vk_pass_end_kind reason, uint32_t detail) {
     }
     g_feedback_avoided += R.feedback_continued - (uint32_t)R.feedback_restore;
     VkCommandBuffer cb = vk_cb();
+    if (vk_gpuprof_pipeline_on) vk_gpuprof_pipeline_break(cb);
     if (R.secondary) {
         int parked;
         if (__builtin_expect(vk_gpuprof_on, 0)) {
@@ -3406,6 +3407,7 @@ static void clear_color(const p_clear_color *c) {
     VkClearAttachment ca = {VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)c->index, v};
     VkClearRect cr = {clear_rect(), 0, 1};
     if (cr.rect.extent.width && cr.rect.extent.height) {
+        if (vk_gpuprof_pipeline_on) vk_gpuprof_pipeline_break(vk_cb());
         if (R.secondary) vk_record_clear(&ca, &cr); else vkCmdClearAttachments(vk_cb(), 1, &ca, 1, &cr);
         if (pso_life_active() && full && (c->mask & 15) == 15) PL.color_clear |= 1u << c->index;
         pso_life_view_write(R.ctex[c->index], PL.color_view[c->index], VK_IMAGE_ASPECT_COLOR_BIT,
@@ -3435,6 +3437,7 @@ static void clear_ds(const p_clear_ds *c) {
     VkClearRect cr = {clear_rect(), 0, 1};
     if (cr.rect.extent.width && cr.rect.extent.height) {
         if (as & VK_IMAGE_ASPECT_DEPTH_BIT) g_clear_inline_d++;
+        if (vk_gpuprof_pipeline_on) vk_gpuprof_pipeline_break(vk_cb());
         if (R.secondary) vk_record_clear(&ca, &cr); else vkCmdClearAttachments(vk_cb(), 1, &ca, 1, &cr);
         if (pso_life_active() && full && (!sm || sm == 255)) PL.depth_clear |= as;
         for (unsigned bit = VK_IMAGE_ASPECT_DEPTH_BIT; bit <= VK_IMAGE_ASPECT_STENCIL_BIT; bit <<= 1)
@@ -4600,6 +4603,11 @@ enum { DS_CACHE = 2048 };
 static struct { uint64_t sub, hash[2]; VkDescriptorSetLayout dsl; size_t n; VkDescriptorSet set; } g_dsc[DS_CACHE];
 static struct { uint64_t sub; VkPipelineLayout layout; VkDescriptorSet set; } g_bound_set[2][6];   /* [graphics, compute][set index] */
 static void descriptor_unbind(void) { memset(g_bound_set, 0, sizeof g_bound_set); }
+/* A fresh walker secondary inherits no pipeline, dynamic or descriptor state.
+ * Descriptor contents remain cached; only binding-elision state is invalid. */
+void vk_draw_secondary_reset(void) {
+    descriptor_unbind(); g_bound_pipe = VK_NULL_HANDLE; g_dyn_dirty = 1;
+}
 static uint64_t g_stat_sets_new, g_stat_sets_reused;
 /* Hash both identities in one word-wise pass over the zero-filled infos. The second uses add/multiply/rotate rather
    than the first's xor/multiply/shift, not just another seed of the same hash. */
@@ -5869,6 +5877,7 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
             }
         }
     }
+    if (vk_gpuprof_pipeline_on) vk_gpuprof_pipeline_begin(cb, p, sh);
     if (R.secondary) g_record_draw = vk_record_draw_begin(p, layout);
     else { VK_REC_DO(VK_REC_CMD, if (p != g_bound_pipe) { vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p); g_bound_pipe = p; }); }
     { static const char *vt = (const char *)1; if (vt == (const char *)1) vt = getenv("TOTK_VK_PASS_DUMP_VSTEX");
@@ -5913,6 +5922,8 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     uint32_t inst = dw ? (dw->instances > 1 ? (uint32_t)dw->instances : 1) : (di->instances > 1 ? (uint32_t)di->instances : 1);
     uint32_t base_inst = dw ? (uint32_t)dw->base_instance : (uint32_t)di->base_instance;
     if (!VK_REC_VALUE(VK_REC_VERTEX, draw_buffers(cb, sh[0], dw, di, prim, count, inst, base_inst))) return;
+    if (vk_gpuprof_pipeline_on && !(dw && prim == 7 && count < 4))
+        vk_gpuprof_pipeline_count(prim, count, inst, di != NULL);
     if (g_record_draw) { vk_record_draw_commit(); g_record_draw = NULL; }
     overlay_scene_draw();
 
@@ -5984,7 +5995,12 @@ static void dispatch(const p_dispatch *dp) {
     pd_dispatch(sh[5], grid);
     int pi = pp_begin(cb, 1);
     if (vk_gpuprof_on) { vk_gpuprof_dispatch_begin(cb); vk_gpuprof_draw(sh); }
+    if (vk_gpuprof_pipeline_on) {
+        vk_gpuprof_pipeline_begin(cb, p, sh);
+        vk_gpuprof_pipeline_count(-1, 0, 0, 0);
+    }
     vkCmdDispatch(cb, grid[0], grid[1], grid[2]);
+    if (vk_gpuprof_pipeline_on) vk_gpuprof_pipeline_break(cb);
     shader_xlate_first_command(sh[5], "dispatch");
     if (vk_fg_extract_active && grid[0] && grid[1] && grid[2]) fg_extract_compute(sh);
     vk_barrier_all(cb);
@@ -6577,8 +6593,12 @@ void vk_pd_write_note(const char *what, uint64_t dst, uint64_t n, const void *da
 /* ---------- present: count frames; TOTK_VK_SHOT=<n> saves every n-th presented image as PNG (headless check) ---------- */
 static uint64_t g_present_n, g_present_t0, g_last_ticket; static double g_pres_t[64];
 static uint32_t crc_table[256];
+static pthread_once_t crc_once = PTHREAD_ONCE_INIT;
+static void crc_init(void) {
+    for (uint32_t i = 0; i < 256; i++) { uint32_t v = i; for (int k = 0; k < 8; k++) v = v & 1 ? 0xedb88320u ^ (v >> 1) : v >> 1; crc_table[i] = v; }
+}
 static uint32_t crc32_(const uint8_t *p, size_t n, uint32_t c) {
-    if (!crc_table[1]) for (uint32_t i = 0; i < 256; i++) { uint32_t v = i; for (int k = 0; k < 8; k++) v = v & 1 ? 0xedb88320u ^ (v >> 1) : v >> 1; crc_table[i] = v; }
+    pthread_once(&crc_once, crc_init);
     c = ~c; for (size_t i = 0; i < n; i++) c = crc_table[(c ^ p[i]) & 0xff] ^ (c >> 8); return ~c;
 }
 
@@ -9059,7 +9079,7 @@ static void *presenter(void *arg) {
     uint64_t retire_logged_generation=UINT64_MAX;
     int retire_logged_active=-1,retire_logged_qualified=-1;
     int retire_qualified=0; /* existing Thor/AFME admission, not transient scene readiness */
-    unsigned hinted_rate = 0;
+    float hinted_rate = 0;
 #endif
     for (;;) {
 #ifdef __ANDROID__
@@ -9204,7 +9224,7 @@ static void *presenter(void *arg) {
         pthread_mutex_unlock(&g_win_mu);
 #ifdef __ANDROID__
         if (b->generated) totk_perf_generated();   /* TOTK_RATE_HINT_HOLD: frame generation is running */
-        unsigned requested_rate = totk_perf_rate();
+        float requested_rate = totk_perf_rate();
         if (w && requested_rate != hinted_rate) {
             totk_perf_window(w);
             if (surface && tx) totk_perf_surface(tx, surface);

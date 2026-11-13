@@ -141,6 +141,14 @@ label (`thor`, `odin`, `duo`, or a new one for another device). `B="tools/bench/
    preset use `--target-fps 30` (default 48 s). Keep the duration/cycle/direction schedule identical in both arms.
    Each pan records frequency limits and raw cumulative GPU counter snapshots immediately before/after motion
    (`freqs.txt`, `gpu-time-in-state.jsonl`), then takes a screenshot outside the measured motion. Check `$OUT/shots/`.
+   Motion executes as one device-side event/sleep/reverse/sleep/release batch with equal half-duration sleeps.
+   Release is the **first operation after the timed second half**, before any final-frame/GPU/frequency reads;
+   snapshot latency must never keep the stick deflected. Keep both halves and the first direction identical across
+   corresponding sessions. This removes host/control asymmetry, not game camera dynamics or OS scheduling noise.
+   INT/TERM waits are interruptible: cancellation stops the owned device command/sleep through an exceptional
+   direct-root request and releases both axes, rather than queuing behind the busy broker. Temporary
+   `<game>/.bench-pan-<host-pid>` control data is removed on completion/cancellation. A failed batch follows the
+   same cleanup; untrappable SIGKILL can only rely on the device batch's finite duration.
    Repeat steps 5–6 and 9 for the other scenes; the sampler stays running across repeated pans.
 10. **Stop the sampler** (`kill %1` in the same shell, else `kill <pid>`, or Ctrl-C; it removes its device loop) and
     **collect**: `tools/bench/collect.sh -s <serial> --device <label> --out $OUT`. It must report 0 GPU/SMMU fault
@@ -168,6 +176,10 @@ label (`thor`, `odin`, `duo`, or a new one for another device). `B="tools/bench/
     4. Delete both zips from `/sdcard/Download` and stop the app.
     5. End the persistent root shell: `python3 tools/bench/rootsh.py -s <serial> stop` (`status` then prints
        "not running").
+    6. **Final step: put the screen to sleep** (`adb -s <serial> shell input keyevent KEYCODE_SLEEP`), then verify
+       `dumpsys power` reports `mWakefulness=Asleep` or `Dozing`. Include this in the restore receipt. Root force-stop
+       when needed: `adb -s <serial> shell su -c 'am force-stop --user 0 com.aure.totk'`. Restore the original numeric
+       stayon value exactly, never an assumed default; do not alter caps/governors/thermals for the benchmark.
 
 ## Reading the results
 
@@ -250,6 +262,55 @@ power, thermals and latency: retain a capped 60-preset round for user-facing acc
 uncapped results or compare either to the other's baseline. Preserve the previous `totk.env`, restore it after the
 experiment and restart to restore normal behavior; benchmark tooling never enables uncapped mode by default.
 
+
+## Compile and scene admission
+
+Read each measured window's `compilation` and the console `COMPILES` flags. Frame-keyed `[nvn-vk]` stutter rows
+provide graphics synchronous/worker build counts and milliseconds, plus new-pipeline creations (which can include
+cache-backed creation; **do not add them to build counts**). Pan/run/arm/block summaries show `compile_windows`,
+`compile_covered_windows` and observed count totals. Compiling windows are retained, never silently dropped:
+report them as a possible confound and repeat under the same cache/warm-up policy if necessary.
+Missing telemetry is null, not zero. Current shader-translation and compute messages lack always-on frame-keyed
+counts, so those counts are unavailable. The overlay `COMPILE` row is a synchronous-only rolling second, not a
+300-frame log count and not evidence that async work stopped.
+
+Optional before each pan: `--warmup-calm-windows 2 --warmup-timeout 120`. Default is **off**. This waits for two
+fresh consecutive 300-present reports with zero graphics creations/sync builds/worker builds, polling a bounded
+log tail every 3 s; stale history, missing reports and gaps cannot satisfy it. `warmups.jsonl` retains newly
+observed reports, elapsed time and `calm` / `timeout` / `unavailable`; the analyzer prints/retains the label even if
+the bounded wait did not become calm. Measurement still proceeds, and compiling measured windows stay visible.
+This does **not** prove shader/compute quiescence or an empty work queue. Apply the same warm-up policy to both arms;
+maximum timeout is 3600 s, never an unbounded wait.
+
+Time of day and weather are **not exposed by the current game log or performance overlay**; `scene_state` records
+them as unavailable, never inferred from wall time or save names. Use the same named save/camera/settle procedure,
+retain screenshots and describe visible scene differences manually. Do not claim scene equivalence from missing data.
+
+## Restart-quartet A/B (launch-only switches)
+
+Use **O1 → B1 → B2 → O2**, one restart per session, with separately collected/analyzed directories and matching
+save, settle, pan durations/directions, cache, caps, power and thermal admission. Do **not** concatenate reset frame
+counters or invent live-switch marks. Analyze each session with current `analyze.py`, then:
+
+```sh
+python3 tools/bench/abtest.py --restart-quartet \
+  "$OUT/O1/result.json" "$OUT/B1/result.json" "$OUT/B2/result.json" "$OUT/O2/result.json" --ref O
+```
+
+This distinctly labelled **restart-quartet** mode needs the same device/scene set, measured windows, and explicit
+matching pan direction/stick schedules (`pans[].direction` from `D` in pans.txt). Re-analyze old logs to obtain that
+metadata. Mixed capped/uncapped sessions are rejected, not pooled. Inspect each source result's compile/cap/power/
+GPU-residency caveats; the tool does not prove physical scene equivalence.
+
+Pairs are **B1−O1 and B2−O2**, equal weight per session; pooled metrics are recomputed from original windows
+(throughput remains frames/time). BETTER/WORSE requires pooled **and** paired-mean deltas strictly beyond tolerance
+in the same direction and **both pair signs agreeing**, with no sign-test relaxation. FPS tolerance is
+**max(0.5 fps, 2% of pooled O fps)**. **|O2−O1| must be ≤ tolerance** per metric; a confirmed effect therefore also
+exceeds O-spread. Other metrics retain compare.py tolerances/rate normalization. Missing pairs/O-spread,
+excess O-spread, sign disagreement or only one delta crossing => INCONCLUSIVE. With admitted O-spread, paired
+delta inside tolerance => SAME. The report includes individual pair deltas and O-spread. Overall primary-tail and
+capped dip-confounding rules remain in force; uncapped compares throughput/tails. A quartet is not statistical
+significance and does not claim both-direction in-session confirmation. The existing mode below is unchanged.
 
 ## In-session A/B (live switches)
 

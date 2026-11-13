@@ -45,11 +45,12 @@ static inline unsigned totk_frame_rate(unsigned real_hz, int framegen, int latti
 static inline unsigned totk_frame_rate_minimum(int auto40, unsigned hz) {
     return auto40 && hz < 60 ? 60 : hz;
 }
-/* Startup-only integer decimal Hz; 0/unset disables the override. The actual window display must separately
- * advertise the requested rate before it is used. Reject signs, fractions, suffixes and overflow. */
+/* Startup-only integer decimal Hz, or max (UINT32_MAX) for the current window's highest advertised rate.
+ * 0/unset disables the override; every nonzero selection is validated by the window-display query. */
 static inline int totk_frame_rate_hint_parse(const char *s, unsigned *hz) {
     *hz = 0;
     if (!s || !*s) return 1;
+    if (!strcmp(s, "max")) { *hz = UINT32_MAX; return 1; }
     unsigned value = 0;
     for (; *s; s++) {
         if (*s < '0' || *s > '9' || value > (2147483647u - (unsigned)(*s - '0')) / 10) return 0;

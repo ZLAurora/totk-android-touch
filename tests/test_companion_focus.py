@@ -1,7 +1,7 @@
 """Exercise production companion touch/focus policy with framework contract doubles.
 
 The task manager's real multi-display routing is covered on devices; the host JVM
-runs the unchanged lifecycle, gesture, and reclaim method bodies.
+runs the production lifecycle, gesture, ordinary reclaim, and bounded cover-start recovery bodies.
 """
 from pathlib import Path
 import shutil
@@ -87,12 +87,20 @@ class Presentation {
     boolean isShowing() { return showing; }
     public boolean dispatchTouchEvent(MotionEvent event) { dispatched++; return handled; }
 }
+class CoverActivity {
+    static long token;
+    static boolean top;
+    static boolean isTopResumed(long expected) { return top && expected == token; }
+}
 public final class CompanionFocusProbe {
     final Activity owner = new Activity();
     final Handler main = new Handler();
     Presentation shown;
     final ActivityManager.AppTask task = new ActivityManager.AppTask(17, "TotkActivity");
     int refreshes, dismissals;
+    boolean coverRequested;
+    final List<String> coverLogs = new ArrayList<>();
+    void logCover(String message) { coverLogs.add(message); }
     void refresh() { refreshes++; }
     void dismiss() { dismissals++; shown = null; }
 '''
@@ -105,10 +113,26 @@ TESTS = r'''
         lifecycle.onActivityResumed(owner);
         ownerTopResumed(true);
         SystemClock.now = 1000;
+        CoverActivity.token = 41; CoverActivity.top = false;
     }
     static void require(boolean condition, String reason) { if (!condition) throw new AssertionError(reason); }
     void event(int action) { shown.dispatchTouchEvent(new MotionEvent(action)); }
     void tap() { event(MotionEvent.ACTION_DOWN); event(MotionEvent.ACTION_UP); }
+    void launchCover() {
+        require(coverStartReady(), "cover launched without a focused, top-resumed owner");
+        coverRequested = true;
+        armCoverFocus(CoverActivity.token);
+        main.post(coverReturnInput);
+    }
+    void coverTop(boolean top) {
+        CoverActivity.top = top;
+        coverTopResumedChanged(CoverActivity.token, top);
+    }
+    void coverTookFocus() {
+        owner.focused = false;
+        ownerTopResumed(false);
+        coverTop(true);
+    }
     public static void main(String[] args) {
         CompanionFocusProbe p = new CompanionFocusProbe();
         switch (args[0]) {
@@ -215,6 +239,83 @@ TESTS = r'''
                 require(paused.task.moves == 0, "cancelled drag requested recovery");
                 break;
             }
+            case "cover-start-focus-loss": {
+                p.launchCover();
+                p.coverTookFocus(); // Both notifications arrive before either queued startup check.
+                p.main.drain();
+                require(p.task.moves == 1 && p.coverFocusToken == 0, "expected cover focus loss was not repaired once");
+                require(p.coverLogs.contains("cover recovery token=41 result=moved"), "recovery result missed native-log sink");
+                p.main.drainDelayed();
+                p.coverTop(true); p.main.drain();
+                require(p.task.moves == 1, "ordinary auto path or repeated top callback bypassed the one-use limit");
+                require(!p.returnInputToOwner(), "ordinary reclaim lost its window-focus guard");
+                p = new CompanionFocusProbe(); p.launchCover();
+                p.owner.focused = false; p.coverTop(true); // Cover authority can precede the owner's callback.
+                p.main.drain();
+                require(p.task.moves == 1, "stale owner top-resumed callback suppressed cover-authorized recovery");
+                break;
+            }
+            case "cover-competing-ui": {
+                p.launchCover();
+                p.coverTookFocus();
+                p.coverTop(false); // Settings/another Activity takes top-resumed before the queued checks.
+                p.main.drain(); p.main.drainDelayed();
+                require(p.task.moves == 0 && p.coverFocusToken == 0, "cover recovery fronted over competing UI");
+                require(p.coverLogs.contains("cover recovery canceled token=41 reason=competing_top_resumed"),
+                        "competing UI cancellation missed native-log sink");
+                p.coverTop(true); p.main.drain();
+                require(p.task.moves == 0, "later cover focus rearmed a canceled startup");
+                break;
+            }
+            case "cover-gesture-and-authority": {
+                p.launchCover();
+                p.owner.focused = false; p.ownerTopResumed(false);
+                p.main.drain();
+                require(p.task.moves == 0, "start/attach alone invented cover top-resumed authority");
+                p.event(MotionEvent.ACTION_DOWN);
+                p.coverTop(true); p.main.drain();
+                require(p.task.moves == 0 && p.coverFocusToken != 0, "startup interrupted or discarded an active gesture");
+                p.event(MotionEvent.ACTION_UP); p.main.drain();
+                require(p.task.moves == 1, "final UP did not complete the bounded startup recovery");
+                break;
+            }
+            case "cover-expiry-stale-coalescing": {
+                p.launchCover(); p.coverTookFocus();
+                SystemClock.now += 1001; p.main.drain();
+                require(p.task.moves == 0 && p.coverFocusToken == 0, "expired startup fronted the game");
+                p = new CompanionFocusProbe(); p.launchCover(); p.coverTookFocus();
+                p.coverTopResumedChanged(999, false); p.reclaimAfterCover(999);
+                p.returnRequested = true; p.returnRequestedAt = SystemClock.now;
+                p.main.drain();
+                require(p.task.moves == 0 && p.coverFocusToken == 0, "startup ignored existing reclaim coalescing");
+                break;
+            }
+            case "cover-lifecycle-task-guards": {
+                for (String guard : new String[]{"pause", "stop", "close", "finish", "destroy", "task-top", "task-id", "breaker"}) {
+                    p = new CompanionFocusProbe(); p.launchCover(); p.coverTookFocus();
+                    switch (guard) {
+                        case "pause": p.lifecycle.onActivityPaused(p.owner); break;
+                        case "stop": p.stopped = true; break;
+                        case "close": p.closed = true; break;
+                        case "finish": p.owner.finishing = true; break;
+                        case "destroy": p.owner.destroyed = true; break;
+                        case "task-top": p.task.info.topActivity = new ComponentName("SetupActivity"); break;
+                        case "task-id": p.inputTask = p.task; p.task.info.taskId = 99; break;
+                        case "breaker": p.autoReturnBlocked = true; break;
+                    }
+                    p.main.drain();
+                    require(p.task.moves == 0, "startup bypassed " + guard);
+                }
+                break;
+            }
+            case "cover-start-ready": {
+                require(p.coverStartReady(), "focused resumed owner was not ready");
+                p.owner.focused = false; require(!p.coverStartReady(), "unfocused owner started cover"); p.owner.focused = true;
+                p.topResumed = false; require(!p.coverStartReady(), "non-top owner started cover"); p.topResumed = true;
+                p.touchInProgress = true; require(!p.coverStartReady(), "gesture started cover"); p.touchInProgress = false;
+                p.lifecycle.onActivityPaused(p.owner); require(!p.coverStartReady(), "paused owner started cover");
+                break;
+            }
             default: throw new AssertionError("unknown scenario");
         }
         System.out.println("passed " + args[0]);
@@ -237,8 +338,11 @@ class CompanionFocusTests(unittest.TestCase):
         top = section(source, '    public void ownerTopResumed(', '    /** Coalesced')
         reclaim = section(source, '    private boolean returnInputToOwner()', '    private void dismiss()')
         touch = section(source, '            private boolean touching;', '            @Override protected void onCreate(')
+        cover_fields = section(source, '    private long coverFocusToken,', '    private final ViewTreeObserver.')
+        cover_reclaim = section(source, '    private void reclaimAfterCover(', '    private boolean startCover(')
         probe = cls.work / 'CompanionFocusProbe.java'
-        probe.write_text(PRELUDE + fields + top + reclaim + '\n    final class TouchPresentation extends Presentation {\n'
+        probe.write_text(PRELUDE + fields + cover_fields + top + reclaim + cover_reclaim
+                         + '\n    final class TouchPresentation extends Presentation {\n'
                          + touch + '\n    }\n' + TESTS)
         cls.command([javac, '--release', '17', '-d', cls.work, probe])
 
@@ -267,6 +371,24 @@ class CompanionFocusTests(unittest.TestCase):
 
     def test_overlay_focus_loss_is_debounced_and_competing_windows_stop_recovery(self):
         self.probe('automatic')
+
+    def test_cover_start_repairs_both_window_and_top_resumed_focus_loss_once(self):
+        self.probe('cover-start-focus-loss')
+
+    def test_cover_start_never_fronts_over_competing_top_resumed_ui(self):
+        self.probe('cover-competing-ui')
+
+    def test_cover_start_waits_for_positive_cover_authority_and_final_gesture_up(self):
+        self.probe('cover-gesture-and-authority')
+
+    def test_cover_start_expiry_stale_tokens_and_existing_coalescing_are_bounded(self):
+        self.probe('cover-expiry-stale-coalescing')
+
+    def test_cover_start_preserves_lifecycle_task_identity_and_breaker_guards(self):
+        self.probe('cover-lifecycle-task-guards')
+
+    def test_cover_creation_waits_for_focused_top_resumed_owner(self):
+        self.probe('cover-start-ready')
 
 
 class NativeInputFocusTests(unittest.TestCase):

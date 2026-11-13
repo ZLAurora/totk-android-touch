@@ -4,6 +4,17 @@
 
 旧打包器只复制 PSO 标识清单，没有复制标识对应的 MSL、反射和依赖索引。空缓存实测预热为 0 个着色器，清单中有 2,171 个着色器标识缺少实际翻译数据。已有存档机器上的预热效果不能代表首次安装。
 
+## Android list refresh (2026-11-11)
+
+The counts and timings below are historical Mac/iOS evidence, not current Android setup costs.
+Android's V-only refresh adds 301 rows whose keys occur in the 1.4.3 inventory, while preserving
+all existing variants and warm rows. See [the integration ledger](../games/totk/android/UPSTREAM_MERGE.md)
+for the source pin, filtering and exclusions, and [Android install guidance](../games/totk/android/APP.md)
+for rebuilding an existing install. The list digest invalidates preparation/resume identity, not
+the completed installation or driver pipeline-cache identity; updating the APK alone does not
+regenerate an existing seed. Default/listed dependency deduplication still applies, so 301 requests
+must not be advertised as 301 additional translated modules.
+
 ## 构建与启动行为
 
 1. `build_app.py` 在签名打包前，用所选版本、已经通过完整校验的本地 RomFS 准备着色器，不读取现有用户缓存。`prepare_shader_seed.py` 解压字典压缩包，扫描整个 RomFS（`Shader/` 包、SDK/Bootup 包，以及特效 `Effect/*.esetb` 和界面布局里嵌的着色器，2026-10-19 起）和游戏程序模块（main 里嵌着 BNSH），解析 BNSH/NVN 程序，也解析 agl 引擎自己的着色器包 `.sharcb`（文件头 `BAHS`：记录头里是代码在代码池的偏移、控制段大小和到控制段的有符号偏移，几个记录可以共用一个控制段）。标题画面的合成、后期处理等用的就是 agl 的着色器（`Lib/agl`、`Shader/ApplicationPackage`、`Lib/Terrain`、`Lib/gsys`），只扫 BNSH 时全部漏掉，全新安装的 iPhone 因此整屏品红。控制段有 0x880 和 0x88c 两种大小，运行时的键只算前 0x880 字节；不为旧式短 control 结构编造补齐字节。

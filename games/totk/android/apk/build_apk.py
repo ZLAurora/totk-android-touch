@@ -29,6 +29,7 @@ LABEL = 'TotK Native'
 SETUP_ACTIVITY = 'com.aure.totk.setup.SetupActivity'
 SETUP_SERVICE = 'com.aure.totk.setup.SetupService'
 GAME_ACTIVITY = 'com.aure.totk.TotkActivity'
+COVER_ACTIVITY = 'com.aure.totk.companion.CoverActivity'
 GAME_CONTROL_SERVICE = 'com.aure.totk.GameControlService'
 SETUP_PROCESS = ':setup'
 # MANAGE_EXTERNAL_STORAGE: optional All files access (direct file access, as Azahar's non-Play build); the app works
@@ -43,7 +44,8 @@ PERMISSIONS = ('android.permission.FOREGROUND_SERVICE', 'android.permission.FORE
 # android.R.attr resource ids of the manifest attributes used here (checked against aapt2 link with android.jar)
 ATTR = {
     'theme': 0x01010000, 'label': 0x01010001, 'icon': 0x01010002, 'name': 0x01010003, 'hasCode': 0x0101000c, 'debuggable': 0x0101000f,
-    'exported': 0x01010010, 'process': 0x01010011, 'launchMode': 0x0101001d, 'screenOrientation': 0x0101001e, 'configChanges': 0x0101001f,
+    'exported': 0x01010010, 'process': 0x01010011, 'taskAffinity': 0x01010012, 'excludeFromRecents': 0x01010017,
+    'launchMode': 0x0101001d, 'screenOrientation': 0x0101001e, 'configChanges': 0x0101001f,
     'value': 0x01010024, 'minSdkVersion': 0x0101020c, 'versionCode': 0x0101021b, 'versionName': 0x0101021c,
     'targetSdkVersion': 0x01010270, 'allowBackup': 0x01010280, 'isGame': 0x010103f4, 'extractNativeLibs': 0x010104ea,
     'drawable': 0x01010199, 'roundIcon': 0x0101052c, 'foregroundServiceType': 0x01010599, 'hasFragileUserData': 0x0101059a,
@@ -126,6 +128,9 @@ def manifest_tree(package, label, version_code, version_name, min_sdk, target_sd
                           (A, 'configChanges', 'hex', CONFIG_CHANGES)], [
                 ('meta-data', [(A, 'name', 'str', 'android.app.lib_name'), (A, 'value', 'str', 'totk')], []),
             ]),
+            ('activity', [(A, 'name', 'str', COVER_ACTIVITY), (A, 'exported', 'bool', False),
+                          (A, 'taskAffinity', 'str', package + '.cover'), (A, 'excludeFromRecents', 'bool', True),
+                          (A, 'launchMode', 'int', SINGLE_TASK), (A, 'configChanges', 'hex', CONFIG_CHANGES)], []),
             ('activity', [(A, 'name', 'str', 'com.aure.totk.setup.UpdateEntryActivity'), (A, 'exported', 'bool', False),
                           (A, 'process', 'str', SETUP_PROCESS), (A, 'theme', 'ref', THEME_TRANSLUCENT_FULLSCREEN)], []),
             ('service', [(A, 'name', 'str', SETUP_SERVICE), (A, 'exported', 'bool', False), (A, 'process', 'str', SETUP_PROCESS),

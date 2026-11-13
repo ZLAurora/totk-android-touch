@@ -5,6 +5,7 @@
 # go through the serial's persistent root shell (rootsh.py: one su per session, pinned to the slowest CPU cluster).
 #   press <button> [ms]   hold a built-in controller button (A B X Y L R PLUS MINUS UP DOWN LEFT RIGHT), default 150 ms
 #   rstick <x> [y]        set the right stick (ABS_Z / ABS_RZ, -32767..32767); "rstick 0" releases it
+#   pan <x> <half-s>      symmetric return pan in one device command; releases before returning, including on failure
 #   shot <file>           screenshot of the main display, written to <file> on the host
 #   log                   print the game's totk.log
 #   detect                print the detected "event=<node> display=<id>" and exit
@@ -59,7 +60,7 @@ done
 ACT=$1; shift
 
 adbs() { adb -s "$SER" "$@"; }
-root() { python3 "$HERE/rootsh.py" -s "$SER" run -c "$1"; }
+root() { python3 "$HERE/rootsh.py" -s "$SER" run --timeout "${2:-120}" -c "$1"; }
 
 detect_event() {
   root "getevent -p" | tr -d '\r' | awk '
@@ -100,6 +101,65 @@ case $ACT in
     [ $# -ge 1 ] || usage
     need_event
     root "sendevent $EV 3 2 $1; sendevent $EV 3 5 ${2:-0}; sendevent $EV 0 0 0" ;;
+  pan)
+    [ $# -eq 2 ] || usage
+    case $1 in -*) magnitude=${1#-} ;; *) magnitude=$1 ;; esac
+    case $magnitude in ''|*[!0-9]*) die "pan x must be an integer in -32767..32767" ;; esac
+    [ "$magnitude" -le 32767 ] || die "pan x must be in -32767..32767"
+    awk -v half="$2" 'BEGIN { exit !(half ~ /^([0-9]+([.][0-9]*)?|[.][0-9]+)$/ && half > 0) }' ||
+      die "pan half-s must be positive"
+    need_event
+    # No host/root-broker round trip between deflection, reversal and release. Both halves
+    # execute the same event sequence and sleep; snapshot latency cannot extend the last half.
+    CONTROL=$GAME/.bench-pan-$$
+    JOB=""
+    # Establish ownership before starting the long broker request. A cancellation marker
+    # also covers a signal between preparation and the device command's first event.
+    root "mkdir -m 700 \"$CONTROL\"" || die "cannot prepare the owned pan control directory"
+    tidy_pan() { root "rm -f \"$CONTROL/pid\" \"$CONTROL/cancel\"; rmdir \"$CONTROL\""; }
+    cancel_pan() {
+      # The broker is occupied by the pan. Only this exceptional path opens another root
+      # shell; otherwise a queued release could not interrupt the owned sleep/reversal.
+      adbs shell "su -c 'C=\"$CONTROL\"
+[ -d \"\$C\" ] && echo cancel > \"\$C/cancel\"
+p=\$(cat \"\$C/pid\" 2>/dev/null)
+case \$p in \"\"|*[!0-9]*) ;; *)
+  case \"\$(cat /proc/\$p/cmdline 2>/dev/null)\" in *\"\$C\"*)
+    children=\$(pgrep -P \"\$p\")
+    [ -z \"\$children\" ] || kill -TERM \$children 2>/dev/null
+    kill -TERM \"\$p\" 2>/dev/null ;;
+  esac ;;
+esac
+sendevent $EV 3 2 0; sendevent $EV 3 5 0; sendevent $EV 0 0 0'"
+    }
+    abort_pan() {
+      status=$?
+      trap - EXIT INT TERM
+      cancel_pan
+      [ -z "$JOB" ] || wait "$JOB" 2>/dev/null
+      tidy_pan
+      exit "$status"
+    }
+    trap abort_pan EXIT
+    trap 'exit 130' INT TERM
+    root "C=\"$CONTROL\"
+release() { sendevent $EV 3 2 0; sendevent $EV 3 5 0; sendevent $EV 0 0 0; }
+trap release EXIT
+trap 'exit 130' INT TERM
+echo \$\$ > \"\$C/pid\"
+[ ! -e \"\$C/cancel\" ] || exit 130
+sendevent $EV 3 2 $1 && sendevent $EV 3 5 0 && sendevent $EV 0 0 0 &&
+sleep $2 &&
+[ ! -e \"\$C/cancel\" ] &&
+sendevent $EV 3 2 $((0 - $1)) && sendevent $EV 3 5 0 && sendevent $EV 0 0 0 &&
+sleep $2 || exit 1
+release || exit 1
+trap - EXIT" "$(awk -v half="$2" 'BEGIN { print 2 * half + 60 }')" &
+    JOB=$!
+    wait "$JOB" || exit $?
+    JOB=""
+    trap - EXIT INT TERM
+    tidy_pan ;;
   shot)
     [ $# -ge 1 ] || usage
     need_display

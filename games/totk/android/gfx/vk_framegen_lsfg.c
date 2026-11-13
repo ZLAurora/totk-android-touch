@@ -267,8 +267,12 @@ int vk_fg_lsfg_interpolate(unsigned previous,unsigned index,uint64_t frame,float
             snprintf(s->probe.error,sizeof s->probe.error,"probe preparation failed without backend reason");
     }
     vkCmdResetQueryPool(cb,s->query,0,TOTK_LSFG_TIMESTAMPS);
-    int recorded=prepared ? L.record_probe(s->context,cb,s->query,L.error) :
-        L.record(s->context,cb,phase,s->query,L.error);
+    /* The isolated library owns its Vulkan dispatch table, so hand it the
+     * actual ordered secondary rather than the stable walking token. Keep cb
+     * itself for the existing seal-membership/provenance bookkeeping. */
+    VkCommandBuffer commands = VK_SECTION_CB(cb);
+    int recorded=prepared ? L.record_probe(s->context,commands,s->query,L.error) :
+        L.record(s->context,commands,phase,s->query,L.error);
     if (!recorded) {
         if (probe) snprintf(s->probe.error,sizeof s->probe.error,"%s",L.error);
         vk_fg_lsfg_refuse(L.error); goto done;

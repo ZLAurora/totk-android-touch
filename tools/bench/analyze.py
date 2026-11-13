@@ -34,6 +34,7 @@ import argparse, collections, datetime, json, os, re, statistics, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from benchlib import SCHEMA, caps_of_limits, device_signature, guard_output, parse_freq_tokens, sig_caps_text  # noqa: E402
 from sampler import GPU_SNAPSHOT_FILE, gpu_residency_delta, parse_gpu_snapshots, power_of_tokens  # noqa: E402
+from provenance import compilation_of, compilation_summary, compile_record, scene_state  # noqa: E402
 
 METHOD_SUMMARY = ('Default profile per device (no totk.env). Save loaded from the in-game Load list, ~55 s settle, then the '
                   'right stick held at {stick} (right, then left) via sendevent on the controller node. Only the runtime\'s own '
@@ -67,10 +68,13 @@ PRESENT_BIN_LABELS = ('<12.5', '12.5-20.9', '20.9-29', '29-37.5', '37.5-45.8', '
 def parse_log(path):
     timing, gpu, fps, stut, longf, info = {}, {}, {}, {}, [], {}
     frame_ms, near33, draw_samples = {}, {}, []
+    compilations = {}
     last_window = None
     recording, present_stats, present_bins, traces = {}, {}, {}, {}
     frame_p99 = {}
     for line in open(path, encoding='utf-8', errors='replace'):
+        if record := compile_record(line):
+            compilations[record[0]] = record[1]
         if m := re.search(r'计时 至帧 (\d+)： 帧时间 p50 ([\d.]+) / p95 ([\d.]+) / 最大 ([\d.]+) ms', line):
             timing[int(m[1])] = tuple(float(x) for x in m.groups()[1:])
         if m := re.search(r'帧间隔 至帧 (\d+)：>16\.7ms \d+ / (\d+) 帧，p99 ([\d.]+) ms', line):
@@ -117,6 +121,7 @@ def parse_log(path):
                 traces[key] = row if key not in traces or traces[key] == row else None
     info['frame_ms'], info['near33'] = frame_ms, near33
     info['draw_rates'] = cumulative_draw_rates(draw_samples)
+    info['compilations'] = compilations
     info.update(recording=recording, present_stats=present_stats, present_bins=present_bins, frame_p99=frame_p99,
                 present_intervals=present_trace_intervals(traces))
     return timing, gpu, fps, stut, longf, info
@@ -303,6 +308,7 @@ def summarize(windows, thermal=()):
     return {
         'windows': len(windows),
         **pacing,
+        **compilation_summary(windows),
         **presentation_summary(windows),
         'fps_min': min(vals('fps'), default=None), 'fps_max': max(vals('fps'), default=None),
         'fps_mean': round(sum(vals('fps')) / len(vals('fps')), 2) if vals('fps') else None,
@@ -443,8 +449,8 @@ def parse_sample_rows(path):
         row.update(power_of_tokens(d))
         for key, *_ in MEMORY_FIELDS:
             row[key] = real(key) if key in d else None
-        parts = [row[k] for k in ('kgk', 'kgm', 'kgi') if row[k] is not None]
-        row['kgsl'] = sum(parts) if parts else None
+        # KGSL kernel memory already includes mapped allocations; only add the separate imported_mem counter.
+        row['kgsl'] = row['kgk'] + row['kgi'] if row['kgk'] is not None and row['kgi'] is not None else None
         rows.append(row)
     return rows
 
@@ -641,6 +647,9 @@ def main():
         gpu_snapshots = parse_gpu_snapshots(os.path.join(out, GPU_SNAPSHOT_FILE))
     except ValueError as exc:
         sys.exit(f'invalid GPU snapshots: {exc}')
+    warmup_path = os.path.join(out, 'warmups.jsonl')
+    warmups = [json.loads(line) for line in open(warmup_path, encoding='utf-8') if line.strip()] \
+        if os.path.exists(warmup_path) else []
     for dev in order:
         timing, gpu, fps, stut, longf, info = logs[dev]
         for scene in scenes:
@@ -668,6 +677,7 @@ def main():
                     w.update(pacing_of(f, w['fps'], target, info, devices[dev]['uncapped']))
                     w['p99_p50_ratio'] = w['p99_ms'] / w['p50_ms'] if w['p99_ms'] is not None and w['p50_ms'] > 0 else None
                     w.update(presentation_of(f - 299, f, info))
+                    w['compilation'] = compilation_of(f, info['compilations'])
                     windows.append(w)
                     print(f'{f-299:>6}-{f:<6} {w["fps"] or 0:5.1f} {w["p50_ms"]:6.2f} {w["p95_ms"]:6.2f} '
                           f'{w["p99_ms"] if w["p99_ms"] is not None else float("nan"):6.2f} {w["max_ms"]:6.1f} '
@@ -675,7 +685,10 @@ def main():
                           f'{w["long_ge45"]:>6}    {st[0] if st else "-"}/{st[2] if st else "-"} '
                           f'(>{st[1] if st else "-"}/>{st[3] if st else "-"}) {w["pacing_state"]} '
                           f'near33={w["frames_near33"]} ({w["pacing_source"]}) '
-                          f'draws/frame={w["draws_per_frame"] if w["draws_per_frame"] is not None else "-"}')
+                          f'draws/frame={w["draws_per_frame"] if w["draws_per_frame"] is not None else "-"} '
+                          f'compiles(sync/worker)={w["compilation"]["pipeline_sync"]}/'
+                          f'{w["compilation"]["pipeline_async"]}'
+                          f'{" COMPILES" if w["compilation"]["compiles_present"] else ""}')
                 rows = parse_samples(None, kv['T0'], kv['T1'], samples)
                 pair = gpu_snapshots.get((dev, kv['T0']), {})
                 try:
@@ -719,6 +732,18 @@ def main():
             if memory:
                 print('  memory / pressure (worst over the windows): ' + ', '.join(f'{k} {v}' for k, v in memory.items()))
             summary = summarize(windows, thermal)
+            state = scene_state()
+            print(f'  scene state: {state["reason"]}')
+            print(f'  graphics compile reports: {summary["compile_covered_windows"]}/{len(windows)} windows; '
+                  f'{summary["compile_windows"]} with compiles; shaders/compute unavailable (not zero)')
+            if summary['compile_windows']:
+                caveats.append(f'{dev}/{scene}: {summary["compile_windows"]} measured windows contain graphics compiles; '
+                               'retained in every summary, not filtered out.')
+            scene_warmups = [w for w in warmups if w.get('device') == dev and
+                             re.sub(r'(?<=[A-Za-z_-])\d+$', '', w.get('scene', '')) == scene]
+            for warmup in scene_warmups:
+                print(f'  optional graphics warm-up: {warmup["status"]} after {warmup["elapsed_s"]} s '
+                      '(shader/compute quiescence unavailable)')
             print_presentation(summary)
             if summary.get('uncapped'):
                 print(f'  uncapped: throughput {summary["throughput_fps"]} fps; dip_metrics_valid=false; '
@@ -752,12 +777,14 @@ def main():
             runs.append({'device': dev, 'scene': scene,
                          'pans': [{'start_frame': kv['F0'], 'end_frame': kv['F1'], 'start_utc': utc(kv['T0']),
                                    'end_utc': utc(kv['T1']), 'stick_value': kv['V'],
+                                   'direction': {1: 'right', -1: 'left'}.get(kv.get('D')),
                                    'freq_limits': {'start': s.get('start'), 'end': s.get('end')},
                                    'target_fps': target, 'gpu_residency': residency, 'battery': battery,
                                    'summary': pan_summary}
                                   for kv, s, target, residency, battery, pan_summary in
                                   zip(plist, snaps, targets, pan_residencies, batteries, pan_summaries)],
                          'freq_stable': stable, 'freq_changes': changes,
+                         'scene_state': state, 'warmups': scene_warmups,
                          'summary': summary, 'windows': windows, 'thermal': thermal,
                          **({'memory': memory} if memory else {}), **({'ab': ab} if ab else {})})
             table.append((dev, scene, summary, windows))

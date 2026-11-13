@@ -1,7 +1,7 @@
 #!/bin/sh
 # pan.sh -s <serial> --device <label> --scene <label> --out <dir> [--target-fps 30|40|60] [--seconds N] [--repeat N]
 #        [--value 16000] [--first right|left] [--no-shot] [--event /dev/input/eventN] [--display <id>]
-#        [--package <pkg>] [--game-dir <dir>]
+#        [--package <pkg>] [--game-dir <dir>] [--warmup-calm-windows N] [--warmup-timeout 120]
 #
 # Steady horizontal camera pan: the right stick held at --value (of 32767) to the right for the first half of the time,
 # then to the left for the second half (--first left: left, then right), then released, so the view returns.
@@ -23,7 +23,7 @@ usage() { sed -n '2,/^set -u/{ /^set -u/d; s/^# \{0,1\}//; p; }' "$0" >&2; exit 
 die() { echo "pan: $*" >&2; exit 1; }
 
 SER=""; DEV=""; SCENE=""; SECS=""; V=16000; FIRST=right; OUT=""; EV=""; DISP=""; PKG=com.aure.totk; GAME=""; SHOT=1
-TARGET_FPS=""; REPEAT=1
+TARGET_FPS=""; REPEAT=1; CALM=0; WARMUP_TIMEOUT=120
 while [ $# -gt 0 ]; do
   case $1 in
     -s) SER=${2:?}; shift 2 ;;
@@ -40,6 +40,8 @@ while [ $# -gt 0 ]; do
     --display) DISP=${2:?}; shift 2 ;;
     --package) PKG=${2:?}; shift 2 ;;
     --game-dir) GAME=${2:?}; shift 2 ;;
+    --warmup-calm-windows) CALM=${2:?}; shift 2 ;;
+    --warmup-timeout) WARMUP_TIMEOUT=${2:?}; shift 2 ;;
     -h|--help) usage ;;
     *) die "unknown argument $1" ;;
   esac
@@ -48,6 +50,8 @@ done
 case $TARGET_FPS in ''|30|40|60) ;; *) die "--target-fps: 30, 40 or 60" ;; esac
 case $REPEAT in ''|*[!0-9]*) die "--repeat: a positive integer" ;; esac
 [ "$REPEAT" -gt 0 ] || die "--repeat: a positive integer"
+case $CALM in ''|*[!0-9]*) die "--warmup-calm-windows: 0 (off) or 1..100" ;; esac
+[ "$CALM" -le 100 ] || die "--warmup-calm-windows: 0 (off) or 1..100"
 case $DEV$SCENE in *[!A-Za-z0-9_-]*) die "--device / --scene: letters, digits, _ and - only" ;; esac
 case $FIRST in right) D=1 ;; left) D=-1 ;; *) die "--first: right or left" ;; esac
 [ -n "$GAME" ] || GAME=/data/user/0/$PKG/files/game
@@ -86,10 +90,23 @@ gpu_snapshot() {
 }
 
 mkdir -p "$OUT/shots"
-trap 'input rstick 0' EXIT
+PAN_PID=""
+cleanup() {
+  if [ -n "$PAN_PID" ]; then
+    kill -TERM "$PAN_PID" 2>/dev/null
+    wait "$PAN_PID" 2>/dev/null
+  fi
+  input rstick 0
+}
+trap cleanup EXIT
 trap 'exit 130' INT TERM
 I=1; PREV_T0=0
 while [ "$I" -le "$REPEAT" ]; do
+  if [ "$CALM" -gt 0 ]; then
+    python3 "$HERE/warmup.py" -s "$SER" --device "$DEV" --scene "$SCENE" --out "$OUT" \
+      --game-dir "$GAME" --calm-windows "$CALM" --timeout "$WARMUP_TIMEOUT" ||
+      die "cannot record the optional warm-up"
+  fi
   F0=$(lastf) || die "no '至帧 N' timing line in $LOG yet (has the game rendered 300 frames?)"
   FS=$(input freqs) || die "cannot read the frequency limits"
   T0=$(date +%s)
@@ -97,14 +114,16 @@ while [ "$I" -le "$REPEAT" ]; do
   while [ "$T0" -le "$PREV_T0" ]; do sleep 1; T0=$(date +%s); done
   PREV_T0=$T0
   gpu_snapshot start
-  input rstick "$((D * V))" || die "cannot start the camera pan"
-  sleep "$HALF" || die "camera pan sleep interrupted"
-  input rstick "$((-D * V))" || die "cannot reverse the camera pan"
-  sleep "$HALF" || die "camera pan sleep interrupted"
-  F1=$(lastf) || die "cannot read the final frame boundary"
+  # wait(1)'s shell builtin is interruptible; a foreground external command would defer
+  # the host trap until the entire device batch finished.
+  "$HERE/bench_input.sh" -s "$SER" --event "$EV" --display "$DISP" --package "$PKG" --game-dir "$GAME" \
+    pan "$((D * V))" "$HALF" &
+  PAN_PID=$!
+  wait "$PAN_PID" || die "cannot complete/release the camera pan"
+  PAN_PID=""
   T1=$(date +%s)
+  F1=$(lastf) || die "cannot read the final frame boundary"
   gpu_snapshot end
-  input rstick 0 || die "cannot release the camera pan"
   FE=$(input freqs) || echo "pan: cannot read the frequency limits after the pan" >&2
   printf '%s\n' "$DEV $SCENE T0=$T0 start $FS" "$DEV $SCENE T0=$T0 end $FE" >> "$OUT/freqs.txt"
   echo "$DEV $SCENE F0=$F0 F1=$F1 T0=$T0 T1=$T1 V=$V D=$D${TARGET_FPS:+ TARGET_FPS=$TARGET_FPS}" | tee -a "$OUT/pans.txt"

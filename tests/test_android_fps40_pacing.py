@@ -206,7 +206,7 @@ static unsigned cutscene_floor(unsigned ticks, uint64_t refresh) {
     cutscene_calls++;
     /* Same physical-tick rounding as the runtime authority: a25ms tick would
      * round the30fps floor back to1. The producer must ask in guest60 units. */
-    assert(refresh == 1000000000ull / 60);
+    assert(refresh == 1000000000ull / (unsigned)(g_hz == 40 ? 60 : g_hz));
     unsigned floor = (unsigned)((1000000000ull / 30 + refresh / 2) / refresh);
     return scripted_camera && ticks < floor ? floor : ticks;
 }
@@ -260,9 +260,29 @@ int main(void) {
     window.interval = 2;
     assert(present_period(&window) == 50000000); /* A slower explicit guest interval is not shortened. */
     assert(!setenv("TOTK_UNCAPPED_INTERVAL", "1", 1));
+    runtime_cutscene_present_ticks = cutscene_floor;
+    /* Unlimited keeps the same producer path, independent of panel callbacks:
+     * no fixed slots or acquire slack, interval1, ceiling120, scripted-camera30. */
+    assert(!setenv("TOTK_UNCAPPED_HZ", "120", 1)); g_hz = -1;
+    scripted_camera = 0;
+    for (unsigned i = 0; i < 2; i++) {
+        actual_refresh = refreshes[i];
+        assert(present_period(&window) == 1000000000ull / 120 && g_hz == 120 && uncapped_now());
+        window.interval = 1;
+        assert(present_period(&window) == 1000000000ull / 120);
+        scripted_camera = 1;
+        for (unsigned frame = 0; frame < 600; frame++) {
+            window.interval = frame & 1 ? 1 : 2;
+            cutscene_calls = 0;
+            assert(present_period(&window) == 33333333 && cutscene_calls == 1);
+        }
+        scripted_camera = 0;
+        assert(present_period(&window) == 1000000000ull / 120);
+    }
     runtime_cutscene_present_ticks = NULL;
     assert(!setenv("TOTK_UNCAPPED_HZ", "55", 1)); g_hz = -1;
     assert(present_period(&window) == 1000000000 / 55 && g_hz == 55); /* Developer cap wins. */
+    window.interval = 2;
     assert(!setenv("TOTK_UNCAPPED", "0", 1)); g_hz = -1;
     assert(present_period(&window) == 2 * actual_refresh && !uncapped_now());
     return 0;

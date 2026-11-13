@@ -260,6 +260,7 @@ class CompanionGate(unittest.TestCase):
         env = os.environ.copy()
         env.pop('TOTK_COMPANION', None)
         env.pop('TOTK_COMPANION_LOG', None)
+        env.pop('TOTK_COMPANION_COVER', None)
         return env
 
     def test_runtime_switch_and_lifecycle(self):
@@ -271,6 +272,26 @@ class CompanionGate(unittest.TestCase):
                 ], env=self.environment())
                 self.assertIn('pass: companion gate ' + setting, result.stdout)
                 self.assertNotIn('RegisterNatives failed', result.stderr)
+                effective = 'false' if setting == '0' else 'true'
+                self.assertIn(f'[TotkCompanion] cover requested=unset effective={effective} reason=host_probe\n', result.stderr)
+
+    def test_cover_diagnostics_reach_native_stderr_when_companion_is_off(self):
+        result = self.command([
+            self.java, '-Djava.library.path=' + str(self.directory), '-cp', str(self.classes),
+            'com.aure.totk.CompanionGateProbe', '0',
+        ], env=self.environment())
+        line = '[TotkCompanion] cover requested=unset effective=false reason=host_probe'
+        self.assertIn(line + '\n', result.stderr)
+        print('native cover log probe: ' + line)
+
+    def test_cover_exact_zero_opt_out(self):
+        env = self.environment()
+        env['TOTK_COMPANION_COVER'] = '0'
+        result = self.command([
+            self.java, '-Djava.library.path=' + str(self.directory), '-cp', str(self.classes),
+            'com.aure.totk.CompanionGateProbe', '1',
+        ], env=env)
+        self.assertIn('[TotkCompanion] cover requested=0 effective=false reason=host_probe\n', result.stderr)
 
     def test_native_gate(self):
         # This driver is also suitable for TSan: no uninstrumented JVM GC/JIT
@@ -284,9 +305,12 @@ class CompanionGate(unittest.TestCase):
             '-o', str(executable),
         ])
         for setting in ('unset', '', '0', '1', 'false', '00'):
-            with self.subTest(setting=setting):
-                result = self.command([str(executable), setting], env=self.environment())
-                self.assertIn('pass: native companion gate ' + setting, result.stdout)
+            for cover_setting in ('unset', '', '0', '1', 'false', '00', '01', ' 1'):
+                with self.subTest(setting=setting, cover_setting=cover_setting):
+                    result = self.command([str(executable), setting, cover_setting], env=self.environment())
+                    self.assertIn('pass: native companion gate ' + setting, result.stdout)
+                    self.assertIn('pass: native companion cover ' + cover_setting, result.stdout)
+                    self.assertIn('[TotkCompanion] cover requested=false effective=false reason=native_probe\n', result.stderr)
 
     def test_jni_load_without_companion_classes(self):
         result = self.command([

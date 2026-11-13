@@ -128,6 +128,80 @@ static uint32_t branch(uint64_t pc,uint64_t target){
     return 0x14000000|(((uint32_t)(delta>>2))&0x3ffffff);
 }
 
+/* Benchmark-only native fixed-time policy. The loader authenticates the pinned
+ * rewritten main before relocation and this launch-time patch, then seals RX.
+ * No request-bank writes or host calls occur while the game is running. */
+static int bench_time_parse(const char *e,unsigned *seconds){
+    if(!e||!strcmp(e,"off"))return 0;
+    if(strlen(e)!=5||e[2]!=':'||e[0]<'0'||e[0]>'9'||e[1]<'0'||e[1]>'9'||
+       e[3]<'0'||e[3]>'9'||e[4]<'0'||e[4]>'9')return -1;
+    unsigned hour=(unsigned)(e[0]-'0')*10+(unsigned)(e[1]-'0');
+    unsigned minute=(unsigned)(e[3]-'0')*10+(unsigned)(e[4]-'0');
+    if(hour>23||minute>59)return -1;
+    *seconds=hour*3600+minute*60;
+    return 1;
+}
+static const uint64_t bench_time_sites[]={
+    0x68c0bc,0x68c0c0,0x68c0c4,0x68c0c8,0x68c0cc,0x68c0d0,0x68c0d4,
+    0x68c0d8,0x68c0dc,0x68c0e0,0x68c0e4,0x68c0e8,0x68c0ec,0x68c0f0,
+    0x68c0f4,0x68c0f8,0x68c0fc,0x68c100,0x68c104,0x68c108,0x68c10c,
+    0x68c110,0x68c114,0x68c118,0x68c11c,0x68c120,0x68c124,0x68c128,
+    0x68c540,0x68c544,0x68c760,0x68c764,0x68c768,0x68c76c,0x68c770,
+    0x68c774,0x68c778,0x68c290,0x68c294,0x68c298,0x68c29c,0x68c2a0,
+    0x68c2a4,0x68c2a8,0x68c2ac,
+};
+static void patch_bench_time(Module *m){
+    unsigned seconds=0;
+    int on=bench_time_parse(getenv("TOTK_BENCH_TIME"),&seconds);
+    if(on<0){
+        fprintf(stderr,"[totk-bench-time] rejected TOTK_BENCH_TIME: expected HH:MM (00:00..23:59) or off; effective off\n");
+        return;
+    }
+    if(!on){
+        fprintf(stderr,"[totk-bench-time] TOTK_BENCH_TIME=off (native clock; default)\n");
+        return;
+    }
+#if TARGET_OS_IPHONE
+    (void)m;runtime_fail("TOTK_BENCH_TIME requires writable 1.4.3 main");
+#else
+    /* The text/rodata gap is occupied. Reuse the loader's zero-filled final
+     * rewritten-code RX page, leaving +0..127 for grass observation veneers. */
+    if(strcmp(m->name,"main")||!m->digest||strlen(m->digest)!=64||
+       m->file_size>UINT64_MAX-0x4000||m->text_end>m->file_size||
+       m->patch_off<m->key_off||m->patch_off>=m->file_size)
+        runtime_fail("1.4.3 benchmark time module identity");
+    uint64_t stub=((m->file_size+15)&~15ULL)+128;
+    if(stub>m->size||12>m->size-stub||
+       stub+12>((m->file_size+0x3fff)&~0x3fffULL))
+        runtime_fail("1.4.3 benchmark time veneer layout");
+    enum { COUNT=sizeof bench_time_sites/sizeof *bench_time_sites };
+    for(unsigned i=0;i<COUNT;i++)
+        if(bench_time_sites[i]>m->text_end||m->text_end-bench_time_sites[i]<4||
+           bench_time_sites[i]>m->size||m->size-bench_time_sites[i]<4)
+            runtime_fail("1.4.3 benchmark time site bounds");
+    uint32_t original[COUNT];
+    if(!code_guard(m,bench_time_sites,COUNT,sizeof *bench_time_sites,original,
+                   "c509b61832d5d59862e3c167499e4aab31b4cbddac5923469ad8aff880b7ca7c"))
+        runtime_fail("1.4.3 benchmark time original instruction mismatch");
+    for(unsigned i=0;i<12;i++)if(m->base[stub+i])
+        runtime_fail("1.4.3 benchmark time occupied veneer padding");
+    float value=(float)seconds;
+    uint32_t bits;memcpy(&bits,&value,4);
+    /* ldr s0,literal; b resume; float literal. Like the replaced scalar load,
+     * this writes s0 and zeros its upper vector bits. Every GPR (including
+     * x8/base day and x19/clock), other SIMD register, SP/LR, NZCV, FPCR and
+     * FPSR is unchanged. No FP arithmetic or scratch register is needed. */
+    uint32_t code[]={0x1c000040,branch(stub+4,0x68c770),bits};
+    uint32_t redirect=branch(0x68c124,0x68c760),load=branch(0x68c76c,stub);
+    /* All guards, space and both branch directions pass before any write. */
+    memcpy(m->base+stub,code,sizeof code);
+    memcpy(m->base+0x68c76c,&load,4);
+    memcpy(m->base+0x68c124,&redirect,4);
+    fprintf(stderr,"[totk-bench-time] TOTK_BENCH_TIME=%02u:%02u effective_seconds=%u (native fixed-time path; benchmark/restored saves only)\n",
+            seconds/3600,(seconds/60)%60,seconds);
+#endif
+}
+
 /* Fade/cutscene sites and the 200 ms marker policy are adapted from
  * mamcjr/TOTKRecompAndroid cc4f134 (MIT, Copyright (c) 2026 Peiikai;
  * SavageWindRecomp lineage). Full notice: third_party/licenses/TOTKRecompAndroid.txt.
@@ -972,6 +1046,7 @@ static void patch_render_res(Module *m);
 void runtime_game_patches(Module *m) {
     runtime_survey_init(m);
     if (strcmp(m->name, "main")) runtime_fail("1.4.3 game patches expect main");
+    patch_bench_time(m);
     patch_realtime(m);
     patch_output_res(m);
     patch_render_res(m);

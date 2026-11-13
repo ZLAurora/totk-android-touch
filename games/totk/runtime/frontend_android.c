@@ -1262,7 +1262,7 @@ static const char *const settings_keys[] = {
     /* frame generation timing block */
     "TOTK_REALTIME", "TOTK_FRAME_LAG", "TOTK_FPS_AUTO", "DM_PRESENT_HZ", "DM_PRESENT_INTERVAL", "TOTK_PRESENT_SLOTS",
     "TOTK_VK_PRESENT", "TOTK_ACQUIRE_CLOCK", "TOTK_PACE", "TOTK_ASYNC_REPLAY",
-    /* 40fps producer clock and optional120Hz request (not observed mode). */
+    /* 40/Unlimited producer clocks and validated display-rate requests (not observed modes). */
     "TOTK_UNCAPPED", "TOTK_UNCAPPED_HZ", "TOTK_UNCAPPED_INTERVAL", "TOTK_FRAME_RATE_HINT", "TOTK_FRAME_RATE_HINT_HZ",
     "TOTK_DATA_DIR",
 };
@@ -2110,18 +2110,19 @@ static void frame_rate_hint_update(ANativeActivity *a) {
     unsigned requested = totk_perf_rate_request();
     if (!requested) return;   /* Off leaves the existing path unchanged, including no Java query. */
     JNIEnv *env = a->env;
-    jmethodID method = surface_parent_method(env, a->clazz, "supportsFrameRateHint", "(I)Z");
-    jboolean supported = method && !(*env)->ExceptionCheck(env) ?
-        (*env)->CallBooleanMethod(env, a->clazz, method, (jint)requested) : JNI_FALSE;
+    jmethodID method = surface_parent_method(env, a->clazz, "selectFrameRateHint", "(I)F");
+    jfloat selected = method && !(*env)->ExceptionCheck(env) ?
+        (*env)->CallFloatMethod(env, a->clazz, method, requested == UINT32_MAX ? -1 : (jint)requested) : 0;
     if ((*env)->ExceptionCheck(env)) {
         (*env)->ExceptionClear(env);
-        supported = JNI_FALSE;
+        selected = 0;
         fprintf(stderr, "[totk-perf] TOTK_FRAME_RATE_HINT_HZ=%u refused: display query JNI error; retaining existing policy\n", requested);
-    } else if (!method || !supported) {
+    } else if (!method || selected <= 0) {
         fprintf(stderr, "[totk-perf] TOTK_FRAME_RATE_HINT_HZ=%u refused: unavailable or not advertised by current window display; retaining existing policy\n", requested);
     }
-    totk_perf_rate_override(supported ? requested : 0);
-    if (supported) fprintf(stderr, "[totk-perf] TOTK_FRAME_RATE_HINT_HZ=%u validated for current window display; FIXED_SOURCE request, not observed panel cadence\n", requested);
+    totk_perf_rate_override(selected);
+    if (selected > 0) fprintf(stderr, "[totk-perf] frame-rate hint %.3f Hz validated for current window display (request=%s); FIXED_SOURCE request, not observed panel cadence\n",
+        selected, requested == UINT32_MAX ? "max" : "integer");
 }
 /* Optional Java32 root hint listener, never a guessed panel orientation or a
  * default-display query. Keep JNI and AttachedSurfaceControl on this UI thread.

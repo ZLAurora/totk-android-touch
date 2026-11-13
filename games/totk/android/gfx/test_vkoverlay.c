@@ -182,6 +182,7 @@ static void check_presented_frame(unsigned frame) {
     unsigned s = (output_h * 3 + 550) / 1100;
     if (!s) s=1; if (s>VK_OVERLAY_MAX_SCALE) s=VK_OVERLAY_MAX_SCALE;
     vk_overlay_panel layout = {.compact = on == 1};
+    layout.system = getenv("TOTK_OVERLAY_SYS") && !strcmp(getenv("TOTK_OVERLAY_SYS"), "1");
     int fg = getenv("TOTK_OVERLAY_TEST_FG") != NULL;
     int power_enabled = getenv("TOTK_OVERLAY_POWER") && !strcmp(getenv("TOTK_OVERLAY_POWER"), "1");
     vk_overlay_configure(&layout, output_w, output_h, fg, power_enabled, pos);
@@ -517,6 +518,64 @@ static void power_tests(const char *root) {
     snprintf(path, sizeof path, "%s/usb", root); rmdir(path);
     CHECK(!rmdir(root), "remove power fixture");
 }
+static void system_tests(const char *root) {
+    char path[512];
+    CHECK(!mkdir(root,0700),"create fresh system fixture");
+    const char *dirs[]={"self","cpu6","cpu6/cpufreq"};
+    for(unsigned i=0;i<3;i++){snprintf(path,sizeof path,"%s/%s",root,dirs[i]);CHECK(!mkdir(path,0700),"system directory %s",dirs[i]);}
+    CHECK(power_file(root,"meminfo","MemTotal: 12582912 kB\nMemFree: 7 kB\nMemAvailable: 3145728 kB\n")&&
+          power_file(root,"self/status","Name: game\nVmRSS: 6291456 kB\n")&&
+          power_file(root,"cpu6/cpufreq/scaling_cur_freq","1500000\n")&&
+          power_file(root,"cpu6/cpufreq/cpuinfo_max_freq","2000000\n")&&
+          power_file(root,"cpu6/cpufreq/scaling_max_freq","1800000\n"),"write real-format system counters");
+    vk_overlay_system s=vk_overlay_read_system(root,root,6);
+    CHECK(s.total==12288&&s.available==3072&&s.rss==6144&&s.cpu==7&&s.ratio==76&&s.cap==2,
+          "memory uses MemAvailable and MiB; selected CPU ratio and policy cap");
+    vk_overlay_panel p={.system=1,.sys=s,.temperature_mc=INT_MIN,.gpu_real_ms=-1};
+    p.sys.thermal=1;p.sys.headroom=43;
+    vk_overlay_configure(&p,1920,1080,0,0,"tr");vk_overlay_text(&p,1000000000ull);
+    CHECK(!strcmp(p.system_text,"THM 0 H0.42 CPU6 0.75 CAP")&&
+          !strcmp(p.memory_text,"RAM   3072/ 12288M RSS   6144M"),"system labels: %s / %s",p.system_text,p.memory_text);
+    CHECK(p.layout.rows==5&&p.layout.system_row==3&&p.layout.width==TEST_FG_W&&
+          p.layout.height==TEST_PLAIN_H+2*VK_OVERLAY_ROW_H,"system layout reserves exactly two rows");
+    unsigned w=p.layout.width,h=p.layout.height;
+    uint32_t pixels[VK_OVERLAY_W*VK_OVERLAY_MAX_H];vk_overlay_raster(&p,1,pixels);
+    static const uint8_t thm[3][7]={{31,4,4,4,4,4,4},{17,17,17,31,17,17,17},{17,27,21,21,17,17,17}};
+    CHECK(!fixed_glyph_mismatches(pixels,p.layout.width,2,2+p.layout.system_row*VK_OVERLAY_ROW_H,thm,3),
+          "thermal row uses exact existing glyph masks");
+    uint64_t updates=p.counters.text_field_updates;
+    vk_overlay_text(&p,2000000000ull);
+    CHECK(p.counters.text_field_updates==updates,"unchanged system values do not reformat");
+    p.sys=(vk_overlay_system){0};vk_overlay_text(&p,3000000000ull);
+    CHECK(!p.system_text[0]&&!p.memory_text[0]&&p.layout.width==w&&p.layout.height==h&&
+          !vk_overlay_configure(&p,1920,1080,0,0,"tr"),"missing values clear without layout jitter");
+    p.sys=(vk_overlay_system){.thermal=8,.headroom=1001,.cpu=1025,.ratio=102,.total=1000000,.available=1000000,.rss=1000000};
+    vk_overlay_text(&p,4000000000ull);
+    CHECK(!p.system_text[0]&&strstr(p.memory_text,"??????"),"invalid system fields omit; memory overflow visible");
+    p.compact=1;vk_overlay_configure(&p,1920,1080,0,1,"tr");
+    CHECK(p.layout.rows==1&&p.layout.system_row==UINT_MAX&&p.layout.width==VK_OVERLAY_COMPACT_COLS*6+4,
+          "opt-in never expands FPS-only layout");
+    p.compact=0;vk_overlay_configure(&p,1920,1080,1,1,"tr");
+    CHECK(p.layout.rows==VK_OVERLAY_MAX_ROWS&&p.layout.height==VK_OVERLAY_MAX_H,"FG plus both options fits reserved storage");
+    const char *bad[]={"nan\n","0\n","2000001\n","1500000junk\n",NULL};
+    for(unsigned i=0;i<5;i++){
+        CHECK(power_file(root,"cpu6/cpufreq/scaling_cur_freq",bad[i]),"write bad frequency %u",i);
+        s=vk_overlay_read_system(root,root,6);
+        CHECK(!s.cpu&&!s.ratio&&s.total==12288,"invalid frequency hides independently %u",i);
+    }
+    CHECK(power_file(root,"cpu6/cpufreq/scaling_cur_freq","1500000\n")&&
+          power_file(root,"cpu6/cpufreq/scaling_max_freq",NULL),"remove policy cap");
+    s=vk_overlay_read_system(root,root,6);CHECK(s.ratio==76&&!s.cap,"missing policy cap is unknown, not capped");
+    CHECK(power_file(root,"cpu6/cpufreq/scaling_max_freq","2000000\n"),"write uncapped policy");
+    s=vk_overlay_read_system(root,root,6);CHECK(s.cap==1,"hardware maximum is not a policy cap");
+    CHECK(power_file(root,"meminfo","MemTotal: 1024 kB\nMemAvailable: 2048 kB\n"),"write impossible memory");
+    s=vk_overlay_read_system(root,root,6);CHECK(!s.total&&!s.available&&s.rss==6144,"impossible RAM hides independently");
+    const char *files[]={"meminfo","self/status","cpu6/cpufreq/scaling_cur_freq","cpu6/cpufreq/scaling_max_freq","cpu6/cpufreq/cpuinfo_max_freq"};
+    for(unsigned i=0;i<5;i++)power_file(root,files[i],NULL);
+    s=vk_overlay_read_system(root,root,-1);CHECK(!s.cpu&&!s.total&&!s.rss,"unavailable sources omit everything");
+    for(unsigned i=3;i;i--){snprintf(path,sizeof path,"%s/%s",root,dirs[i-1]);CHECK(!rmdir(path),"remove system directory");}
+    CHECK(!rmdir(root),"remove system fixture");
+}
 static void benchmark(void) {
     vk_overlay_panel p = {.target_ms = 1000.0 / 30, .power_mw = 5200};
     vk_overlay_configure(&p,1920,1080,1,1,"tr");
@@ -575,6 +634,8 @@ static void record_benchmark(VkImage image) {
 static int render_layout_ppm(const char *path) {
     vk_overlay_panel p={.power_mw=4200,.temperature_mc=38700,.target_ms=1000.0/60,.handheld=1};
     const char *power=getenv("TOTK_OVERLAY_POWER");
+    p.system=getenv("TOTK_OVERLAY_SYS")&&!strcmp(getenv("TOTK_OVERLAY_SYS"),"1");
+    p.sys=(vk_overlay_system){.thermal=1,.headroom=43,.cpu=7,.ratio=76,.cap=2,.available=3072,.total=12288,.rss=6144};
     if(!vk_overlay_configure(&p,1920,1080,1,power&&!strcmp(power,"1"),"tr"))return 0;
     uint64_t t=1000000000ull;
     for(unsigned i=0;i<240;i++)vk_overlay_note_frame(&p,t+=16666667,i&1);
@@ -731,6 +792,7 @@ int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--bench")) { benchmark(); return fails != 0; }
     if (argc == 3 && !strcmp(argv[1], "--power")) {
         power_tests(argv[2]);
+        system_tests(argv[2]);
         printf("%s: %d power/CPU checks, %d failed\n",fails ? "FAILED" : "ok",checks,fails);
         return fails != 0;
     }

@@ -32,7 +32,7 @@ static unsigned logged, frames;
 static uint64_t previous_frame, sample_time;
 static _Atomic unsigned content_rate = 60;
 static unsigned rate_request;
-static _Atomic unsigned rate_override;
+static _Atomic float rate_override;
 /* TOTK_RATE_HINT_HOLD (ms; 0 = the configured rate as before): launch value, live cache, the guest present thread's
  * hold state, the value it last logged, and generated outputs the presenter queued (frame generation is running). */
 static int hold_launch, hold_logged = -1;
@@ -103,7 +103,7 @@ static void configure(void) {
     rate_on = is_one("TOTK_FRAME_RATE_HINT"); fps60 = is_one("TOTK_FPS60");
     const char *hint = getenv("TOTK_FRAME_RATE_HINT_HZ");
     if (!totk_frame_rate_hint_parse(hint, &rate_request)) {
-        fprintf(stderr, "[totk-perf] TOTK_FRAME_RATE_HINT_HZ=%s refused: expected integer decimal Hz; retaining existing policy\n", hint);
+        fprintf(stderr, "[totk-perf] TOTK_FRAME_RATE_HINT_HZ=%s refused: expected integer decimal Hz or max; retaining existing policy\n", hint);
         rate_request = 0;
     } else if (rate_request && !rate_on) {
         fprintf(stderr, "[totk-perf] TOTK_FRAME_RATE_HINT_HZ=%u ignored: needs TOTK_FRAME_RATE_HINT=1\n", rate_request);
@@ -430,28 +430,29 @@ unsigned totk_perf_rate_request(void) {
     pthread_once(&config_once, configure);
     return rate_request;
 }
-void totk_perf_rate_override(unsigned hz) {
+void totk_perf_rate_override(float hz) {
     pthread_once(&config_once, configure);
-    atomic_store_explicit(&rate_override, rate_on && hz == rate_request ? hz : 0, memory_order_relaxed);
+    atomic_store_explicit(&rate_override, rate_on && hz > 0 && hz <= 2147483647.0f &&
+        (rate_request == UINT32_MAX || hz == rate_request) ? hz : 0, memory_order_relaxed);
 }
-unsigned totk_perf_rate(void) {
+float totk_perf_rate(void) {
     pthread_once(&config_once, configure);
     if (!rate_on) return 0;
-    unsigned override = atomic_load_explicit(&rate_override, memory_order_relaxed);
+    float override = atomic_load_explicit(&rate_override, memory_order_relaxed);
     return override ? override : atomic_load_explicit(&content_rate, memory_order_relaxed);
 }
 void totk_perf_window(ANativeWindow *window) {
-    unsigned hz = totk_perf_rate();
+    float hz = totk_perf_rate();
     if (!hz || !window) return;
-    int result = window_rate ? window_rate(window, (float)hz, ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE) : -1;
-    fprintf(stderr, "[totk-perf] window frame-rate hint=%u FIXED_SOURCE result=%d (request, not observed mode)\n", hz, result);
+    int result = window_rate ? window_rate(window, hz, ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE) : -1;
+    fprintf(stderr, "[totk-perf] window frame-rate hint=%.3f FIXED_SOURCE result=%d (request, not observed mode)\n", hz, result);
 }
 void totk_perf_surface(ASurfaceTransaction *tx, ASurfaceControl *surface) {
-    unsigned hz = totk_perf_rate();
+    float hz = totk_perf_rate();
     if (!hz || !surface || !tx) return;
     /* Only seamless switches: a rate request must not black-screen mid-play. */
-    if (surface_rate) surface_rate(tx, surface, (float)hz, ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE, 0);
-    fprintf(stderr, "[totk-perf] SurfaceControl frame-rate hint=%u FIXED_SOURCE seamless-only %s (void API; not mode proof)\n",
+    if (surface_rate) surface_rate(tx, surface, hz, ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE, 0);
+    fprintf(stderr, "[totk-perf] SurfaceControl frame-rate hint=%.3f FIXED_SOURCE seamless-only %s (void API; not mode proof)\n",
         hz, surface_rate ? "staged" : "unavailable");
 }
 #endif

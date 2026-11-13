@@ -20,8 +20,29 @@ Android-device result.
 **Round-eight default record (historical):** Android tried AHB with automatic copy fallback; explicit
 `TOTK_VK_PRESENT=copy` remained the control. The then-current chunk rule was 600 only with
 `TOTK_FRAME_LAG=1`, otherwise 75, and lag was recorded as off pending separate VMA safety work.
-`TOTK_COMPANION=0` suppresses secondary presentation, polling and action injection after `totk.env` loads;
-omit `--dex/--assets` in the low-level APK packer for the Java-free variant (`build_android.py --no-companion`
+`TOTK_COMPANION=0` suppresses secondary presentation, polling and action injection after `totk.env` loads.
+The cover defaults on for built-in secondary displays with the companion enabled. Exact
+`TOTK_COMPANION_COVER=0` opts out; unset, `1` and other values keep it on.
+Start waits for owner window focus and top-resumed readiness. Ordinary touch/game-input reclaim
+keeps its window-focus guard; a separate one-use, token-bound 1000 ms recovery may front the verified, still-resumed
+game after the live cover takes top-resumed state. Creation waits for no gesture; recovery remains within its original
+deadline and is checked on final UP/CANCEL. Pause, close, competing top-resumed loss, or a stale/expired token
+suppresses it. The cover is non-focusable/non-interactive and intentionally has no `noHistory`.
+
+Tested only with Cocoon: the launcher was stopped in every cover-on launch on Retroid Pocket Duo and AYN Thor.
+Duo launches started from the launcher pooled 28.70 → 29.22 fps and 101 → 40 frames over 50 ms per 24 windows;
+the frame-rate difference is inside the comparison tool's tolerance, while the tool rates the pooled result better.
+Thor launcher CPU use fell from about 27% of one core to about 0.05%, and compositor CPU use from about 19% to
+about 17%, with no frame-rate change (44.80 → 45.32 fps standing; 44.65 → 44.69 fps panning).
+The policy log shows the raw startup request: `requested=unset effective=true` for an eligible default-on
+launch, or `requested=0 effective=false` for explicit opt-out. Built-in-panel gating still uses `DisplayClass`.
+Cover start/finish/refusal/restart/policy/recovery lines use `[TotkCompanion] cover ...` in canonical
+`<game>/totk.log`; the optional `TOTK_LOGCAT=1` mirror uses Android tag `totk` but platform filtering may still drop
+INFO. Inspect the file, not logcat alone. With the switch off, no cover activity/window, reclaim or cover lifecycle
+callback registration occurs, though the native query, disabled CoverSession allocation and policy log remain.
+The policy line also records read-only `logcat_min_priority`, `logcat_info`, and `logcat_warn` admission queries;
+it does not change the process priority or Android log properties.
+Omit `--dex/--assets` in the low-level APK packer for the Java-free variant (`build_android.py --no-companion`
 selects it, but that script is not part of integration verification).
 
 **Round-ten status (historical, superseded for frame lag):** SGSR and automatic 60/30 selection are optional;
@@ -1752,7 +1773,7 @@ For lower query volume, start with **`TOTK_VK_GPU_PROFILE_SAMPLE=2`** and statis
 budgets `1`–`16` select at most that many pass parts per frame by deterministic ordinal rotation.
 Do not combine it with `TOTK_VK_PASS_PROFILE`, pass dumps, screenshots or the pass probe for performance measurements.
 
-Opt-in startup prepares sixteen reusable timestamp/statistics query-slot leases on the dedicated
+Opt-in startup prepares 32 reusable timestamp/statistics query-slot leases on the dedicated
 `totk-gpuprof` worker; the caller can wait for that initialization once. During play, taking a prepared
 lease is a short private-mutex O(1) operation, with no query reset, result read, formatting or I/O.
 `vkCmdWriteTimestamp2(ALL_COMMANDS)` brackets primary rendering instances (including attachment
@@ -1764,8 +1785,12 @@ independent timestamp reports: at least two and at most `2k+2` for budget `k`. A
 draws, areas and completed-frame scene metadata remain recorded, even with zero samples.
 Existing fence completion detaches/enqueues the fenced profiler lease and immediately releases the
 game ring slot; it does not read queries or report inline. The profiler worker owns result reads
-without WAIT or polling, aggregation, JSONL/log output, query resets and lease return. Its bounded
-sixteen-lease FIFO does not share the recorder-worker mutex. No free lease drops profiler coverage
+without WAIT or polling, aggregation, formatting, query resets and lease return. In compact pipeline
+mode a separate nice+10 sink owns file writes/flushes through a bounded 1 MiB FIFO; the consumer
+requests nice+5 and keeps inherited affinity. FIFO overflow is explicit output loss and censors
+pipeline authority, never a wait on the consumer. Window service/readback/reset/report wall counters
+and bounded footer drop-frame/queued/inflight/phase summaries diagnose bursts, not just average CPU. Its
+32-lease FIFO does not share the recorder-worker mutex. No free lease drops profiler coverage
 (`background_dropped_slots`, cumulative, and missing frame coverage), never blocks the game for I/O.
 CPU present independently publishes `{frame, end_sequence}` to a bounded 256-entry closure FIFO under
 the private background mutex. The worker finalizes only after all fenced leases through that sequence
@@ -2208,6 +2233,9 @@ The desktop presenter mock publishes its pixels/geometry through an atomic post 
 establish the cross-thread publication before assertions inspect ordinary pixel memory (also required under TSan).
 Pass-probe reports serialize their shared LCS/depth scratch between the presenter and explicit test callers;
 that diagnostic lock is outside recording and queue publication.
+PNG CRC lookup initialization uses `pthread_once`: walker pass dumps and presenter black-flash captures can
+write PNGs concurrently. Both diagnostics are compiled into release builds; pass dumps are opt-in, while the
+copy-presenter's black-flash detector defaults on (`TOTK_VK_BLACK=0` disables it). PNG pixels and checksums are unchanged.
 
 `vkdrawtest --lag-walk-bench [frames=6]` measures a Lookout-shaped 5,760-draw stream with two warmup frames per
 stable/churning case. It explicitly disables automatic draw-count chunking (`TOTK_VK_CHUNK_DRAWS=0`) for its

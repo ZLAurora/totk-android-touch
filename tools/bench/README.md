@@ -5,7 +5,8 @@ and comparing against the recorded baselines. The full procedure is the `totk-be
 (`.omp/skills/totk-benchmark/SKILL.md`); this is the quick reference.
 
 Device side: `su` root (for `sendevent`, the app's private `totk.log` and `settings.env`, `dmesg`, and the thermal /
-cpufreq / kgsl sysfs files). Ordinary benchmark tools write only the dmesg marker and live-control file
+cpufreq / kgsl sysfs files). Ordinary benchmark tools write the dmesg marker, transient owned pan-control directories
+(`<game>/.bench-pan-<host-pid>`, removed on completion/cancellation), and the live-control file
 (`<game>/totk.ctl`, atomically published with the game folder's owner and explicit SELinux context from `ls -Zd`).
 The explicit CPU profiler below also stages its NDK binary in `/data/local/tmp` and temporarily changes
 recorded perf access controls. Everything is read from `totk.log` and sysfs / procfs, never from
@@ -19,17 +20,19 @@ Common options: `-s <serial>` (adb serial), `--device <label>` (a short name use
 | Script | Use |
 |---|---|
 | `bench_input.sh -s <serial> [--event /dev/input/eventN] [--display <id>] <action>` | `press <A\|B\|X\|Y\|L\|R\|PLUS\|MINUS\|UP\|DOWN\|LEFT\|RIGHT> [ms]`, `rstick <x> [y]` (`rstick 0` releases), `shot <file>`, `log`, `detect`, `freqs` (the frequency limits as one line: `cpuN=<cpus>:<scaling_min>:<scaling_max>:<cpuinfo_max>` kHz per cpufreq policy, `gpu_maxclk`, `gpu_freqs`, `gpu_devfreq_max`, GPU power levels). Auto-detects the controller node (`getevent -p`: ABS_Z/ABS_RZ + BTN_SOUTH) and the first display (`dumpsys SurfaceFlinger --display-id`). |
-| `pan.sh -s <serial> --device <label> --scene <label> [--target-fps 30\|40\|60] [--seconds N] [--repeat N] [--value 16000] [--first right\|left] [--no-shot] --out <dir>` | Return pan: stick right for half the time then left (`--first left`: reverse). Defaults to 48 s at 30 target, 144 s at 40/60 target. Records frame/time/frequency boundaries and exact GPU cumulative snapshots per pan, then optional screenshot outside motion. |
+| `pan.sh -s <serial> --device <label> --scene <label> [--target-fps 30\|40\|60] [--seconds N] [--repeat N] [--value 16000] [--first right\|left] [--no-shot] --out <dir>` | Return pan: equal half-duration sleeps and mirrored stick events in one device command (`--first left`: reverse). Releases immediately after the second sleep, before final-frame/GPU/frequency reads. Defaults to 48 s at 30 target, 144 s at 40/60 target. Optional `--warmup-calm-windows N --warmup-timeout 120` is off by default; see provenance below. |
 | `rootsh.py -s <serial> run [-c <script>] \| status \| stop` | The serial's persistent root shell: a host-side broker holding one `adb shell su -c sh`, started by the first `run`, ended by `stop`, after 30 idle minutes or when the device goes. `run` executes the script (default: stdin) in its own `sh -c` and passes its stdout, stderr and status through (124: no answer in time, 125: no root shell). The shell pins itself to the slowest cpufreq cluster (`status` prints the cores). |
 | `live.sh -s <serial> set KEY=VALUE \| unset KEY \| mark <text>...` | Live switches (APP.md *Live switches*): atomically replaces `<game>/totk.ctl` with only the new batch (one generation at the next presented frame) and prints the game's `[totk-ctl]` answer (a mark's acknowledgement, refusals); exit 3 when a mark is not acknowledged, 4 when a line was refused. |
 | `ab.sh -s <serial> --device <label> --scene <label> --arms 'A:<lines>;B:<lines>' [--order ABBAABBA] [--pan-seconds 30] [--settle 15] --out <dir>` | In-session A/B in one loaded scene: per block, the arm's lines plus `mark ab arm=<X> block=<n> scene=<scene> direction=<right\|left>` (live.sh), a settle, a pan (direction alternating). Writes `<dir>/arms.txt` with the direction recorded. |
-| `sampler.py -s <serial> --device <label> --out <dir> [--duration S]` | Every 3 s: newest frame, max CPU/GPU zone temperature, cooling states, GPU `thermal_pwrlevel`/clock/`max_gpuclk`, cpufreq `scaling_max/cpuinfo_max`, MemAvailable, the game's VmRSS / VmSwap / RssShmem, its kgsl memory (`/sys/class/kgsl/kgsl/proc/<pid>/{kernel,gpumem_mapped,imported}`), PSI cpu / memory some / full avg10 and kswapd CPU % → `<dir>/samples-<label>.txt` (values a device lacks stay empty → null). Stops on Ctrl-C / SIGTERM / `--duration` and removes its device loop. |
+| `sampler.py -s <serial> --device <label> --out <dir> [--duration S]` | Every 3 s: newest frame, max CPU/GPU zone temperature, cooling states, GPU `thermal_pwrlevel`/clock/`max_gpuclk`, cpufreq `scaling_max/cpuinfo_max`, MemAvailable, the game's VmRSS / VmSwap / RssShmem, its kgsl memory (`/sys/class/kgsl/kgsl/proc/<pid>/{kernel,gpumem_mapped,imported_mem}`; falls back to legacy `imported`), PSI cpu / memory some / full avg10 and kswapd CPU % → `<dir>/samples-<label>.txt` (values a device lacks stay empty → null). Stops on Ctrl-C / SIGTERM / `--duration` and removes its device loop. |
 | `collect.sh -s <serial> --device <label> --out <dir> [--mark]` | `--mark`: dmesg marker (after the scene settles). Default: pulls `logs/<label>.log`, `logs/<label>-dmesg.txt` (from the marker), `settings-<label>.env`, `facts-<label>.txt` (model, SoC, GPU, Android, displays, app version, APK sha256, serial hash), warns about a developer `totk.env`, prints the GPU-fault check. Exit 3 when there is no `totk.log`. |
 | `analyze.py <dir> [--json <file>] [--name <name>] [--commit <sha>] [--meta <json>] [--arms]` | Per device × scene: the 300-frame windows that started after the stick was pushed and ended before it was released (end frame in `[F0+600, F1]`), thermal state over each pan, the frequency limits of each pan and whether they stayed put (`freq_stable`), each device's frequency signature, a results table and caveats; `--json` writes schema `totk-android-benchmark/1`. `--arms`: each window goes to the live-switch generation that covered it whole and that generation's arm (windows straddling a change are dropped); per arm pooled metrics, per block metrics and the same-arm spread (`ab` in the JSON). With the sampler's memory fields, each window, run and arm also gets `memory`: MemAvailable minimum and the maxima of the rest. |
 | `compare.py <reference.json> <new.json>` | Per device × scene: fps mean/min, p50 median, p95 max, worst frame, GPU ms mean, long ≥45 ms, >50 ms, max temperatures, with deltas and verdicts (thresholds in `compare.py --help`); labels each device pair by frequency signature: match / reference only / NOT COMPARABLE; warns when `settings_env` or cpufreq caps differ or caps changed during a run. Exit 1 if a scene with a matching signature is worse. |
-| `abtest.py <ab.json> [--ref A]` | Each arm of an `analyze.py --arms` result against the reference: pooled and same-direction ABBA paired deltas, per-direction deltas, sign agreement, exact sign p-value, tolerance, informational same-arm spread and verdict. Better/worse requires both deltas beyond tolerance plus unanimous pair signs (or p < 0.05 with ≥6 pairs); paired-only crossings are informational leans. Prefer ABBAABBA or longer at 60 fps; full rule in `--help` / the skill. Exit 1 if an arm is worse. |
+| `abtest.py <ab.json> [--ref A]` | In-session arms: pooled and same-direction ABBA paired deltas, per-direction deltas, sign agreement, exact sign p-value, tolerance and informational spread. Better/worse requires both deltas beyond tolerance plus unanimous signs (or p < 0.05 with ≥6 pairs) and both directions. Distinct restart mode: `--restart-quartet O1.json B1.json B2.json O2.json --ref O` (see below). Exit 1 if an arm is worse. |
 | `ledger.py add <result.json> --commit <sha> --apk <apk> --profile <text> [--note ...]` | Append a run to `docs/benchmarks/ledger.jsonl` (+ `docs/benchmarks/runs/<run-id>/<device>.json`), tied to the clean commit the APK was built from (its `assets/build.txt`); compared with the baseline of its frequency signature, or, for a signature seen for the first time (with stable caps), recorded as that signature's NEW baseline (`docs/benchmarks/baselines/<device>/<signature>.json`, pinned, indexed); re-renders `docs/benchmarks/LEDGER.md`. Also `render`, `show <run-id>`, `compare <run-id> <run-id>`. |
 | `check_baselines.py` | Fails if a baseline file (`docs/benchmarks/baseline-*`, `docs/benchmarks/baselines/**`) differs from `docs/benchmarks/BASELINES.sha256` or is unpinned, or `docs/benchmarks/baselines/index.json` is inconsistent (also run by `tests/test_bench_tools.py`). |
+
+KGSL `kgsl_max_mb` is the physical allocation total `kernel + imported_mem` (using legacy `imported` when needed); `kernel` already includes mapped allocations, so `gpumem_mapped` stays a separate overlapping diagnostic and is not added again. The total is unavailable unless both required counters are present, including when one is explicitly zero. These KGSL allocation counters are not RSS/PSS and imported memory may be externally backed; compare them separately from process-resident memory.
 
 Baselines are immutable and per frequency signature (device model + SoC, settings.env hash, per-cluster CPU caps,
 GPU cap), listed in `docs/benchmarks/baselines/index.json`. Only `ledger.py add` creates one (for a new signature);
@@ -109,6 +112,71 @@ estimate for missing pairs or proof of physical scanout. It is null without vali
 Cadence tracing is high-volume and has measurably perturbed Thor timing: keep it off in ordinary performance arms,
 do not mix traced/untraced arms, and use independent distinct-picture evidence for displayed smoothness.
 
+### Restart quartets (distinct from in-session A/B)
+
+For launch-only switches, collect and analyze **four separate session directories**, in the declared
+**O1 → B1 → B2 → O2** order (one restart, same named save, settle and pan schedule each time). Do not concatenate
+their logs: frame counters reset. No synthetic live-control marks are necessary:
+
+```sh
+python3 tools/bench/abtest.py --restart-quartet \
+  "$OUT/O1/result.json" "$OUT/B1/result.json" "$OUT/B2/result.json" "$OUT/O2/result.json" --ref O
+```
+
+The report is labelled **restart-quartet**, never in-session direction-confirmed. All four JSONs must contain the
+same device/scene set, nonempty measured windows and identical explicit pan direction/stick schedules; current
+`analyze.py` records `pans[].direction` from `pans.txt D`. Re-analyze older captures rather than inventing directions.
+Keep pan durations, save, cache, caps, power and thermal admission the same; inspect each source result's caveats,
+frequency stability, compile flags and GPU residency. The command does not establish physical scene equivalence.
+Mixed capped/uncapped sessions are rejected rather than pooled.
+
+Each complete session is one block. Pairs are **B1−O1 (positions 2−1)** and **B2−O2 (3−4)**, equal weight regardless
+of window count. Pooled values are recomputed from both sessions' original windows (throughput remains frames/time).
+Per-metric BETTER/WORSE requires pooled **and** paired-mean deltas strictly beyond tolerance in the same direction,
+and **both pair signs agreeing**, with no sign-test relaxation. FPS tolerance is **max(0.5 fps, 2% of pooled O fps)**;
+other metrics retain `compare.py` tolerances and per-window count rates. **O-spread = |O2−O1| must be ≤ tolerance**,
+so any confirmed effect also exceeds O-spread. Larger/missing O-spread, missing pairs, sign disagreement or a
+paired-only/pooled-only crossing are INCONCLUSIVE, not a confirmed improvement. With admitted O-spread, a paired
+delta within tolerance is SAME. The report shows both individual pair deltas and O-spread. Primary-tail regressions
+and capped dip-confounding still apply; uncapped uses throughput/tails. This two-pair rule is not statistical
+significance. The existing in-session mode and its both-directions requirement are unchanged.
+
+**GPU clock guard.** A GPU governor can settle at a different clock from one session to the next (the Thor ran the
+same scene at 680 MHz and 42.5 fps, then at 615 MHz and 37 fps), and that alone moves GPU ms and fps. The report
+prints each session's residency-weighted mean GPU clock from `pans[].gpu_residency`. When the two arms' means differ
+by more than **3%** the overall result is **verdict confounded by GPU clock** instead of BETTER/WORSE/SAME; repeat
+the quartet with the clock in the same state in both arms. Pass `--clock-lever` when the arm changes the clock on
+purpose (a clock floor): the difference is still printed and the verdict stands. Sessions without residency are
+reported as **not checked**, never treated as equal.
+
+### Compile and scene provenance
+
+Every measured window has `compilation`: graphics `pipeline_sync`, `pipeline_async`, their milliseconds, and
+`pipeline_creations`/milliseconds parsed from the frame-keyed `[nvn-vk] frame N, stutter: ...` line.
+`pipeline_creations` includes cache-backed creations and **is not an independent shader compile count**; do not
+sum it with sync/worker counts. `compiles_present=true` flags observed synchronous/worker builds (`COMPILES` in
+the text). Missing fields/reports stay null, never zero. Pan/run/arm/block summaries retain `compile_windows`,
+`compile_covered_windows` and the observed totals; flagged windows remain in every performance summary.
+Worker counters describe work completed in that 300-present reporting interval, not a causal stall at a specific frame.
+
+The current logs have **no always-on frame-keyed shader-translation or compute compile counts**: those fields are
+explicitly unavailable. Seed-file reads are not compiles; unframed shader completion messages cannot be assigned
+by text adjacency. The overlay's `COMPILE count totalMS` is a **rolling one-second, synchronous-only** image row,
+not a window counter (and excludes async workers/cache joins); it is not OCRed or summed into log counts.
+
+Optional `pan.sh --warmup-calm-windows 2 --warmup-timeout 120` waits before **each** pan for two **fresh consecutive**
+300-present reports with zero graphics creations, sync builds and worker builds. Existing history, duplicate/stale
+reports, missing counters and skipped reporting intervals cannot satisfy the streak. It polls a bounded log tail
+every 3 s, with a finite timeout (maximum 3600 s), and records `calm` / `timeout` / `unavailable`, elapsed time and
+every newly observed report in `warmups.jsonl`; the analyzer retains and labels these observations. Timeout or
+unavailability is visible and measurement proceeds; logs/compile-flagged measured windows are **never hidden**.
+This only admits observed graphics calm, not shader/compute quiescence or absence of queued work. Use the same
+warm-up policy in both arms. Default is off (no extra wait/polling).
+
+`scene_state` explicitly records time of day and weather as **unavailable**: neither the current game log nor the
+performance overlay exposes them. Do not substitute host wall time, save names or a guessed weather classification.
+Match the named save and camera procedure, retain screenshots and describe any visible scene differences manually.
+
 ### Long pans and exact GPU residency
 
 The target defaults to the active preset (`settings.env`, then developer `totk.env` override); `--target-fps`
@@ -121,6 +189,20 @@ boundaries. `--target-fps 60 --seconds 48 --repeat 3` is the recommended shorter
 Keep at least 12 **included** windows per session/arm; the analyzer warns for shorter 60-target scene records.
 If a prolonged slowdown leaves fewer, lengthen/repeat rather than accepting a short run. Use the same duration,
 cycle length and direction schedule in both arms; explicit `ab.sh --pan-seconds 144` keeps its own block schedule.
+The event/sleep/reverse/sleep/release sequence runs in **one device-side batch**. The normal release and
+failure/signal cleanup happen before it returns; `pan.sh` also has a best-effort release trap. No final-frame,
+GPU or frequency snapshot can lengthen the last deflection. Equal sleeps remove host/broker round-trip asymmetry;
+input scheduling and game camera dynamics still prevent a promise of pixel-identical endpoints. Frame/GPU boundary
+reads retain small control/read latency outside motion; only complete runtime windows are selected.
+The host waits interruptibly on the owned pan child. INT/TERM or a failed batch invokes an exceptional direct-root
+cancel command (one extra su session only on failure): mark cancellation, validate the recorded device PID against
+its control path, terminate that command and its sleep, and release the axes. It must not queue release behind the
+busy broker. Cleanup reaps the request and removes its control directory before returning. SIGKILL cannot run shell
+traps; the finite device batch remains the last-resort release bound.
+The fake-device host regression retains a **6 s signal-to-completed-axis-release bound** for a 20 s pan
+(10 s before reversal). It timestamps the zero-axis/SYN sequence on the fake device with a monotonic clock;
+the separate **30 s outer timeout** allows loaded-host pipe draining, request reaping and broker/control-directory
+cleanup. That outer allowance does not relax the release bound or permit a reversal after cancellation.
 
 Every pan invokes `sampler.py --gpu-snapshot` just before and after motion via the persistent root shell, storing raw
 cumulative counters in `gpu-time-in-state.jsonl`. The first supported source is KGSL/devfreq `trans_stat`, then the
@@ -185,6 +267,102 @@ not one estimate per 300-frame window. Optional `--per-window` adds `per_window`
 breakdown while retaining those interval tables. Use a capture containing only the intended warmed measured
 interval when interpreting a result; missing/evicted files are censored coverage, not zero observations.
 
+### Pipeline/shader groups
+
+`TOTK_VK_GPU_PROFILE_PIPELINES=1..16` (default `0`, requires `GPU_PROFILE=1/2/3`) adds actual GPU
+brackets for contiguous pipeline/full-VS-FS-variant groups and separate CS dispatch groups. Recommended
+starting capture: `TOTK_VK_GPU_PROFILE=1 TOTK_VK_GPU_PROFILE_SAMPLE=2
+TOTK_VK_GPU_PROFILE_PIPELINES=4 TOTK_VK_GPU_PROFILE_STATS=0`. Do not infer shader work from old pass rows:
+`shader` is only the pass's first draw signature; `draws` belongs to the entire pass.
+
+When pipeline profiling is enabled, output now defaults to **worker-aggregated compact windows**.
+`TOTK_VK_GPU_PROFILE_PIPELINES_RAW=1` explicitly restores per-group `pipeline`,
+per-lease/frame `pipeline_coverage` and global `frame` rows; unset/`0` uses compact output.
+This switch does not change the parent profiler when pipeline profiling is off. Raw schema-3 captures
+remain readable, including older headers without the additive compact declaration.
+
+The analyzer automatically adds `pipelines` to its JSON result and a shader-pair text table:
+`pipelines.pipelines` keeps launch/stream-scoped actual Vulkan handles, and `pipelines.shader_pairs`
+merges exact full `kind/vs/fs/cs` tuples across streams. Compact headers declare `pipeline_output`,
+`pipeline_compact_version:1` and the exact ordered `pipeline_window_columns`. `pipeline_key` dictionaries
+map positive launch-local IDs to handle + kind + complete shader tuple, never a truncated shader hash or pass
+ordinal. `pipeline_window` numeric arrays carry retained counts, valid/missing/discarded sample counts,
+measured moments and eligible inverse-probability-weighted moments for a canonical 300-frame window;
+orderly close also emits the final partial window. Only keys with selected observations are emitted.
+Keys absent from a window are **unknown/not selected**, not zero-cost entries.
+`pipeline_window_coverage` retains completed/eligible/excluded frame counts, population/budget exposure
+tuples, selected/query counters, optional detail omissions, true losses and aggregation/performance facts.
+The analyzer preserves these original summaries in `pipelines.compact_windows`, including thread CPU
+time, serialized bytes, peak worker backlog and bounded aggregation memory.
+
+Dictionary records must precede their references in the **same retained file**, including after rotation.
+Conflicting/missing dictionaries, unsupported column dimensions/order, nonfinite/inconsistent moments,
+impossible count/probability relationships, missing parent/compact window pairs and incomplete frame
+coverage withhold estimates. Never join a handle or dictionary ID across launches.
+Compact data cannot recover exact per-frame exclusions, per-pass keys, frame percentiles or raw query
+statuses: `domain_excluded_frames` and group `pass_keys` are null; `domain_excluded_windows` supplies
+only the known count per window. Advertised suppression of global frame rows is not itself a capture
+gap; parent window and compact coverage authority replace it for supported aggregate estimates only.
+Do not fabricate frame rows or infer frame-latency percentiles from a sum or sum-of-squares.
+
+In explicit raw mode, `pipeline` rows retain `frame/group`, `pass_key/pass_ordinal`, actual `pipeline`,
+full `vs/fs/cs`, `draws/dispatches`, nullable `primitives`, known/unknown primitive counts/reason,
+`selected/status`, nullable `gpu_ms`, timestamp count and each sample's selection numerator/denominator.
+Raw `pipeline_coverage` rows retain lease/frame, observed/dropped/selected groups, timestamps, population/
+phase, optional unretained detail, out-of-domain groups and discard state.
+Pass frame/window timestamp counts exclude this separate query pool.
+
+Uniform 32-bit launch bits plus rotating phase give every in-domain ordinal probability `budget/N`.
+Population `N` starts at 2048 and grows to the next power of two after larger observed frames; it never
+shrinks (implementation ceiling `2^31` groups/frame). Phase is `(launch_bits + (frame-1)*budget) mod N`,
+so growth preserves uniform marginal probability without another random syscall. A newly growing tail
+is uncovered only for its first frame, NOT permanently excluded. Stable layouts eventually cover every
+ordinal across passes AND groups within `ceil(N/budget)` frames. There is no per-pass prefix timing cap.
+At most `2*budget` extra writes/frame; 2048 metadata records and 1024 timestamp pairs/lease bound storage.
+ALL selected groups have reserved metadata space; at most 1024 additional unselected groups/lease retain
+optional detail. Excess unselected detail is explicitly `unretained`, not a timing loss or zero-cost shader.
+Observed counters are retained subtotals when `counts_complete:false`: optional metadata can be omitted
+at ingest, and compact output also omits unselected-only key/windows. Neither kind of omission may be
+reinterpreted as zero draws or used to scale timings by observed/sample frequencies.
+`weighted_gpu_ms` is `sum(valid group ms * actual N/budget)`, NOT equal draw work. Each sample retains
+its own weight even when population grows mid-window; multiplying the final sample sum by the final
+population is wrong. `estimated_gpu_ms` estimates the whole captured group population only with complete
+domain/selection authority and no true loss. Growing-frame tails withhold that estimate.
+`eligible_estimated_gpu_ms` ranks only completed domain-covered frames, explicitly reporting exclusion
+counts and `eligible_frames`; it is not a whole-capture total when exclusions exist.
+Discarded frames and true dropped groups are excluded from that domain, and true query/data losses still
+withhold **both** estimates. Missing/invalid selected samples, unavailable queries, worker lease/closure
+drops, unfinished closures, aggregation/key/frame overflow, missing dictionaries and rotation/capture
+loss cannot silently become successful estimates. Optional unselected detail omissions do not censor
+selected timing. Descriptive moments and valid-sample weighted subtotals are not loss correction,
+IID standard errors or confidence intervals.
+No samples mean null estimate, not zero shader cost. `thin` warns below ten eligible group samples.
+Selection is correlated, not IID: periodic work may alias; repeat launches for independent phases.
+Input primitive counts include instances and quad-to-triangle conversion, not clipping/rasterization.
+Indexed restart without index payload authority is null with a known subtotal/unknown draw count; compute
+has null primitives and explicit dispatch counts. Unselected/unavailable/invalid/discarded timing is null.
+
+These are instrumented GPU intervals including state/setup and timestamps, NOT isolated shader cost;
+never add them to overlapping pass totals. The bound does not prove cheap device behavior: ALL_COMMANDS
+may serialize work, and metadata/output still costs CPU/IO. First calibrate off/on in same-APK ABBA runs,
+then keep pass sampling fixed and ABBA PIPELINES=0/4. Match driver, exact seed manifest/module hashes,
+save/route, render size/FPS cap and thermals; inspect CPU p50/p95, GPU span, clocks, query counts and loss.
+Uniform phase alone cannot remove instrumentation-driven workload changes or prove statistical confidence.
+
+Aggregation is bounded (8192 dictionary/window keys and 64 population exposures); capacity exhaustion
+is explicit overflow, never unbounded allocation or silent eviction of estimator authority. Inactive
+dictionary entries can be retired internally, but IDs are never reused and referenced mappings must
+still be emitted before use after file rotation. Storage remains four bounded files; default compact
+output aims at **at most roughly 50 MB per ten logical minutes**, including retained parent pass/window
+output, for the realistic 4096-key churn fixture—not a guarantee for arbitrary shader/pass churn.
+Default rotation size alone cannot fix an unsustainable producer, and retaining only the latest files
+does not preserve earlier whole-capture estimates. Capture all `.jsonl*` rotations and keep loss warnings.
+Report actual bytes/window and total bytes, aggregation/flush **thread CPU** per window, peak memory/
+backlog, producer pacing waits, true drops and close-time flush separately. Fast synthetic producer
+waiting must not be mislabeled as a real-time throughput result. Host throughput or zero host drops is
+**not proof** that Duo no longer drops slots; only a later matched device run can establish that.
+
+
 ### Sampled queries and interpretation
 
 `TOTK_VK_GPU_PROFILE_SAMPLE` defaults to **`0`**, including unset: existing full-mode behavior is unchanged.
@@ -242,7 +420,7 @@ scans texture/storage-image bindings, looks up/copies the texture registry, sear
 allocates audit arrays or logs liveness candidates, including on unselected passes. Static attachment
 LOAD/CLEAR/STORE/DONT_CARE operations and logical byte estimates remain pass-key-derived summaries,
 not a speculative liveness audit or hardware traffic counter. The dedicated `totk-gpuprof` worker
-owns query result reads, aggregation, formatting/output and resets; its sixteen prepared leases are
+owns query result reads, aggregation, formatting and resets; its 32 prepared leases are
 bounded. One-time opt-in startup preparation can wait, but exhaustion during play drops coverage
 (`background_dropped_slots`, cumulative, plus missing frame coverage), never waits for profiler I/O.
 CPU present has an independent ordered closure FIFO (256 entries, header `background_closures`).
@@ -426,6 +604,103 @@ thin warnings and optional per-window output, without changing full-mode output.
 The explicit CPU-close replay fixtures pin opt-in-only behavior, original invalidity/provenance, complete
 frame/pass/window consistency and rejection of missing build/domain/endpoint authority, gaps, true query
 failures, background losses, corrupt timestamps and negative full-mode gaps.
+Pipeline fixtures additionally pin probability/rotation bounds, unknown primitive semantics, null missing
+timings, explicit overflow/discard loss, full variant mapping and fixed inverse-probability weighting.
+The real `--pipeline-groups` fixture changes actual color-mask pipelines within a pass (3/2/4 draws), spans
+one-draw secondary chunks and executes a real seeded compute dispatch. A continuation draw after a nested
+pre-upload scope must remain in the exact main parent group; ending the child cannot close the parent's
+pipeline query. `--pipeline-overflow` exercises 2049 alternating groups and domain growth. The existing
+mode/default-off and sealed-present fixtures also cover this switch.
+The raw Vulkan assertions explicitly request `PIPELINES_RAW=1`; separate real `--pipeline-groups`
+assertions leave it unset and require compact dictionary/window/coverage rows with no global frame rows.
+Pure fixtures serialize **one** logical 4096-key dataset into both encodings, retaining explicit optional
+unselected omissions rather than generating a second handmatched expected dataset. They compare estimates,
+moments, count subtotals and thin/missing/censor flags with `1e-9` relative/absolute tolerance, including
+20–60 logical fps, mid-window population growth, partial close, missing/invalid queries, true drops,
+discard, missing/late/conflicting dictionaries, rotation loss and unfinished groups.
+A separate fixed-cost ground-truth run activates each 2048-key set for a full 512-frame rotation block,
+then churns to the other half of its 4096-key pool. The block boundary crosses 300-frame windows; four
+retained rotated files and a partial final window must recover each key's known GPU-ms and exact shader
+tuple totals within `1e-10` relative/absolute tolerance. This demonstrates estimator recovery, not merely
+agreement between encodings. It does **not** claim exact finite-sample recovery for arbitrary phase-correlated
+churn. A P1-shaped regression retains 63/70 leading optional lease rows plus intact 86+11 rows: the seven
+missing rows must produce an explicit `retained-row-count-mismatch`, while 137 valid samples remain
+unestimable under independent rotation/missing-window/background-drop authority.
+Missing `session_end` is also a pipeline censor reason, for raw and compact alike. Complete-looking
+retained windows do not prove that the final partial window or final loss counters were captured.
+Regression cases remove the footer (and separately leave a partial footer JSON line) from both
+known-truth encodings; both estimates and counter-completeness authority must fail closed.
+The bounded pool is 32 packed leases; headers publish CPU storage bytes and actual query capacities.
+The device configuration uses 31,075,072 CPU lease bytes on the host 64-bit ABI (compact2: 51,980,288,
+−40.2%), excluding driver storage, compact aggregation, parent aggregation and sink/stack memory.
+SAMPLE=2/PIPELINES=4/STATS=0 uses 1280 pipeline records, 386 parent and 512 pipeline timestamp slots
+per lease (28,736 total query slots versus compact2's 200,768); disabled statistics allocate no scratch.
+Lease records borrow process-lifetime immutable shader-name pointers (104 rather than 320 bytes/record);
+the bounded 4,427,008-byte worker dictionary owns full names, merges exact-name aliases and caches
+immutable source tuples. The host fixture precomputes the identical 4096-key/churn names with a
+separately reported `fixture_identity_memory_bytes` bound, instead of formatting them on every sample.
+Driver query-pool memory is additional and not inferred from those counts. Compact writes use an
+independent bounded 1 MiB byte FIFO and 256 KiB sink stack; overflow is explicit
+`output_sink_overflows`/`output_failures`, not a consumer wait or valid estimate. Bounded rotation
+markers move rotation IO to the sink too; close drains prior writes then joins the sink after its footer.
+The old `--worker-scale 2700 --pace 1` model uses only two leases/frame and did **not** predict Duo's
+approximately 18 submissions/frame or burst stalls. Use the device-shaped regression instead:
+`--compact-fixture --frames 330 --fps 30 --pace 1 --parts 18 --gpu-held 8 --nonblocking 1
+--sample-budget 2 --spread-percent 60 --writer-stall-ms 200`. Submissions span 60% of each frame,
+matching the device's ~20 ms recording/33 ms frame rather than an instantaneous lease burst.
+`--coupled-stall 1` stalls the consumer as a failure control; default stalls
+the independent sink, which must preserve lease recycling, clean drain and end authority.
+`--sink-contract` checks bounded overflow/rejection and ring-wrap byte identity. Effective consumer
+nice/affinity are in headers; window cumulative service CPU/wall and phase wall counters, and
+bounded footer drop-frame occupancy/phase summaries, distinguish worker backlog from in-flight
+ownership without per-event lines. Leases already cover whole submissions, not individual passes;
+coarsening across independent fences would require different publication/reset/closure authority.
+For ten-minute rate checks use `--seconds 600 --fps 30` or `--fps 45` with the same 18-part
+nonblocking parameters, `--worker-scale 2700 --catch-up 0`. Slowdown charges 2.7× measured service
+to thread CPU time using synthetic CPU work, not tiny per-lease sleeps or multiplied host scheduling.
+Model worker CPU includes that synthetic work; explicit sink/coupled stalls still model IO separately.
+Default paced producers rebase a missed whole-frame deadline without skipping work; explicit
+`--catch-up 1` preserves old deadline catch-up burst stress. Report `producer_late_frames`,
+`producer_late_slots`, `producer_max_late_ms`, `producer_rebase_seconds` and actual wall duration.
+Keep failed old-mode evidence; corrected rate-model success is not burst-stress or device proof.
+Pipeline profiling is qualified only for **≤30 fps capture configurations** (Duo or capped Thor).
+The 600-second 30-fps CPU-service model passes; 45 fps is **not qualified**, and its failed captures
+must be retained. Uncapped Thor needs a separate device check and mandatory footer/drop inspection;
+loss/missing closure fails closed. This limit does not silently clamp the game or grow the lease pool.
+`--record-fixture` isolates production hook/lease CPU at 4096 groups and 8192 draws/frame, counting
+but not driver-encoding timestamp calls.
+
+
+For parent-owned host execution, `vkgpuprofcompacttest` builds the production-worker fixture without
+shader seeds or a Vulkan instance. Set `OUT` to an absolute host output directory:
+
+```sh
+LOCK=/home/agent/Projects/totk-android/.scratch/hosttest.lock
+flock "$LOCK" taskset -c 0-3 nice -n 10 make -C games/totk/android TARGET=linux CC=cc OUT="$OUT" vkgpuprofcompacttest
+flock "$LOCK" taskset -c 0-3 nice -n 10 "$OUT/vkgpuproftest" --compact-contract
+```
+
+Run each capture invocation below in its **own empty working directory** so launch files do not mix:
+
+```sh
+# Ten logical minutes, 4096-key churn, fps cycles20/30/40/50/60.
+flock "$LOCK" taskset -c 0-3 nice -n 10 env TOTK_VK_GPU_PROFILE_PIPELINES_RAW=0 "$OUT/vkgpuproftest" --compact-fixture --seconds 600 --fps 0 --pace 0 --loss 0
+# Same seeded logical data, bounded raw-vs-compact partial-close comparison.
+flock "$LOCK" taskset -c 0-3 nice -n 10 env TOTK_VK_GPU_PROFILE_PIPELINES_RAW=0 "$OUT/vkgpuproftest" --compact-fixture --frames 302 --fps 0 --pace 0 --loss 0
+flock "$LOCK" taskset -c 0-3 nice -n 10 env TOTK_VK_GPU_PROFILE_PIPELINES_RAW=1 "$OUT/vkgpuproftest" --compact-fixture --frames 302 --fps 0 --pace 0 --loss 0
+# True missing/invalid/drop cases must remain unknown.
+flock "$LOCK" taskset -c 0-3 nice -n 10 env TOTK_VK_GPU_PROFILE_PIPELINES_RAW=0 "$OUT/vkgpuproftest" --compact-fixture --frames 302 --fps 0 --pace 0 --loss 1
+```
+
+Also exercise fixed `--fps 20` and `--fps 60`, bounded rotation with `TOTK_VK_GPU_PROFILE_MAX_BYTES=4096`,
+and `--pace 1` when measuring wall-paced host behavior. `--frames` overrides seconds. Both pacing modes
+may wait for synthetic producer capacity; report `producer_wait_ms` rather than treating zero dropped
+synthetic slots as proof the host—or Duo—keeps up without backpressure. Keep raw runs bounded: their
+per-group bytes are intentionally large. Analyze all retained `.jsonl*` files with `gpuprof.py`.
+The C fixture retains optional metadata that compact may suppress for never-selected key/windows:
+compare count subtotals only for the same retained/emitted population, never assert identical never-sampled
+inventories. The pure fixture above supplies exact subtotal-equivalence and independent known-truth assertions.
+
 The optional `GPUPROF_TEST_BIN=<absolute vkgpuproftest path>` enables fresh-process real Vulkan runs for
 modes 0/1/2/3, recorder workers 0/2, statistics on/off/unsupported, ordinal windows off/on, split-frame and
 unsent multi-frame reconciliation, direct pre uploads while main rendering is open, default row/byte reduction
