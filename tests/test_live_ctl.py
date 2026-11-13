@@ -77,6 +77,11 @@ class LiveCtl(unittest.TestCase):
             self.assertTrue(all(f'{key} is startup-only' in line for line in got), got)
             self.assertTrue(all('set it in totk.env and restart' in line for line in got), got)
 
+    def test_integer_folding_is_startup_only(self):
+        got = self.parse('set TOTK_VK_INT_FOLD=0', 'unset TOTK_VK_INT_FOLD')
+        self.assertTrue(all('TOTK_VK_INT_FOLD is startup-only' in line for line in got), got)
+        self.assertTrue(all('set it in totk.env and restart' in line for line in got), got)
+
     def test_malformed_and_refused(self):
         got = self.parse('set TOTK_VK_DESC_STOCK', 'set TOTK_VK_DESC_STOCK=', 'set TOTK_VK_DESC_STOCK=2',
                          'set TOTK_VK_DESC_STOCK=1x', 'set TOTK_TIMER_SLACK_NS=0', 'set TOTK_PRIO_RENDER=-21',

@@ -3023,6 +3023,29 @@ The second adds `NoContraction` only to core float arithmetic feeding Position t
 Each opt-in arm isolates shader/pipeline/prewarm cache identity. Compare identical fresh-process camera sweeps for flicker, GPU ms and compile/warm-up cost; no speedup is claimed.
 Host checks: `python3 -m unittest discover -s tests -p test_vk_position.py -v`; with `spirv-val`, set `TOTK_TEST_POSITION_SEED` to a loose seed directory or `seed.vkpack` for real vertex samples in all four arms.
 
+**Integer address proofs:** `TOTK_VK_INT_FOLD` is startup-only, default **1**; only exact `=0` disables it.
+The requested and effective policy is logged once. It folds only proven scalar integer bits, preserving
+byte-offset wraparound, FP/NaN guards, bounds and stage outputs. Same-block non-aliased Function locals
+carry alignment proofs into UBO component selection; unknown control-flow facts are discarded.
+Direct/group `RelaxedPrecision` values and decorated locals supply no exact-bit facts; any decorated result
+keeps its original opcode, including `NoSignedWrap` / `NoUnsignedWrap`. This avoids changing permitted reduced
+precision or leaving opcode-specific decorations on `OpCopyObject`. Per-block generation stamps and a
+constant lookup index replace bound-sized clears/searches; the lowest already-seen same-type constant ID
+is still selected. No index or proof allocation occurs in the off arm.
+The pass runs on each loaded module immediately before `vkCreateShaderModule`, after the existing runtime
+patches; it does not change translator outputs, shared variant hashes, reflection, or packed seed bytes.
+Keep seeds unfurled for both arms. Existing seeds and fresh-install packs remain usable without regeneration.
+The enabled arm adds `.intfold-v1` to pipeline/prewarm/import/compute/learned-IO cache paths (including
+alternate seeds and explicit paths); `=0` retains the old unfurled namespace. The first default launch after
+updating recompiles driver pipelines as needed, with possible one-time loading/route stutter, not a full
+shader import. Newly learned histories warm later launches; elapsed rebuild time is device/route dependent.
+Earlier standalone a740 estimates reduced total instructions by 6.58% (not an FPS prediction), with seven
+occupancy regressions. Prior Thor quartets were throughput-neutral with no observed visual defects;
+capped busy-weighted-clock work proxies fell 2.26% on Duo Hateno and 4.1–5.4% on Odin (Odin's strict
+equal-FPS gate did not pass). Battery savings remain unconfirmed. Odin's uncapped standing sample rose
+61.93→63.81 fps; pan remained SAME. Measure fresh-process `=0`/default O/B/B/O GPU time, clocks and tails,
+with geometry/skinning/vegetation picture checks on each device; these are not general speedup guarantees.
+
 ### Original NVN early fragment tests (guest semantics)
 
 Original shader **declared** early depth/stencil tests are honored **by default**. `TOTK_VK_EARLYZ=0` is an explicit,

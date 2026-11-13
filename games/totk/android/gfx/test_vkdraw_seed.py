@@ -13,7 +13,13 @@ layout(std140, set=0, binding=0) uniform support_buffer_t { vec4 alpha; } suppor
 layout(std140, set=0, binding=1) uniform vp_c3_t { vec4 off; } vp_c3;
 layout(location=0) in vec2 pos;
 layout(location=1) in vec2 delta;
-void main() { gl_Position = vec4(pos + delta + vp_c3.off.xy, 0.0, 1.0); }
+// Keep the aligned component live: it selects UBO lanes that affect every draw.
+// Unoptimized glslang output carries the address through Function locals.
+void main() {
+    uint address = floatBitsToUint(pos.x) * 48u;
+    uint component = (address >> 2u) & 3u;
+    gl_Position = vec4(pos + delta + vec2(vp_c3.off[component], vp_c3.off[component + 1u]), 0.0, 1.0);
+}
 '''
 FS = '''#version 450
 layout(std140, set=0, binding=0) uniform support_buffer_t { vec4 x; } support_buffer;

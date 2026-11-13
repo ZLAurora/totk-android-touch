@@ -17,6 +17,20 @@ early-fragment tests are now default-on; `CHUNK_DRAWS` stays 75. Plain `--runtim
 request `--shaders` when the new seed-policy epoch must be evaluated. Host normal/TSan acceptance is not a combined
 Android-device result.
 
+**Default integer shader folding:** `TOTK_VK_INT_FOLD=0` in `totk.env` plus a restart is the control;
+unset enables it. Check the one-time `requested=... effective=...` log before comparing. This exact
+32-bit address proof runs at Vulkan module load, not during seed translation; float math and NaN guards
+are unchanged. Existing packed/loose seeds need no regeneration. The enabled `.intfold-v1` namespace
+deliberately starts driver pipelines/prewarm/compute/IO learning cold after update, so first-use loading
+or traversal may stutter once; no full shader import is needed. Warm both arms independently before
+timing. Prior Thor throughput was SAME without observed picture defects; Duo Hateno's capped GPU-work
+proxy fell 2.26%; Odin proxies fell 4.1–5.4% but missed the strict equal-FPS gate. Battery improvement
+is unconfirmed. Odin's uncapped standing sample was 61.93→63.81 fps (pan SAME), not a general gain.
+Repeat picture checks (Link/NPC skinning, shadows, grass, terrain/water, effects and UI), record first
+post-update pipeline rebuild time, then one restart `=0`/default O/B/B/O quartet on Duo, Thor and Odin.
+See VULKAN.md's integer address proofs section for the shader policy details.
+
+
 **Round-eight default record (historical):** Android tried AHB with automatic copy fallback; explicit
 `TOTK_VK_PRESENT=copy` remained the control. The then-current chunk rule was 600 only with
 `TOTK_FRAME_LAG=1`, otherwise 75, and lag was recorded as off pending separate VMA safety work.

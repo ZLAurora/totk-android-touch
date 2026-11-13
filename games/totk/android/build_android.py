@@ -299,7 +299,7 @@ def companion_assets(tree, version, work, out, logs, env):
 
 # ---- the app ----
 APP_PACKAGE = 'com.aure.totk'
-INSTALL_SH = '''#!/bin/sh
+INSTALL_SH = r'''#!/bin/sh
 # The Android app TotK Native (android/APP.md), a developer build: its game folder is the app's folder on shared storage
 #   /sdcard/Android/data/{package}/files   (install.json, rewritten/, game-data/, extracted/, shaders/, companion/,
 #                                            driver.so, totk.env, totk.log)
@@ -314,11 +314,11 @@ INSTALL_SH = '''#!/bin/sh
 #   sh install_app.sh log          the app's log (totk.log)
 #   sh install_app.sh saves        copy the app's saves (kept in its private storage) to saves-<date>.tar here
 #                                  (requires a debuggable dev APK; release APKs deny run-as)
-#   sh install_app.sh cache-export copy the app's Vulkan pipeline cache to vk-pipeline-cache-<date>.bin here
+#   sh install_app.sh cache-export copy existing private Vulkan caches into cache-export-<date>/, preserving their names
 #                                  (requires a debuggable dev APK; release APKs deny run-as)
-#   sh install_app.sh cache-import FILE   give the app a compatible GPU/driver/TU_DEBUG cache, checked at next start
+#   sh install_app.sh cache-import FILE...   stage exported caches under their unchanged names (also works with release APKs)
 set -e
-FILE="$2"; case "$FILE" in /*|"") ;; *) FILE="$PWD/$FILE" ;; esac   # cache-import FILE, from where the script was called
+CALLER="$PWD"   # cache-import paths are relative to where the script was called, not the output folder
 cd "$(dirname "$0")"
 PKG={package}
 DIR=/sdcard/Android/data/$PKG/files
@@ -328,6 +328,21 @@ require_run_as() {{
     echo "Install a matching-signed dev APK over the release APK without uninstalling to retain data; export, then reinstall the release APK if wanted." >&2
     exit 1
   fi
+}}
+# The runtime-produced basename carries seed/position/integer-fold identity. Never
+# infer the active arm from the host, source totk.env, strip a suffix or relabel bytes.
+cache_name() {{
+  case "$1" in vk-pipeline-cache.bin*) ;; *) return 1 ;; esac
+  suffix=${{1#vk-pipeline-cache.bin}}
+  case "$suffix" in *.intfold-v1) suffix=${{suffix%.intfold-v1}} ;; esac
+  case "$suffix" in
+    *.pos-v1-10) suffix=${{suffix%.pos-v1-10}} ;;
+    *.pos-v1-01) suffix=${{suffix%.pos-v1-01}} ;;
+    *.pos-v1-11) suffix=${{suffix%.pos-v1-11}} ;;
+  esac
+  case "$suffix" in "") return 0 ;; .*) suffix=${{suffix#.}} ;; *) return 1 ;; esac
+  [ "${{#suffix}}" -eq 64 ] || return 1
+  case "$suffix" in *[!0-9a-f]*) return 1 ;; esac
 }}
 case "$1" in
   "") adb install -r totk.apk; echo "installed; start it from the launcher, or: adb shell monkey -p $PKG -c android.intent.category.LAUNCHER 1" ;;
@@ -370,14 +385,38 @@ case "$1" in
     echo "saved $f" ;;
   cache-export)
     require_run_as
-    f="vk-pipeline-cache-$(date +%Y%m%d-%H%M%S).bin"; tmp="$f.tmp"
-    if ! adb exec-out run-as "$PKG" cat files/state/vk-pipeline-cache.bin > "$tmp"; then rm -f "$tmp"; exit 1; fi
-    if ! mv "$tmp" "$f"; then rm -f "$tmp"; exit 1; fi
-    echo "saved $f ($(wc -c < "$f") bytes; requires matching GPU, driver SHA256 and TU_DEBUG; see APP.md legacy exception)" ;;
+    paths=$(adb exec-out run-as "$PKG" find files/state -maxdepth 1 -type f)
+    folder="cache-export-$(date +%Y%m%d-%H%M%S)-$$"; found=0
+    while IFS= read -r path; do
+      name=${{path##*/}}
+      cache_name "$name" || continue
+      [ "$path" = "files/state/$name" ] || continue
+      if [ "$found" = 0 ]; then mkdir "$folder"; found=1; fi
+      tmp="$folder/$name.tmp"
+      if ! adb exec-out run-as "$PKG" cat "$path" > "$tmp"; then
+        rm -f "$tmp"; rmdir "$folder" 2>/dev/null || :; exit 1
+      fi
+      if ! mv "$tmp" "$folder/$name"; then
+        rm -f "$tmp"; rmdir "$folder" 2>/dev/null || :; exit 1
+      fi
+      echo "saved $folder/$name ($(wc -c < "$folder/$name") bytes; keep this basename)"
+    done <<CACHE_PATHS
+$paths
+CACHE_PATHS
+    if [ "$found" = 0 ]; then echo "error: no transferable Vulkan pipeline caches in private files/state" >&2; exit 1; fi ;;
   cache-import)
-    if [ ! -f "$FILE" ]; then echo "usage: sh install_app.sh cache-import FILE"; exit 2; fi
-    adb push "$FILE" "$DIR/vk-pipeline-cache.bin"; echo "the app validates context at its next start (.imported on merge, .stale on mismatch)" ;;
-  *) echo "usage: sh install_app.sh [from-device|data|data-packed|data-loose|log|saves|cache-export|cache-import FILE]"; exit 2 ;;
+    shift
+    if [ "$#" = 0 ]; then echo "usage: sh install_app.sh cache-import FILE..."; exit 2; fi
+    for file do
+      case "$file" in /*) ;; *) file="$CALLER/$file" ;; esac
+      name=${{file##*/}}
+      if [ ! -f "$file" ] || ! cache_name "$name"; then
+        echo "error: use an existing cache with its original vk-pipeline-cache.bin[namespace] basename; refusing to guess or relabel its arm: $file" >&2; exit 2
+      fi
+      adb push "$file" "$DIR/$name"
+      echo "staged $name unchanged; only the matching runtime namespace imports it (.imported on merge, .stale on context mismatch)"
+    done ;;
+  *) echo "usage: sh install_app.sh [from-device|data|data-packed|data-loose|log|saves|cache-export|cache-import FILE...]"; exit 2 ;;
 esac
 '''
 
