@@ -307,6 +307,15 @@ static void *release_capture_waiter(void *unused) {
 static void screen_classify_probe(const tex_t *base, uint8_t *mem) {
     /* RGBA8 + D32 is deliberate: this tests the capture policy/lifetime and real depth writes,
        not B10G11R11 packing. Dimensions never enter the PSO key, so masks must be distinct. */
+    /* The shared VS selects off[component] / off[component + 1], where
+     * component = ((floatBitsToUint(pos.x) * 48) >> 2) & 3 must fold to zero.
+     * Consume distinct, nonzero UBO lanes and compensate the geometry so the
+     * exact full-target pixels below still apply. A wrong lane cannot hide
+     * behind an all-zero offset vector: z/w would move the triangle away. */
+    const float offsets[] = {.25f, -.25f, 4, 8};
+    const float full[] = {-1.25f, -.75f, 2.75f, -.75f, -1.25f, 3.25f};
+    memcpy(mem + 0x40000, offsets, sizeof offsets);
+    memcpy(mem + 0x30000, full, sizeof full);
     tex_t capture = *base, capture_depth = *base, scene = *base, scene_depth = *base;
     capture.mem = mem + 0x70000; capture.serial = 200;
     capture_depth.mem = mem + 0x80000; capture_depth.serial = 201; capture_depth.d.format = 0x34;

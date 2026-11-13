@@ -25,6 +25,7 @@
 #include "vk_load_proof.h"
 #include "vk_subgroup.h"
 #include "vk_position.h"
+#include "vk_int_fold.h"
 #include <errno.h>
 #include <inttypes.h>
 #include <sys/stat.h>
@@ -40,6 +41,14 @@ static void position_init(void) {
     g_position_policy = vk_position_policy(getenv("TOTK_VK_POS_INVARIANT"), getenv("TOTK_VK_POS_NOCONTRACT"));
     LOGV("[nvn-vk] TOTK_VK_POS_INVARIANT=%u (startup-only): vertex Position Invariant", g_position_policy & 1);
     LOGV("[nvn-vk] TOTK_VK_POS_NOCONTRACT=%u (startup-only): position-feeding float arithmetic NoContraction", g_position_policy >> 1);
+}
+
+static pthread_once_t g_int_fold_once = PTHREAD_ONCE_INIT;
+static int g_int_fold;
+static void int_fold_init(void) {
+    const char *s = getenv("TOTK_VK_INT_FOLD");
+    g_int_fold = !s || strcmp(s, "0");
+    LOGV("[nvn-vk] TOTK_VK_INT_FOLD requested=%s effective=%d (startup-only): proven scalar integer address bits", s ? s : "unset", g_int_fold);
 }
 
 /* Folder selection is process-lifetime. Preserve legacy cache paths for the
@@ -83,14 +92,16 @@ static void seed_init(void) {
     for (int i = 0; i < 32; i++) snprintf(g_seed_tag + 2 * i, 3, "%02x", digest[i]);
 }
 static const char *seed_dir(void) { pthread_once(&g_seed_once, seed_init); return g_seed_dir; }
-/* Alternate seeds and position precision arms namespace explicit cache/import
-   paths too. Off/off with the canonical seed retains legacy paths. Caller owns out. */
+/* Alternate seeds, position precision and integer folding namespace explicit
+   cache/import paths too. Both policies off retains legacy paths. Caller owns out. */
 const char *vk_shader_cache_path(const char *base, char *out, size_t size) {
     pthread_once(&g_seed_once, seed_init);
     pthread_once(&g_position_once, position_init);
+    pthread_once(&g_int_fold_once, int_fold_init);
     if (!base || !strcmp(base, "0")) return NULL;
     const char *suffix = vk_position_cache_suffix(g_position_policy);
-    int n = g_seed_default ? snprintf(out, size, "%s%s", base, suffix) : snprintf(out, size, "%s.%s%s", base, g_seed_tag, suffix);
+    const char *fold = g_int_fold ? ".intfold-v1" : "";
+    int n = g_seed_default ? snprintf(out, size, "%s%s%s", base, suffix, fold) : snprintf(out, size, "%s.%s%s%s", base, g_seed_tag, suffix, fold);
     return n >= 0 && (size_t)n < size ? out : NULL;
 }
 static void seed_io_start(void) {
@@ -130,6 +141,7 @@ int vk_shaders_ready(void) {
    a later process-wide chdir by the guest/runtime. Keep this base process-owned. */
 void vk_shader_seed_startup(const char *game_dir) {
     pthread_once(&g_position_once, position_init);
+    pthread_once(&g_int_fold_once, int_fold_init);
     if (!g_seed_dir && !realpath(game_dir, g_seed_base))
         snprintf(g_seed_base, sizeof g_seed_base, "%s", game_dir);
     if (vk_seed_io_enabled()) seed_io_start(); /* index/warming overlaps remaining boot work */
@@ -380,6 +392,7 @@ static int spirv_image_features_ok(const uint32_t *w, size_t nw, int can_read, i
 static int hexval(int c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1; }
 static vk_shader *shader_load(const char *variant, int early_tests) {
     pthread_once(&g_position_once, position_init);
+    pthread_once(&g_int_fold_once, int_fold_init);
     shader_key key = {0}; snprintf(key.variant, sizeof key.variant, "%s", variant);
     key.early_tests = (uint32_t)early_tests; key.position_policy = g_position_policy;
     vk_shader *sh = nvn_hm_get(&g_shaders, &key);
@@ -496,6 +509,12 @@ static vk_shader *shader_load(const char *variant, int early_tests) {
         if (fixed < 0) {
             RED(32, "subgroup shader %s: cannot preserve 32-lane semantics on this device/module; refused", variant);
             free(spv); free(sh->b); free(sh->c1); free(sh); return NULL;
+        }
+    }
+    if (g_int_fold) {
+        int folded = vk_spirv_int_fold((uint32_t *)spv, spv_len / 4);
+        if (folded < 0) {
+            RED(16, "shader %s: integer proof unavailable; retaining original module", variant);
         }
     }
     VkShaderModuleCreateInfo mci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = spv_len, .pCode = (const uint32_t *)spv};

@@ -80,6 +80,17 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   instead of 24,783 and the shader pack grows by about 29 MiB. Existing shader packs stay valid; the added
   variants arrive when the user runs the full shader rebuild. Upstream's new compressed pipeline-row and
   recipe-row formats are not imported.
+- Enable exact integer shader-address folding by default (`TOTK_VK_INT_FOLD=0` turns it off).
+  Earlier tests reduced total native shader instructions by 6.58%; capped GPU-work estimates fell about
+  2.3% on Duo and 4–5% on Odin (not confirmed battery savings), while Thor throughput stayed the same.
+  Odin's uncapped standing sample rose from
+  61.93 to 63.81 fps; these are workload-specific results, not a general frame-rate promise.
+  With this port: pictures were correct on the Odin (six scenes) and the Duo (15 minutes). On the Duo, uncapped,
+  frame rate was unchanged (31.81 → 31.85 fps standing, 30.67 → 30.52 panning) and GPU time per frame fell from
+  24.61 to 23.93 ms and from 25.08 to 24.47 ms; no measured value was worse, but the comparison counts as
+  inconclusive because the GPU clock differed by 3.3% between the two settings. Not yet re-measured on the Thor
+  or, for speed, on the Odin. The driver's pipeline cache is rebuilt once in the background after this change
+  (about 5 minutes on the Odin; much longer on the Duo while playing); the shipped shader set stays valid.
 
 ### Menu
 - Add **Unlimited** to Frame rate: variable real-game updates up to the existing 120 fps safety ceiling, with

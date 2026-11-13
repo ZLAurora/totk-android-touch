@@ -913,6 +913,17 @@ static void vk_init_once(void) {
     free(pc_data);
     { const char *base = getenv("TOTK_VK_PIPELINE_CACHE_IMPORT"); if (!base || !*base) base = "vk-pipeline-cache.bin";
       char import_path[1100]; const char *ip = vk_shader_cache_path(base, import_path, sizeof import_path);
+      /* Imports retain their arm's filename; never relabel the opposite arm's
+       * blob into this namespace, even when the selected import is absent. */
+      if (ip) {
+          const char fold[] = ".intfold-v1"; size_t len = strlen(ip), suffix = sizeof fold - 1;
+          char other[1100]; int n;
+          if (len >= suffix && !strcmp(ip + len - suffix, fold))
+              n = snprintf(other, sizeof other, "%.*s", (int)(len - suffix), ip);
+          else n = snprintf(other, sizeof other, "%s%s", ip, fold);
+          if (n >= 0 && (size_t)n < sizeof other && !access(other, F_OK))
+              LOGV("[pipeline-cache] import skipped: %s does not match effective namespace %s", other, ip);
+      }
       size_t isz = 0; void *idata = vk_pcache_load(ip, &isz, 0); VkPipelineCache ic;
       VkPipelineCacheCreateInfo icc = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, .initialDataSize = isz, .pInitialData = idata};
       if (idata && !vkCreatePipelineCache(V.dev, &icc, NULL, &ic)) {

@@ -35,7 +35,7 @@ class BuildKindTests(unittest.TestCase):
         self.assertIn("'--release'", ast.unparse(release_functions['package']))
 
 
-    def test_private_exports_preflight_run_as_before_creating_files(self):
+    def test_private_saves_preflight_run_as_before_creating_files(self):
         tree = ast.parse((ANDROID / 'build_android.py').read_text())
         install = next(n.value for n in tree.body if isinstance(n, ast.Assign)
                        and any(isinstance(t, ast.Name) and t.id == 'INSTALL_SH' for t in n.targets))
@@ -57,35 +57,26 @@ class BuildKindTests(unittest.TestCase):
                 'sys.exit(9)\n')
             adb.chmod(0o755)
             env = dict(os.environ, PATH=f'{temp}{os.pathsep}{os.environ["PATH"]}')
-            for command in ('saves', 'cache-export'):
-                for old in (*temp.glob('saves-*.tar'), *temp.glob('vk-pipeline-cache-*.bin'),
-                            *temp.glob('*.tmp')):
-                    old.unlink()
-                with self.subTest(command=command, rejected=True):
-                    rejected = subprocess.run(['sh', str(generated), command], cwd=temp,
-                                              env=dict(env, REJECT_RUN_AS='1'), capture_output=True, text=True)
-                    self.assertNotEqual(rejected.returncode, 0)
-                    self.assertIn('debuggable dev APK', rejected.stderr)
-                    self.assertIn('matching-signed dev APK over the release APK without uninstalling',
-                                  rejected.stderr)
-                    self.assertFalse(list(temp.glob('saves-*.tar')))
-                    self.assertFalse(list(temp.glob('vk-pipeline-cache-*.bin')))
-                    self.assertFalse(list(temp.glob('*.tmp')))
-                with self.subTest(command=command, partial_failure=True):
-                    partial = subprocess.run(['sh', str(generated), command], cwd=temp,
-                                             env=dict(env, REJECT_EXPORT='1'), capture_output=True, text=True)
-                    self.assertNotEqual(partial.returncode, 0)
-                    self.assertFalse(list(temp.glob('saves-*.tar')))
-                    self.assertFalse(list(temp.glob('vk-pipeline-cache-*.bin')))
-                    self.assertFalse(list(temp.glob('*.tmp')))
-                with self.subTest(command=command, rejected=False):
-                    exported = subprocess.run(['sh', str(generated), command], cwd=temp, env=env,
-                                              capture_output=True, text=True)
-                    self.assertEqual(exported.returncode, 0, exported.stdout + exported.stderr)
-                    matches = list(temp.glob('saves-*.tar' if command == 'saves'
-                                              else 'vk-pipeline-cache-*.bin'))
-                    self.assertEqual(len(matches), 1)
-                    self.assertEqual(matches[0].read_bytes(), b'development export fixture')
+            # Cache transfer has its own namespace-aware adb/filesystem fixture.
+            rejected = subprocess.run(['sh', str(generated), 'saves'], cwd=temp,
+                                      env=dict(env, REJECT_RUN_AS='1'), capture_output=True, text=True)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn('debuggable dev APK', rejected.stderr)
+            self.assertIn('matching-signed dev APK over the release APK without uninstalling',
+                          rejected.stderr)
+            self.assertFalse(list(temp.glob('saves-*.tar')))
+            self.assertFalse(list(temp.glob('*.tmp')))
+            partial = subprocess.run(['sh', str(generated), 'saves'], cwd=temp,
+                                     env=dict(env, REJECT_EXPORT='1'), capture_output=True, text=True)
+            self.assertNotEqual(partial.returncode, 0)
+            self.assertFalse(list(temp.glob('saves-*.tar')))
+            self.assertFalse(list(temp.glob('*.tmp')))
+            exported = subprocess.run(['sh', str(generated), 'saves'], cwd=temp, env=env,
+                                      capture_output=True, text=True)
+            self.assertEqual(exported.returncode, 0, exported.stdout + exported.stderr)
+            matches = list(temp.glob('saves-*.tar'))
+            self.assertEqual(len(matches), 1)
+            self.assertEqual(matches[0].read_bytes(), b'development export fixture')
 
     def test_same_output_build_kind_transitions(self):
         # Observe the production Makefile's real runtime/GFX object rules. A recording compiler only writes

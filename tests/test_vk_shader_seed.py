@@ -41,14 +41,19 @@ class ShaderSeedTests(unittest.TestCase):
             env.pop('TOTK_SHADER_SEED_DIR', None)
             env.pop('TOTK_VK_POS_INVARIANT', None)
             env.pop('TOTK_VK_POS_NOCONTRACT', None)
+            env['TOTK_VK_INT_FOLD'] = '0'
             env['TEST_GAME_DIR'] = str(root)
             launch = root / 'unrelated-working-directory'
             launch.mkdir()
 
-            def run(folder, marker, indexed=False, position=('0', '0'), mutate=False):
+            def run(folder, marker, indexed=False, position=('0', '0'), mutate=False, fold: str | None = '0'):
                 e = dict(env)
                 e['TOTK_VK_SEED_IO'] = '1' if indexed else '0'
                 e['TOTK_VK_POS_INVARIANT'], e['TOTK_VK_POS_NOCONTRACT'] = position
+                if fold is None:
+                    e.pop('TOTK_VK_INT_FOLD', None)
+                else:
+                    e['TOTK_VK_INT_FOLD'] = fold
                 if mutate:
                     e['TEST_POSITION_MUTATE'] = '1'
                 if folder is not None:
@@ -58,6 +63,10 @@ class ShaderSeedTests(unittest.TestCase):
                 self.assertIn(f'shader seed: {lines[0]}', result.stderr)
                 for name, value in zip(('INVARIANT', 'NOCONTRACT'), position):
                     self.assertEqual(result.stderr.count(f'TOTK_VK_POS_{name}={value} (startup-only)'), 1)
+                requested = 'unset' if fold is None else fold
+                effective = int(fold != '0')
+                self.assertEqual(result.stderr.count(
+                    f'TOTK_VK_INT_FOLD requested={requested} effective={effective} (startup-only)'), 1)
                 self.assertTrue(Path(lines[0]).is_absolute())
                 return lines
 
@@ -80,6 +89,14 @@ class ShaderSeedTests(unittest.TestCase):
                     self.assertEqual(arm[1:4], [path + suffix for path in baseline[1:4]])
                     paths.append(tuple(arm[1:4]))
                 self.assertEqual(len(set(paths)), 4)
+                for fold in (None, '0', '1', '', 'invalid'):
+                    with self.subTest(folder=folder, fold=fold):
+                        for position in (('0', '0'), ('1', '1')):
+                            arm = run(folder, marker, position=position, mutate=True, fold=fold)
+                            suffix = '' if position == ('0', '0') else '.pos-v1-11'
+                            if fold != '0':
+                                suffix += '.intfold-v1'
+                            self.assertEqual(arm[1:4], [path + suffix for path in baseline[1:4]])
             for folder in ('', 'shaders', './shaders', str(root / 'shaders')):
                 with self.subTest(default_alias=folder):
                     self.assertEqual(run(folder, 'original')[1:4], legacy)

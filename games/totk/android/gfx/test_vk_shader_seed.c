@@ -9,6 +9,8 @@ int main(int argc, char **argv) {
     if (getenv("TEST_POSITION_MUTATE")) {
         setenv("TOTK_VK_POS_INVARIANT", "0", 1);
         setenv("TOTK_VK_POS_NOCONTRACT", "0", 1);
+        /* Every subsequent query must retain the startup arm and log only once. */
+        setenv("TOTK_VK_INT_FOLD", g_int_fold ? "0" : "1", 1);
     }
     if (!strcmp(argv[1], "--unready")) {
         assert(!vk_shaders_ready()); assert(!vk_shaders_ready());
