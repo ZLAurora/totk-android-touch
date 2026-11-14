@@ -59,7 +59,7 @@ final class TouchView extends View {
         VibratorManager vm = context.getSystemService(VibratorManager.class);
         vib = vm == null ? null : vm.getDefaultVibrator();
         density = context.getResources().getDisplayMetrics().density;
-        tp.setTypeface(Typeface.SANS_SERIF);
+        tp.setTypeface(loadTouchTypeface(context));
         setLayerType(View.LAYER_TYPE_SOFTWARE, null);
         reloadAim();
     }
