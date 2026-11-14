@@ -128,6 +128,136 @@ static uint32_t branch(uint64_t pc,uint64_t target){
     return 0x14000000|(((uint32_t)(delta>>2))&0x3ffffff);
 }
 
+
+/* Direct touch camera input: 1.4.3 free-orbit final angle stage. */
+void runtime_touch_orbit_dispatch(uintptr_t guest_sp, uintptr_t camera) {
+#if defined(__ANDROID__) && defined(TOTK_ANDROID_APP)
+    extern int runtime_touch_direct_consume(float *yaw, float *pitch);
+
+    float yaw_delta = 0.0f;
+    float pitch_delta = 0.0f;
+
+    if (!runtime_touch_direct_consume(&yaw_delta, &pitch_delta))
+        return;
+
+    if (!isfinite(yaw_delta) || !isfinite(pitch_delta))
+        return;
+
+    float pitch, yaw;
+    memcpy(&pitch, (const void *)(guest_sp + 0x44), sizeof pitch);
+    memcpy(&yaw, (const void *)(guest_sp + 0x48), sizeof yaw);
+
+    float low, high;
+    memcpy(&low, (const void *)(camera + 0xf8), sizeof low);
+    memcpy(&high, (const void *)(camera + 0xfc), sizeof high);
+
+    if (!isfinite(low) || !isfinite(high) || low >= high) {
+        low = -89.9f;
+        high = 89.9f;
+    }
+
+    low = fmaxf(-89.9f, low);
+    high = fminf(89.9f, high);
+
+    if (low >= high) {
+        low = -89.9f;
+        high = 89.9f;
+    }
+
+    if (!isfinite(pitch)) pitch = 0.0f;
+    if (!isfinite(yaw)) yaw = 0.0f;
+
+    float new_pitch = fminf(high, fmaxf(low, pitch + pitch_delta));
+    float new_yaw = remainderf(yaw + yaw_delta, 360.0f);
+
+    /* The final angles consumed by the game's original instruction. */
+    memcpy((void *)(guest_sp + 0x44), &new_pitch, sizeof new_pitch);
+    memcpy((void *)(guest_sp + 0x48), &new_yaw, sizeof new_yaw);
+
+    /*
+     * Keep the camera's persistent filtered pitch and yaw in sync.
+     * These offsets and the pitch-offset calculation match the 1.4.3
+     * free-orbit implementation in the PC direct-camera reference.
+     */
+    float pitch_weight, pitch_offset, stored_yaw;
+    memcpy(&pitch_weight, (const void *)(camera + 0x88), sizeof pitch_weight);
+    memcpy(&pitch_offset, (const void *)(camera + 0x10c), sizeof pitch_offset);
+    memcpy(&stored_yaw, (const void *)(camera + 0x120), sizeof stored_yaw);
+
+    float offset = (1.0f - pitch_weight) * pitch_offset;
+    if (!isfinite(offset)) offset = 0.0f;
+    if (!isfinite(stored_yaw)) stored_yaw = 0.0f;
+
+    float stored_pitch = remainderf(new_pitch - offset, 360.0f);
+    stored_yaw = remainderf(stored_yaw + yaw_delta, 360.0f);
+
+    memcpy((void *)(camera + 0x108), &stored_pitch, sizeof stored_pitch);
+    memcpy((void *)(camera + 0x120), &stored_yaw, sizeof stored_yaw);
+#else
+    (void)guest_sp;
+    (void)camera;
+#endif
+}
+
+#if defined(__ANDROID__) && defined(TOTK_ANDROID_APP)
+extern void runtime_touch_orbit_veneer(void);
+
+static void patch_touch_orbit(Module *m) {
+    const uint64_t site = 0x18f108;
+    const uint32_t expected = 0xbd4047ec; /* ldr s12, [sp, #0x44] */
+
+    if (site > m->text_end || m->text_end - site < 4 ||
+        site > m->size || m->size - site < 4)
+        runtime_fail("1.4.3 touch-orbit hook site outside main");
+
+    uint32_t original;
+    memcpy(&original, m->base + site, sizeof original);
+    if (original != expected)
+        runtime_fail("1.4.3 touch-orbit original instruction mismatch");
+
+    /*
+     * Existing 1.4.3 veneers occupy +20 through +916.
+     * The thermal veneer uses +916..+1024.
+     * Start this independent veneer at +1040.
+     */
+    uint64_t stub = ((m->text_end + 15) & ~15ULL) + 1040;
+    uint64_t page_end = (m->text_end + 0xfff) & ~0xfffULL;
+
+    if (stub > m->size || 32 > m->size - stub ||
+        stub + 32 > page_end)
+        runtime_fail("1.4.3 touch-orbit veneer layout");
+
+    for (unsigned i = 0; i < 32; i++)
+        if (m->base[stub + i])
+            runtime_fail("1.4.3 touch-orbit veneer padding in use");
+
+    /*
+     * Save x16 because it is live at the hook site.
+     * Load the absolute veneer address from the literal at stub+24.
+     * The C-call veneer restores all registers before returning here.
+     */
+    uint32_t code[] = {
+        0xa9bf7ff0,             /* stp x16,xzr,[sp,#-16]! */
+        0x580000b0,             /* ldr x16, literal at stub+24 */
+        0xd63f0200,             /* blr x16 */
+        0xa8c17ff0,             /* ldp x16,xzr,[sp],#16 */
+        expected,               /* replay ldr s12,[sp,#0x44] */
+        branch(stub + 20, site + 4)
+    };
+
+    uint64_t target = (uint64_t)(uintptr_t)runtime_touch_orbit_veneer;
+    uint32_t redirect = branch(site, stub);
+
+    memcpy(m->base + stub, code, sizeof code);
+    memcpy(m->base + stub + 24, &target, sizeof target);
+    memcpy(m->base + site, &redirect, sizeof redirect);
+
+    fprintf(stderr,
+            "[totk-touch] 1.4.3 free-orbit direct camera hook installed\n");
+}
+#endif
+
+
 /* Benchmark-only native fixed-time policy. The loader authenticates the pinned
  * rewritten main before relocation and this launch-time patch, then seals RX.
  * No request-bank writes or host calls occur while the game is running. */
