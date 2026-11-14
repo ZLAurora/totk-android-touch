@@ -250,7 +250,7 @@ static void patch_touch_orbit(Module *m) {
 
     memcpy(m->base + stub, code, sizeof code);
     memcpy(m->base + stub + 24, &target, sizeof target);
-    memcpy(m->base + site, &redirect, sizeof redirect);
+    /* Temporarily disabled: do not redirect game execution yet. */
 
     fprintf(stderr,
             "[totk-touch] 1.4.3 free-orbit direct camera hook installed\n");
