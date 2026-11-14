@@ -75,7 +75,14 @@ final class TouchView extends View {
     }
     void setController(boolean c) { controller = c; publish(); invalidate(); }
     private boolean showButtons() { return !hidden && (!controller || forceShow); }
-    void release() { ptrs.clear(); lastMask = -1; aim.cancel(); send(0, 0, 0, 0, 0); sendAim(0, 0, 0.01f); invalidate(); }
+    void release() {
+        ptrs.clear();
+        lastMask = -1;
+        aim.cancel();
+        send(0, 0, 0, 0, 0);
+        sendDirectAim(0f, 0f);
+        invalidate();
+    }
     private static int al(int c, float m) { return (c & 0xFFFFFF) | (Math.round(Math.min(255f, (c >>> 24) * m)) << 24); }
 
     @Override protected void onLayout(boolean changed, int l, int t, int rt, int b) {
@@ -269,8 +276,16 @@ final class TouchView extends View {
                 if (q.stick < 0) continue;
                 float dx = q.px - q.cx, dy = q.py - q.cy, len = (float) Math.hypot(dx, dy), m = Math.min(1f, len / rad);
                 float v = m <= 0.12f ? 0 : (m - 0.12f) / 0.88f;
-                ax[q.stick * 2] = len > 0 ? (int) (dx / len * v * 32767) : 0;
-                ax[q.stick * 2 + 1] = len > 0 ? (int) (-dy / len * v * 32767) : 0;   // Android: down is +y; the Switch: up is +
+                int sx = len > 0 ? (int) (dx / len * v * 32767) : 0;
+int sy = len > 0 ? (int) (-dy / len * v * 32767) : 0;
+
+if (q.stick == 1) {
+    sx = Math.round(sx * stickSensX);
+    sy = Math.round(sy * stickSensY);
+}
+                
+                ax[q.stick * 2] = Math.max(-32767, Math.min(32767, sx));
+                ax[q.stick * 2 + 1] = Math.max(-32767, Math.min(32767, sy));   // Android: down is +y; the Switch: up is +
             }
         }
         if (mask == lastMask && Arrays.equals(ax, lastAx)) return;
@@ -282,9 +297,14 @@ final class TouchView extends View {
         try { TouchNative.nativeSet(m, lx, ly, rx, ry); }
         catch (LinkageError missing) { nativeOk = false; Log.e(TAG, "touch hook missing in libtotk.so", missing); }
     }
-    private void sendAim(float sx, float sy, float dt) {
+    private void sendDirectAim(float yawDegrees, float pitchDegrees) {
         if (!nativeOk) return;
-        try { TouchNative.nativeAim(sx, sy, dt); } catch (LinkageError missing) { nativeOk = false; }
+        try {
+        TouchNative.nativeDirectAim(yawDegrees, pitchDegrees);
+    } catch (LinkageError missing) {
+        nativeOk = false;
+        Log.e(TAG, "direct touch aim hook missing in libtotk.so", missing);
+    }
     }
 
     // ---- drawing ----
