@@ -203,12 +203,14 @@ void runtime_touch_orbit_dispatch(uintptr_t guest_sp, uintptr_t camera) {
 extern void runtime_touch_orbit_veneer(void);
 
 static void patch_touch_orbit(Module *m) {
-    const uint64_t site = 0x18f108;
-    const uint32_t expected = 0xbd4047ec; /* ldr s12, [sp, #0x44] */
-
-    if (site > m->text_end || m->text_end - site < 4 ||
-        site > m->size || m->size - site < 4)
-        runtime_fail("1.4.3 touch-orbit hook site outside main");
+   (void)m;
+   return;
+   const uint64_t site = 0x18f108;
+   const uint32_t expected = 0xbd4047ec; /* ldr s12, [sp, #0x44] */
+   
+   if (site > m->text_end || m->text_end - site < 4 ||
+      site > m->size || m->size - site < 4)
+      runtime_fail("1.4.3 touch-orbit hook site outside main");
 
     uint32_t original;
     memcpy(&original, m->base + site, sizeof original);
@@ -1195,7 +1197,7 @@ void runtime_game_patches(Module *m) {
       aspect_install(m, "1.4.3", sites, 4, ((m->text_end + 15) & ~15ULL) + 48,   /* after the two veneers above */
                      (m->file_size + 0x3fff) & ~0x3fffULL); }
 #if defined(__ANDROID__) && defined(TOTK_ANDROID_APP)
-    /* patch_touch_orbit(m); */
+    patch_touch_orbit(m);
 #endif
     const char *enabled = getenv("TOTK_FPS60");
     if (enabled && !strcmp(enabled, "0")) {
