@@ -128,19 +128,7 @@ patch(UA, '*x0 = (int32_t)floorf(a->cx + (*x0 - a->cx) * a->sx); *x1 = (int32_t)
     if (ax >= 0) { *x0 = (int32_t)floorf(ax + (*x0 - ax) * a->sx); *x1 = (int32_t)ceilf(ax + (*x1 - ax) * a->sx); }''')
 patch('games/totk/android/gfx/vk_post.c', 'vk_ui_aspect_tracks(vk_ui_aspect_requested(getenv("TOTK_ASPECT"))));', '1);')
 
-# ---- Build 3b: the overlay classes move into their own files ----
-_dst = touch_dir / 'TouchOverlay.java'
-_s = _dst.read_text(encoding='utf-8')
-_a = _s.index('/** Touch aim: finger velocity'); _b = _s.index('/** Aim settings panel')
-_s = _s[:_a] + _s[_b:]
-_s = _s[:_s.index('/** Default layout (your preview layout)')]
-_old = 'new P("backlog", "Flick backlog (ms, 0 = off)", 0f, 600f, 0f, 10f),'
-if _s.count(_old) != 1:
-    sys.exit('PATCH FAILED: backlog parameter line not found')
-_s = _s.replace(_old, _old + '\n        new P("headroom", "Aim headroom (x)", 1f, 4f, 1f, 0.25f),'
-                '\n        new P("btnOp", "Button opacity (%)", 10f, 100f, 50f, 5f),'
-                '\n        new P("txtOp", "Text and icon opacity (%)", 10f, 100f, 100f, 5f),')
-_dst.write_text(_s, encoding='utf-8')
+# ---- Build 3b: copy the already-separated overlay classes ----
 for _n in ('TouchAim', 'TouchLayout', 'TouchView'):
     shutil.copy(ROOT / f'touchmod/java/{_n}.java', touch_dir / f'{_n}.java')
 print('patched touch overlay (3b)')
