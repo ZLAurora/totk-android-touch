@@ -47,6 +47,7 @@ final class TouchView extends View {
     final TouchAim aim = new TouchAim();
     Runnable displayHook, aimHook;
     private final float[] aimOut = new float[2];
+    private float stickSensX = 1f, stickSensY = 1f;
 
     private static final class Ptr {
         final boolean[] own, hov; int stick = -1; boolean aim; float cx, cy, px, py;
@@ -64,8 +65,12 @@ final class TouchView extends View {
     }
     void reloadAim() {
         SharedPreferences sp = TouchSettings.prefs(getContext());
-        aim.load(sp); joystick = sp.getBoolean("joystick", false);
-        btnA = sp.getFloat("btnOp", 50f) / 100f; txtA = sp.getFloat("txtOp", 100f) / 100f;
+        aim.load(sp);
+        joystick = sp.getBoolean("joystick", false);
+        stickSensX = sp.getFloat("stickSensX", 1f);
+        stickSensY = sp.getFloat("stickSensY", 1f);
+        btnA = sp.getFloat("btnOp", 50f) / 100f;
+        txtA = sp.getFloat("txtOp", 100f) / 100f;
         invalidate();
     }
     void setController(boolean c) { controller = c; publish(); invalidate(); }
@@ -84,8 +89,8 @@ final class TouchView extends View {
         @Override public void doFrame(long t) {
             float dt = lastFrame == 0 ? 0.0083f : Math.min(0.05f, Math.max(0.0005f, (t - lastFrame) / 1e9f));
             lastFrame = t;
-            aim.step(dt, aimOut);
-            sendAim(aimOut[0], aimOut[1], dt);
+            aim.stepDirect(dt, aimOut);
+            sendDirectAim(aimOut[0], aimOut[1]);
             if (aim.active()) Choreographer.getInstance().postFrameCallback(this); else { looping = false; lastFrame = 0; }
         }
     };
