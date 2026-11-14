@@ -77,7 +77,8 @@ patch(CJ, 'void runtime_android_present_transform_hint(uint64_t epoch, int hint)
       'void Java_com_aure_totk_touch_TouchNative_nativeSet(JNIEnv *env, jclass cls, jlong buttons, jint lx, jint ly, jint rx, jint ry);\n'
       'void Java_com_aure_totk_touch_TouchNative_nativeAim(JNIEnv *env, jclass cls, jfloat sx, jfloat sy, jfloat dt);\n'
       'void Java_com_aure_totk_touch_TouchNative_nativeAspect(JNIEnv *env, jclass cls, jfloat ratio);\n'
-      'void Java_com_aure_totk_touch_TouchNative_nativeAnchor(JNIEnv *env, jclass cls, jint mode);\n')
+      'void Java_com_aure_totk_touch_TouchNative_nativeAnchor(JNIEnv *env, jclass cls, jint mode);\n'
+      'void Java_com_aure_totk_touch_TouchNative_nativeDirectAim(JNIEnv *env, jclass cls, jfloat yaw, jfloat pitch);\n')
 _old = '} else (*env)->ExceptionClear(env); /* NativeActivity-only APK: optional Java hint unavailable. */'
 patch(CJ, _old, _old + '''
     {   /* touchmod: the overlay's natives, registered by hand like the others */
@@ -88,6 +89,7 @@ patch(CJ, _old, _old + '''
                 {"nativeAim", "(FFF)V", (void *)Java_com_aure_totk_touch_TouchNative_nativeAim},
                 {"nativeAspect", "(F)V", (void *)Java_com_aure_totk_touch_TouchNative_nativeAspect},
                 {"nativeAnchor", "(I)V", (void *)Java_com_aure_totk_touch_TouchNative_nativeAnchor},
+                {"nativeDirectAim", "(FF)V", (void *)Java_com_aure_totk_touch_TouchNative_nativeDirectAim},
             };
             if ((*env)->RegisterNatives(env, tc, touch_methods, sizeof touch_methods / sizeof *touch_methods)) {
                 (*env)->ExceptionClear(env); fprintf(stderr, "[touch] RegisterNatives failed\\n");
