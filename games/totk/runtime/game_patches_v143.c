@@ -1194,6 +1194,9 @@ void runtime_game_patches(Module *m) {
     { static const uint64_t sites[] = {0x628c74, 0xb43460, 0x1ff04f4, 0x253fbb0};   /* camera update and setup, viewport x2 */
       aspect_install(m, "1.4.3", sites, 4, ((m->text_end + 15) & ~15ULL) + 48,   /* after the two veneers above */
                      (m->file_size + 0x3fff) & ~0x3fffULL); }
+#if defined(__ANDROID__) && defined(TOTK_ANDROID_APP)
+    patch_touch_orbit(m);
+#endif
     const char *enabled = getenv("TOTK_FPS60");
     if (enabled && !strcmp(enabled, "0")) {
         fprintf(stderr, "[totk] 1.4.3 shipping frame controller (TOTK_FPS60=0)\n");
