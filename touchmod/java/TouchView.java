@@ -351,25 +351,39 @@ if (q.stick == 1) {
     }
     /** Sets tp to the font at the widest width that keeps s within avail, and returns the text width. A variable font
      * narrows its width axis; a font without one is squeezed as a fallback. */
+    
     private float fitWidth(String s, float avail, boolean autofit) {
         tp.setTextScaleX(1f);
-        boolean var = tp.setFontVariationSettings("'wght' 150, 'wdth' 112");
-        float w = tp.measureText(s);
-        if (!autofit || w <= avail) return w;
-        if (var) {
-            for (int wd = 104; wd >= 62; wd -= 6) {
-                tp.setFontVariationSettings("'wght' 150, 'wdth' " + wd);
-                w = tp.measureText(s);
-                if (w <= avail) return w;
+
+        // Estimate width without Paint.measureText(), which crashes
+        // in Android's Minikin text-layout cache on this device.
+        float em = tp.getTextSize();
+        float w = 0f;
+
+        for (int i = 0; i < s.length(); i++) {
+            char ch = s.charAt(i);
+
+            if (Character.isWhitespace(ch)) {
+                w += em * 0.32f;
+            } else if ("ilI.,'!:;|".indexOf(ch) >= 0) {
+                w += em * 0.30f;
+            } else if ("MW@%&#".indexOf(ch) >= 0) {
+                w += em * 0.88f;
+            } else if (Character.isUpperCase(ch)) {
+                w += em * 0.66f;
+            } else if (ch > 0x7f) {
+                w += em * 0.95f;
+            } else {
+                w += em * 0.55f;
             }
         }
-        tp.setTextScaleX(Math.max(0.62f, avail / w));
-        return tp.measureText(s);
-    }
-    private void putText(Canvas c, String s, float x, float base) {
-        tp.setShader(new LinearGradient(0, base + tp.ascent(), 0, base + tp.descent(), al(0xFFFFFFFF, txtA), al(0xFFCCCCCC, txtA), Shader.TileMode.CLAMP));   // 100% to 80% brightness
-        c.drawText(s, x, base, tp);
-        tp.setShader(null);
+
+        if (!autofit || w <= avail) return w;
+
+        float scale = Math.max(0.62f, avail / w);
+        tp.setTextScaleX(scale);
+        return w * scale;
+
     }
     private void glyph(Canvas c, TouchLayout.Btn b, boolean togOn, float gx, float gy, float u) {
         p.setShader(null); p.setPathEffect(null);
