@@ -385,6 +385,18 @@ if (q.stick == 1) {
         return w * scale;
 
     }
+    
+    private void putText(Canvas c, String s, float x, float base) {
+        tp.setShader(new LinearGradient(
+                0, base + tp.ascent(),
+                0, base + tp.descent(),
+                al(0xFFFFFFFF, txtA),
+                al(0xFFCCCCCC, txtA),
+                Shader.TileMode.CLAMP));
+        c.drawText(s, x, base, tp);
+        tp.setShader(null);
+    }
+    
     private void glyph(Canvas c, TouchLayout.Btn b, boolean togOn, float gx, float gy, float u) {
         p.setShader(null); p.setPathEffect(null);
         if (b.icon != 0) { p.setStyle(Paint.Style.FILL); p.setColor(al(b.icon, txtA)); c.drawCircle(gx, gy, 1.6f * u, p); }
