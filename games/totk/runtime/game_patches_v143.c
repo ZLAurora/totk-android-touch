@@ -203,8 +203,6 @@ void runtime_touch_orbit_dispatch(uintptr_t guest_sp, uintptr_t camera) {
 extern void runtime_touch_orbit_veneer(void);
 
 static void patch_touch_orbit(Module *m) {
-   (void)m;
-   return;
    const uint64_t site = 0x18f108;
    const uint32_t expected = 0xbd4047ec; /* ldr s12, [sp, #0x44] */
    
@@ -216,6 +214,11 @@ static void patch_touch_orbit(Module *m) {
     memcpy(&original, m->base + site, sizeof original);
     if (original != expected)
         runtime_fail("1.4.3 touch-orbit original instruction mismatch");
+   
+   return;
+
+    /*
+     * Existing 1.4.3 veneers occupy +20 through +916.
 
     /*
      * Existing 1.4.3 veneers occupy +20 through +916.
