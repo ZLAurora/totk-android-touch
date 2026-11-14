@@ -221,7 +221,7 @@ static void patch_touch_orbit(Module *m) {
      * Start this independent veneer at +1040.
      */
     uint64_t stub = ((m->text_end + 15) & ~15ULL) + 1040;
-    uint64_t page_end = (m->text_end + 0xfff) & ~0xfffULL;
+    uint64_t page_end = (m->text_end + 0x3fff) & ~0x3fffULL;
 
     if (stub > m->size || 32 > m->size - stub ||
         stub + 32 > page_end)
