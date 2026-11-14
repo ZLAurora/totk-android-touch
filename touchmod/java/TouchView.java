@@ -63,6 +63,27 @@ final class TouchView extends View {
         setLayerType(View.LAYER_TYPE_SOFTWARE, null);
         reloadAim();
     }
+
+        private static Typeface loadTouchTypeface(Context context) {
+        final String[] archivoAssets = {
+            "fonts/Archivo-Regular.ttf",
+            "Archivo-Regular.ttf",
+            "fonts/Archivo.ttf",
+            "Archivo.ttf"
+        };
+
+        for (String asset : archivoAssets) {
+            try {
+                return Typeface.createFromAsset(context.getAssets(), asset);
+            } catch (RuntimeException ignored) {
+                // Try the next possible asset path.
+            }
+        }
+
+        // Fall back to Android's regular Roboto font.
+        return Typeface.create("sans-serif", Typeface.NORMAL);
+        }
+    
     void reloadAim() {
         SharedPreferences sp = TouchSettings.prefs(getContext());
         aim.load(sp);
