@@ -237,13 +237,13 @@ static void patch_touch_orbit(Module *m) {
      * The C-call veneer restores all registers before returning here.
      */
     uint32_t code[] = {
-        0xa9bf7ff0,             /* stp x16,xzr,[sp,#-16]! */
-        0x580000b0,             /* ldr x16, literal at stub+24 */
-        0xd63f0200,             /* blr x16 */
-        0xa8c17ff0,             /* ldp x16,xzr,[sp],#16 */
-        expected,               /* replay ldr s12,[sp,#0x44] */
-        branch(stub + 20, site + 4)
-    };
+    0xa9bf7bf0,             /* stp x16,x30,[sp,#-16]! */
+    0x580000b0,             /* ldr x16, literal at stub+24 */
+    0xd63f0200,             /* blr x16 */
+    0xa8c17bf0,             /* ldp x16,x30,[sp],#16 */
+    expected,               /* replay ldr s12,[sp,#0x44] */
+    branch(stub + 20, site + 4)
+};
 
     uint64_t target = (uint64_t)(uintptr_t)runtime_touch_orbit_veneer;
     uint32_t redirect = branch(site, stub);
