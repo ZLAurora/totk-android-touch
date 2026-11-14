@@ -7,6 +7,8 @@
 #include <time.h>
 #include <math.h>
 #include <stdint.h>
+#include <pthread.h>
+#include <jni.h>
 
 static pthread_mutex_t g_touch_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_touch_buttons, g_touch_edges;
