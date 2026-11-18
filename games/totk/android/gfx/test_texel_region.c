@@ -6,13 +6,90 @@
 #include <string.h>
 #include <time.h>
 
-static unsigned checks, failures, cases;
+static unsigned checks, failures, cases, spans;
 static uint32_t seed = 0x8719a325;
 static uint32_t random_u32(void) { seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5; return seed; }
 #define CHECK(c) do { checks++; if (!(c)) { if (failures++ < 12) fprintf(stderr, "FAIL line %d case %u\n", __LINE__, cases); } } while (0)
 static uint32_t mip(uint32_t n, unsigned l) { n >>= l; return n ? n : 1; }
 static uint64_t now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000 + t.tv_nsec; }
 static void *alloc(size_t n) { void *p = malloc(n); if (!p) { perror("malloc"); exit(2); } return p; }
+
+/* Each owner is a distinct allocation; dst_span is never rebased to pretend it
+   contains the whole texture. Compare every span, including padding, against
+   the original full encoder before assembling the complete storage image. */
+static void swizzle_span_case(nvn_texdesc d) {
+    enum { GUARD = 19 };
+    static const size_t edges[] = {1,3,15,16,17,31,32,33,63,64,65,127,128,129,255,256,257,511,512,513,1023,1024,1025};
+    nvn_texlayout layout; nvn_tex_layout(&d, &layout);
+    size_t storage_size = (size_t)layout.size + 32;
+    uint8_t *expected = alloc(storage_size), *split = alloc(storage_size), guard[GUARD];
+    memset(guard, 0xa7, sizeof guard);
+    for (size_t i = 0; i < storage_size; i++) expected[i] = (uint8_t)random_u32();
+    memcpy(split, expected, storage_size);
+    int bw, bh, bpb = nvn_fmt_bpb(d.format, &bw, &bh);
+    for (unsigned l = 0; l < d.levels; l++) for (unsigned layer = 0; layer < layout.layers; layer++) {
+        cases++;
+        uint32_t row = (mip(d.width, l) + bw - 1) / bw * bpb;
+        uint32_t rows = d.target == 0 || d.target == 3 ? 1 : (mip(d.height, l) + bh - 1) / bh;
+        uint32_t slices = d.target == 2 ? mip(d.depth, l) : 1;
+        size_t pitch = row + 7, linear_size = pitch * rows * slices + 32;
+        uint8_t *src = alloc(linear_size), *before = alloc(linear_size);
+        for (size_t i = 0; i < linear_size; i++) src[i] = (uint8_t)random_u32();
+        memcpy(before, src, linear_size);
+        size_t level_offset = (size_t)nvn_tex_level_offset(&d, l);
+        size_t base = (size_t)layer * layout.layer_size + level_offset;
+        size_t next = l + 1 < d.levels ? (size_t)nvn_tex_level_offset(&d, l + 1) : (size_t)layout.layer_size;
+        /* Include real inter-level/layer padding and bytes beyond this level.
+           Even the last layer has another 32 guarded storage bytes available. */
+        size_t extent = next - level_offset + 23;
+        uint8_t *whole = alloc(extent + 2 * GUARD);
+        memset(whole, 0xa7, extent + 2 * GUARD);
+        memcpy(whole + GUARD, split + base, extent);
+        CHECK(!nvn_swizzle(&d, l, layer, src, pitch, expected));
+        for (size_t offset = 0, edge = 0; offset < extent;) {
+            size_t end = edge < sizeof edges / sizeof *edges ? edges[edge++] : offset + 1 + random_u32() % 1061;
+            if (end > extent) end = extent;
+            size_t n = end - offset;
+            uint8_t *owner = alloc(n + 2 * GUARD);
+            memset(owner, 0xa7, n + 2 * GUARD);
+            memcpy(owner + GUARD, split + base + offset, n);
+            CHECK(!nvn_swizzle_span_into(&d, l, layer, src, pitch, owner + GUARD, offset, n));
+            CHECK(!memcmp(owner + GUARD, expected + base + offset, n));
+            CHECK(!memcmp(owner, guard, GUARD) && !memcmp(owner + GUARD + n, guard, GUARD));
+            memcpy(split + base + offset, owner + GUARD, n);
+            free(owner);
+            spans++;
+            offset = end;
+        }
+        CHECK(!memcmp(split, expected, storage_size));
+        /* A single span with a saturating count must stop at the actual texels,
+           leaving trailing alignment, other levels/layers, and guards intact. */
+        uint8_t first_byte = whole[GUARD];
+        CHECK(!nvn_swizzle_span_into(&d, l, layer, src, pitch, whole + GUARD + 1, 1, UINT64_MAX));
+        CHECK(whole[GUARD] == first_byte);
+        CHECK(!memcmp(whole + GUARD + 1, expected + base + 1, extent - 1));
+        CHECK(!nvn_swizzle_span_into(&d, l, layer, src, pitch, whole + GUARD, 0, UINT64_MAX));
+        CHECK(!memcmp(whole + GUARD, expected + base, extent));
+        CHECK(!memcmp(whole, guard, GUARD) && !memcmp(whole + GUARD + extent, guard, GUARD));
+        CHECK(!nvn_swizzle_span_into(&d, l, layer, src, pitch, whole + GUARD, 1, 0));
+        CHECK(!nvn_swizzle_span_into(&d, l, layer, src, pitch, whole + GUARD, UINT64_MAX, UINT64_MAX));
+        CHECK(!memcmp(whole + GUARD, expected + base, extent));
+        CHECK(nvn_swizzle_span_into(&d, l, layer, src, row - 1, whole + GUARD, 0, extent) == -1);
+        CHECK(nvn_swizzle_span_into(&d, l, layout.layers, src, pitch, whole + GUARD, 0, extent) == -1);
+        CHECK(nvn_swizzle_span_into(&d, d.levels, layer, src, pitch, whole + GUARD, 0, extent) == -1);
+        CHECK(!memcmp(whole + GUARD, expected + base, extent));
+        CHECK(!memcmp(whole, guard, GUARD) && !memcmp(whole + GUARD + extent, guard, GUARD));
+        if (!nvn_tex_is_linear(&d)) {
+            /* The old whole-storage span API must still reject partial GOBs. */
+            CHECK(nvn_swizzle_span(&d, l, layer, src, pitch, split, 1, 512) == -1);
+            CHECK(nvn_swizzle_span(&d, l, layer, src, pitch, split, 0, 511) == -1);
+            CHECK(!memcmp(split, expected, storage_size));
+        }
+        CHECK(!memcmp(src, before, linear_size));
+        free(whole); free(src); free(before);
+    }
+    free(expected); free(split);
+}
 
 static void texture_case(nvn_texdesc d) {
     nvn_texlayout layout; nvn_tex_layout(&d, &layout);
@@ -101,6 +178,14 @@ int main(int argc, char **argv) {
         }
         for (unsigned v = 0; v < 2; v++) texture_case((nvn_texdesc){.target=1, .format=fmt, .width=69u*bw-1, .height=33u*bh-1,
             .depth=1, .levels=1, .flags=v ? 0x40 : 0x10});
+        swizzle_span_case((nvn_texdesc){.target=4, .format=fmt, .width=69u*bw-1, .height=19u*bh-1,
+            .depth=3, .levels=3, .pkg_block_h=3});
+        swizzle_span_case((nvn_texdesc){.target=2, .format=fmt, .width=23u*bw-1, .height=17u*bh-1,
+            .depth=5, .levels=3, .pkg_block_h=0x23});
+        swizzle_span_case((nvn_texdesc){.target=3, .format=fmt, .width=69u*bw-1, .height=3, .depth=1, .levels=3});
+        for (unsigned v = 0; v < 2; v++) swizzle_span_case((nvn_texdesc){.target=1, .format=fmt,
+            .width=23u*bw-1, .height=11u*bh-1, .depth=1, .levels=1, .flags=v ? 0x40 : 0x10,
+            .stride=v ? 0 : (uint32_t)(23 * bpb + 13)});
     }
     /* Keep tall/deep packaged GOB variants from collapsing to small mip tiles. */
     for (unsigned th = 0; th <= 5; th++) for (unsigned td = 0; td <= 4; td++)
@@ -111,7 +196,7 @@ int main(int argc, char **argv) {
     CHECK(!memcmp(storage,before,sizeof storage));
     invalid.samples=4; CHECK(nvn_swizzle_region(&invalid,0,0,0,0,0,4,1,1,src,64,64,storage) == -1);
     CHECK(!memcmp(storage,before,sizeof storage));
-    printf("%s: texel region %u formats, supported bpb mask=%#x (1,2,3,4,6,8,12,16), %u regions, %u checks, %u failed\n",
-        failures ? "FAILED" : "ok", formats, bpb_mask, cases, checks, failures);
+    printf("%s: texel region %u formats, supported bpb mask=%#x (1,2,3,4,6,8,12,16), %u cases, %u independent swizzle spans, %u checks, %u failed\n",
+        failures ? "FAILED" : "ok", formats, bpb_mask, cases, spans, checks, failures);
     return !!failures;
 }

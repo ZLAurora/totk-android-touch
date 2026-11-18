@@ -27,6 +27,13 @@ void mtl_pool_finalize(const void *mem);
 void mtl_vpool_add(const void *mem, uint64_t size) __attribute__((weak));
 void mtl_vpool_del(const void *mem) __attribute__((weak));
 int mtl_pool_alias(void *dst, const void *src, uint64_t size) __attribute__((weak));
+/* Optional Linux mapping transaction. 0 declines without touching memory (including alias mode off);
+   1 completes the replacement; -1 handles a failed replacement, so the caller must not retry outside
+   the backend lock. src == NULL installs fresh anonymous zero pages. */
+int mtl_vpool_replace(void *dst, const void *src, uint64_t size) __attribute__((weak));
+/* Optional host-owned range release: the same 0/1/-1 contract, retiring any registration and
+   translations before munmap under the backend lock. A handled failure must not be retried. */
+int mtl_vpool_release(void *dst, uint64_t size) __attribute__((weak));
 #endif
 int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off);   // 成功 1；buf 是 (__bridge) id<MTLBuffer> | 1 on success; buf is a (__bridge) id<MTLBuffer>
 

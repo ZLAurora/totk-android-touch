@@ -81,6 +81,7 @@ void runtime_android_game_pause_wait(void) {
 }
 uint64_t vk_window_set(ANativeWindow *window, ANativeWindow *surface_parent, int display_id);   /* android/gfx/vk_draw.c */
 void vk_window_resized(ANativeWindow *window, uint64_t epoch);   /* android/gfx/vk_draw.c */
+void vk_wb_alias_report(const char *phase) __attribute__((weak)); /* normal-thread diagnostic snapshot */
 void vk_window_transform_hint(ANativeWindow *window, uint64_t epoch, int hint);   /* android/gfx/vk_draw.c */
 void vk_shader_seed_startup(const char *game_dir);   /* android/gfx/vk_shader.c */
 int vk_overlay_cycle(void);   /* android/gfx/vk_overlay.c */
@@ -2395,6 +2396,7 @@ static void android_game_pause_update(void) {
     if (paused == runtime_android_game_paused()) return;
     game_input_after_ns = (int64_t)mono_ns();
     android_game_pause_set(&game_pause, paused);
+    if (paused && vk_wb_alias_report) vk_wb_alias_report("pause");
     runtime_audio_output_pause(paused);
     runtime_input_clear();
     present_timeline_lifecycle(-1, paused);

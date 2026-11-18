@@ -517,7 +517,61 @@ void vk_wb_stats(void);                          /* present's 300-frame summary 
 uint64_t vk_wb_pool_identity(const pool_t *pool, const void *address, uint64_t size);
 int vk_wb_pool_lock(uint64_t identity, const void *address, uint64_t size);
 void vk_wb_pool_unlock(void);
+/* Exact startup opt-in; no lazy initialization. The locked APIs require a successful vk_wb_pool_lock
+   (or equivalent g_pool_mu ownership), retained through every store using the returned pointer.
+   Span returns at most requested bytes, clipped at the next owner/virtual-alias transition; a NULL
+   span may describe an unsupported gap in *available. Range requires every byte to be supported. */
+int vk_wb_alias_enabled(void);
+void *vk_wb_alias_span_locked(uintptr_t guest, size_t requested, size_t *available);
+int vk_wb_alias_range_locked(uintptr_t guest, size_t size);
+typedef enum {
+    VK_WB_ALIAS_LANDING, VK_WB_ALIAS_STORE, VK_WB_ALIAS_PUBLICATION, VK_WB_ALIAS_SITE_COUNT
+} vk_wb_alias_site;
+typedef enum {
+    VK_WB_ALIAS_PATH_ALIAS, VK_WB_ALIAS_PATH_REGISTRY, VK_WB_ALIAS_PATH_OWNERSHIP,
+    VK_WB_ALIAS_PATH_MIXED, VK_WB_ALIAS_PATH_NON_DMABUF, VK_WB_ALIAS_PATH_RETIRED,
+    VK_WB_ALIAS_PATH_OTHER, VK_WB_ALIAS_PATH_COUNT
+} vk_wb_alias_reason;
+/* Whole-extent structural classification under g_pool_mu; ALIAS means every byte is supported,
+   MIXED means supported/unsupported bytes or multiple unsupported classes. NON_DMABUF requires
+   a known HOST/CPU owner or no retained private mapping; RETIRED is a known virtual hole or
+   guest_unknown mapping. Unregistered/invalid extents are OTHER; no procfs backing inference.
+   REGISTRY is selected before a contended lookup; OWNERSHIP is landing's untracked-owner gate. */
+vk_wb_alias_reason vk_wb_alias_reason_locked(uintptr_t guest, size_t size);
+/* Enabled-only, lock-free relaxed cumulative operation/byte counters. Bytes are logical encoder
+   spans (including padding) or requested stores, not necessarily changed texels. Count one
+   incidence per selected reason per logical call; a split store counts ALIAS bytes plus MIXED
+   legacy bytes if the whole extent is mixed. Freshness-rejected/deferred no-store work is excluded. */
+void vk_wb_alias_account(vk_wb_alias_site site, vk_wb_alias_reason reason, uint64_t bytes);
+/* Normal context only; no pool lock or counter reset. One line at periodic/pause/exit, only enabled:
+   memory write-back alias paths: phase=PHASE cumulative=1 landing=alias:OPS/BYTES,registry:OPS/BYTES,
+   ownership:OPS/BYTES,mixed:OPS/BYTES,non-dmabuf:OPS/BYTES,retired:OPS/BYTES,other:OPS/BYTES
+   store=... publication=... (same ordered reason labels; relaxed, nontransactional snapshot). */
+void vk_wb_alias_report(const char *phase);
 #ifdef TOTK_VK_TESTS
+/* Explicit registry fixtures: init requires an empty registry and parses the exact startup switch.
+   TOTK_VK_ALIAS_FIXTURE (with TOTK_VK_TESTS) omits only unrelated Vulkan initialization/allocation/
+   callbacks; real mtl_vpool_add/del, totk_vpool_map and replacement/release syscalls stay shared.
+   Guest mappings are caller-owned and already share fd/offset before owner/attach. Returned
+   identities work with vk_wb_pool_lock; remove restores owners through the production retirement. */
+void vk_wb_test_alias_init(void);
+/* Set/clear without concurrent mapping calls. Called just before MapVirtual registry retirement
+   and enabled replacement try to acquire g_pool_mu; callback may observe but must not mutate it. */
+void vk_wb_test_alias_replace_hook(void (*hook)(void *), void *opaque);
+uint64_t vk_wb_test_alias_owner(void *guest, size_t size, int fd, uint64_t offset);
+uint64_t vk_wb_test_alias_view(void *guest, size_t size, void *owner_guest, uint64_t owner_offset);
+uint64_t vk_wb_test_alias_virtual(void *guest, size_t size);
+uint64_t vk_wb_test_alias_cpu(void *guest, size_t size); /* known unsupported K_CPU metadata, no remapping */
+int vk_wb_test_alias_registry_trylock(void); /* success means acquired and immediately released */
+void vk_wb_test_alias_remove(void *guest);
+void vk_wb_test_alias_memory(uint64_t out[2]); /* private mapping count/bytes */
+void vk_wb_test_alias_counts(uint64_t out[VK_WB_ALIAS_SITE_COUNT][VK_WB_ALIAS_PATH_COUNT][2]); /* ops, bytes */
+/* Site2 production selector; contention uses a whole-operation legacy store without registry ownership. */
+int vk_wb_test_alias_store(void *guest, const void *data, size_t size, int event32, int add32, int guarded);
+int vk_wb_test_alias_store_site(vk_wb_alias_site site, void *guest, const void *data, size_t size,
+                               int event32, int add32, int guarded); /* alias_store defaults to STORE */
+/* Actual HOST-import K_OWN only in tests: shared guest fd mapping must predate mtl_pool_add. */
+int vk_wb_test_alias_attach(void *guest, uint64_t size, int fd, uint64_t offset);
 void vk_wb_test_stats(uint64_t v[7]); /* landed, bytes, pending, CPU skips, superseded, staging bytes, copies */
 void vk_wb_test_memory(uint64_t v[5]); /* record capacity bytes, history bytes, pinned image bytes, WB-only bytes, histories */
 void vk_wb_test_history(const tex_t *t, uint64_t v[2]); /* storage landings and next quiet interval */

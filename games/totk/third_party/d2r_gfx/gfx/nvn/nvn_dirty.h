@@ -137,10 +137,23 @@ void *nvn_dirty_gpu_write_begin(void *addr, size_t len);   // write guest memory
 void nvn_dirty_gpu_write_end(void *tok);
 /* Same ownership, but never wait for a GPU ticket or another page/unit owner. Zero means retry later. */
 int nvn_dirty_gpu_write_try_begin(void *addr, size_t len, void **token);
+/* Explicit private-alias ownership: the caller retains a writable alias of the SAME physical bytes plus
+   backing/range lifetime through end, and performs stores through that alias, never the guest pointer.
+   These use the same tickets, BUSY claims, try/unwind and generation semantics as the ordinary APIs, but
+   keep guest permissions unchanged (including under VMA pressure), with no GPU-write/restore mprotect stats.
+   The existing nvn_dirty_gpu_write_end accepts either token kind; no existing begin chooses alias mode. */
+void *nvn_dirty_gpu_write_alias_begin(void *addr, size_t len);
+int nvn_dirty_gpu_write_alias_try_begin(void *addr, size_t len, void **token);
 /* Emulated GPU completion stores: retain unit ownership across the actual host store, without allocation.
    Return 0 on a permission-change failure. Unlike CPU writes, these keep dirty generations/hot history unchanged. */
 int nvn_dirty_lag_store(void *addr, const void *data, size_t len);
 int nvn_dirty_lag_store32(volatile uint32_t *addr, uint32_t value, int add);
+/* Completion store through caller-proven private backing. guest identifies dirty/lag ownership; alias names
+   the same physical bytes and must remain writable/live throughout. Retains guest PG_BUSY ownership even
+   for lag-off baseline/exact watches; untracked bytes are copied directly. No backend callbacks or locks,
+   allocation, guest mprotect or CPU-generation changes. add32 uses one aligned 32-bit word (len == 4), just
+   like store32; otherwise copies len bytes. Existing store APIs always write the guest mapping. */
+int nvn_dirty_lag_store_alias(void *guest, void *alias, const void *data, size_t len, int add32);
 typedef struct { uintptr_t page; uint64_t pc, lr; uint32_t src; } nvn_dirty_rec;   // src 0: guest write (fault), 1: host write
 int nvn_dirty_recent(uintptr_t lo, uintptr_t hi, nvn_dirty_rec *out, int max);   // latest unprotections in [lo, hi) (DM_NVN_TILELOG) // 覆盖页在戳之后被写过 → 1 | Covered pages were written after the stamp -> 1
 void nvn_dirty_stats(uint64_t *faults, uint64_t *preps);           // 累计：游戏写触发的缺页次数、宿主写前解保护的页数 | Cumulative: number of page faults triggered by game writes, number of pages unprotected before host writes

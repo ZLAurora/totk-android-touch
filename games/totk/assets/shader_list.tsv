@@ -4841,6 +4841,7 @@ V	14bf80de425281511abc1a7e9a05c22aa24150df370d7522c0cc950682440cda	{"attr":{},"f
 V	14bf80de425281511abc1a7e9a05c22aa24150df370d7522c0cc950682440cda	{"attr":{},"fout":{"0":"float"},"img":{},"tex":{"10":"2d","11":"2d","12":"2d","13":"2d","15":"2darray","17":"2d","6":"2darray_depth","7":"2d","8":"cube","9":"2d"}}
 V	14c00b9dd0e54e115040b97bed14fa4db4990441833e501c580b7447003d636e	{"attr":{"0":"float","1":"float","2":"float","3":"float","5":"float"},"fout":{},"img":{},"tex":{}}
 V	14c17ad31f89dc534868033ca84f45549af91bc9637d9cbc0da5235755eb07bb	{"attr":{},"fout":{"0":"float"},"img":{},"tex":{"0":"2d","1":"2d","2":"2d","3":"2d","4":"2d","5":"2d"}}
+V	14c1d79eeb14b54c7e7839f37ebfbb472d11a5438577c4921cc4ee05ac62415f	{"attr":{},"fout":{"0":"float","1":"float","4":"float","6":"float","7":"float"},"img":{},"tex":{"1":"*","11":"*","12":"*","13":"*","14":"*","15":"*","18":"*","26":"*","27":"*","4":"*","6":"*","7":"*_depth","8":"*"}}
 V	14c1d79eeb14b54c7e7839f37ebfbb472d11a5438577c4921cc4ee05ac62415f	{"attr":{},"fout":{"0":"float","1":"float","4":"float","6":"float","7":"float"},"img":{},"tex":{"1":"*","11":"*","12":"*","13":"*","14":"*","15":"*","18":"*","26":"*","27":"*","4":"*","6":"*_depth","7":"*_depth","8":"*"}}
 V	14c1d79eeb14b54c7e7839f37ebfbb472d11a5438577c4921cc4ee05ac62415f	{"attr":{},"fout":{"0":"float","1":"float","4":"float","6":"float","7":"float"},"img":{},"tex":{"1":"2d","11":"2d","12":"2d","13":"2d","14":"2d","15":"2d","18":"2d","26":"2d","27":"2d","4":"2d","6":"2d","7":"2d","8":"2d"}}
 V	14c1d79eeb14b54c7e7839f37ebfbb472d11a5438577c4921cc4ee05ac62415f	{"attr":{},"fout":{"0":"float","1":"float","4":"float","6":"float","7":"float"},"img":{},"tex":{"1":"2d","11":"2d","12":"2d","13":"2d","14":"2d","15":"2d","18":"2d","26":"2d","27":"2darray","4":"2d","6":"2d","7":"2d_depth","8":"2d"}}
@@ -19140,6 +19141,7 @@ V	53e1924e611b845d71f23420236a82b8bb98b1ec920ae5df889ed4d4e35450e4	{"attr":{},"f
 V	53e1ac65132edb50842d32946b37b2e9c92386b2ec2a78c81127fd6644b5f852	{"attr":{"0":"float","1":"float","2":"float","4":"float","6":"float","8":"float"},"fout":{},"img":{},"tex":{"3":"2d"}}
 V	53e321f43885b16b4df261eb18e25e9e0a4d74d4c140b2c442440d291a1b2720	{"attr":{},"fout":{"0":"float"},"img":{},"tex":{"10":"2d","11":"2d","13":"2d","14":"2d","15":"2d","17":"2d","29":"2d","31":"2d","6":"2d","7":"2d","8":"2d","9":"2d"}}
 V	53e321f43885b16b4df261eb18e25e9e0a4d74d4c140b2c442440d291a1b2720	{"attr":{},"fout":{"0":"float"},"img":{},"tex":{"10":"2d","11":"2d","13":"2d","14":"2d","15":"2d","17":"2d","29":"2darray","31":"2d","6":"2darray_depth","7":"2d","8":"cube","9":"3d"}}
+V	53ec48b320b5a0e42ce9c63d09de9946c12efcda17b6f47f7af105de91da4842	{"attr":{},"fout":{"0":"float","1":"float","2":"float","4":"float","6":"float","7":"float"},"img":{},"tex":{"0":"*","1":"*","11":"*","12":"*","13":"*","14":"*","15":"*","18":"*","26":"*","27":"*","28":"*","4":"*","6":"*","7":"*_depth","8":"*","9":"*"}}
 V	53ec48b320b5a0e42ce9c63d09de9946c12efcda17b6f47f7af105de91da4842	{"attr":{},"fout":{"0":"float","1":"float","2":"float","4":"float","6":"float","7":"float"},"img":{},"tex":{"0":"*","1":"*","11":"*","12":"*","13":"*","14":"*","15":"*","18":"*","26":"*","27":"*","28":"*","4":"*","6":"*_depth","7":"*_depth","8":"*","9":"*"}}
 V	53ec48b320b5a0e42ce9c63d09de9946c12efcda17b6f47f7af105de91da4842	{"attr":{},"fout":{"0":"float","1":"float","2":"float","4":"float","6":"float","7":"float"},"img":{},"tex":{"0":"2d","1":"2d","11":"2d","12":"2d","13":"2d","14":"2d","15":"2d","18":"2d","26":"2d","27":"2d","28":"2d","4":"2d","6":"2d","7":"2d","8":"2d","9":"2d"}}
 V	53ec48b320b5a0e42ce9c63d09de9946c12efcda17b6f47f7af105de91da4842	{"attr":{},"fout":{"0":"float","1":"float","2":"float","4":"float","6":"float","7":"float"},"img":{},"tex":{"0":"2d","1":"2d","11":"2d","12":"2d","13":"2d","14":"2d","15":"2d","18":"2d","26":"2d","27":"2darray","28":"2darray","4":"2d","6":"2d","7":"2d_depth","8":"2d","9":"cube"}}
@@ -19453,6 +19455,7 @@ V	5545986af24c242dbcf9d52d733a7944a59dcc25d5f4abc251f5ef76f46bde89	{"attr":{"0":
 V	5547fad4895b8139abb0b846a2c5944a2dd85d7e2beadbf6d2ecff4a5b76cf6f	{"attr":{"0":"float","1":"float","12":"float","2":"float","3":"float","8":"float","9":"float"},"fout":{},"img":{},"tex":{}}
 V	55482139ee9f8c68415f60aef0e1461cb8a48fd9f2a55823c8c7fea48cf9ba54	{"attr":{},"fout":{"0":"float","1":"float","3":"float","5":"float","7":"float"},"img":{},"tex":{"13":"2d","14":"2d","15":"2d","16":"2d","25":"2d","27":"2d","28":"2d","8":"2d","9":"2d"}}
 V	5549f5606e22760942f95f9fa65d64b0848f7c4e76d40de48b398be8b81a3f5e	{"attr":{},"fout":{"0":"float"},"img":{},"tex":{"0":"2d","1":"2darray"}}
+V	554d0974d69830e5df77052dc88a8e9b846d5010ea82f6da6ab396b4fec842ab	{"attr":{},"fout":{"0":"float"},"img":{},"tex":{"0":"*_depth","1":"*","2":"*","3":"*"}}
 V	554d0974d69830e5df77052dc88a8e9b846d5010ea82f6da6ab396b4fec842ab	{"attr":{},"fout":{"0":"float"},"img":{},"tex":{"0":"2d","1":"2d","2":"2d","3":"2d"}}
 V	554d0974d69830e5df77052dc88a8e9b846d5010ea82f6da6ab396b4fec842ab	{"attr":{},"fout":{"0":"float"},"img":{},"tex":{"0":"2d_depth","1":"3d","2":"3d","3":"3d"}}
 V	554e8fb2c4f6b46892e0c5578e17ed1f143269770ee6cc428d06a4630ea7a145	{"attr":{"0":"float","1":"float","2":"float","3":"float","4":"float","5":"float","6":"float","7":"float","8":"float"},"fout":{},"img":{},"tex":{}}
@@ -22084,6 +22087,7 @@ V	61640fe91e9ba91cffb549ad2a030f5ff4c2e38c40851df56ca4a3c99ebd7dd7	{"attr":{},"f
 V	6164d3071edd0e6141c46d91e5bdb13f8e6d5127dea168a56716ef718dc75481	{"attr":{"0":"float","1":"float","2":"float","3":"float","5":"float","6":"float","7":"float","8":"float","9":"float"},"fout":{},"img":{},"tex":{"20":"2d","8":"2d"}}
 V	616501c29738be401d2f11d0f20367f517f05102635b5c78330301864be843ab	{"attr":{},"fout":{"0":"float"},"img":{},"tex":{"1":"2d"}}
 V	616607e6da770673aeaffb731c114292abd31e031118857cc3f5c977b0b7f204	{"attr":{"0":"float","1":"float","10":"float","11":"float","2":"float","3":"float","4":"float","5":"float","6":"float","7":"float","8":"float","9":"float"},"fout":{},"img":{},"tex":{"20":"2d"}}
+V	6166470bdd69e3a08d3b9ad1cbc7eaf83a2fc40eeb0aea027cf00fd31cff371f	{"attr":{},"fout":{"0":"float","1":"float"},"img":{},"tex":{"0":"*","1":"*_depth"}}
 V	6166470bdd69e3a08d3b9ad1cbc7eaf83a2fc40eeb0aea027cf00fd31cff371f	{"attr":{},"fout":{"0":"float","1":"float"},"img":{},"tex":{"0":"2d","1":"2d"}}
 V	6166470bdd69e3a08d3b9ad1cbc7eaf83a2fc40eeb0aea027cf00fd31cff371f	{"attr":{},"fout":{"0":"float","1":"float"},"img":{},"tex":{"0":"2d","1":"2d_depth"}}
 V	6166e9c5db2acfb2a656a21ca8d5a62b13efea1b398659bbf3407953d6625d95	{"attr":{"0":"float","1":"float","2":"float","3":"float","4":"float","5":"float","6":"float","7":"float"},"fout":{},"img":{},"tex":{}}
@@ -23795,6 +23799,7 @@ V	69126d480c63f0351631d194d5c0a1e3347b83d865fc855fd48e8314fd7f77bf	{"attr":{},"f
 V	6912d3a01b66462550d8f4a3b17e5367ca9aa3003274af57576fcb9bd0cf37a3	{"attr":{},"fout":{"0":"float"},"img":{},"tex":{"10":"2d","11":"2d","13":"2d","14":"2d","15":"2d","17":"2d","18":"2d","19":"2d","26":"2d","27":"2d","29":"2d","31":"2d","6":"2d","7":"2d","8":"2d","9":"2d"}}
 V	6913e073722018def9d0fee10526c79a79aefc2717282db84ba658e9a84e6096	{"attr":{},"fout":{"0":"float"},"img":{},"tex":{"0":"2d","1":"2d","2":"2d"}}
 V	69161802ea228acfb9d2e90350bf52fabc0ee7fd19d318b3e4df69c38f2405ad	{"attr":{"0":"float","1":"float","12":"float","2":"float","4":"float","6":"uint","8":"float"},"fout":{},"img":{},"tex":{}}
+V	691719147a1c4bcf9033d939c9c8e5b1c05a6015d8ac8fd70b75621e6bc9cd90	{"attr":{},"fout":{"0":"float","1":"float","2":"float"},"img":{},"tex":{"0":"*","1":"*","2":"*","3":"*","4":"*_depth"}}
 V	691719147a1c4bcf9033d939c9c8e5b1c05a6015d8ac8fd70b75621e6bc9cd90	{"attr":{},"fout":{"0":"float","1":"float","2":"float"},"img":{},"tex":{"0":"2d","1":"2d","2":"2d","3":"2d","4":"2d"}}
 V	691719147a1c4bcf9033d939c9c8e5b1c05a6015d8ac8fd70b75621e6bc9cd90	{"attr":{},"fout":{"0":"float","1":"float","2":"float"},"img":{},"tex":{"0":"2d","1":"2d","2":"2d","3":"2d","4":"2d_depth"}}
 V	69182463180d4f85ab426ece22390c2573a7846eb384bf96cfea26b2b016861e	{"attr":{},"fout":{"0":"float"},"img":{},"tex":{"0":"2d","1":"2d","2":"2d","3":"2d"}}
@@ -30200,6 +30205,7 @@ V	855eeb14aac1b81968e4e67b20119be86d24c9d29ece32570cd1610199925392	{"attr":{},"f
 V	855f9ce9d8c9d2941f2456704301cf5973ddf46a8645bbe854a648558bd05218	{"attr":{},"fout":{"0":"float"},"img":{},"tex":{"10":"2d","11":"2d","12":"2d","17":"2d"}}
 V	856021ac8df8cf4cb80702e7335d761b5a32a626c60846ee03cd5489f36913e7	{"attr":{},"fout":{"0":"float","1":"float"},"img":{},"tex":{"0":"2d","12":"2d","13":"2d","14":"2d","15":"2d","16":"2d","17":"2d","18":"2d","19":"2d","25":"2d","7":"2d","8":"2d","9":"2d"}}
 V	8560d1668d10859b5ac87d64ae11ea53e42818bdd186cc39d96d931191e9f60a	{"attr":{"0":"float","1":"float","2":"float","3":"float","4":"float","5":"float","6":"float","7":"float","8":"float"},"fout":{},"img":{},"tex":{"20":"2d"}}
+V	8560db7c984b51a9c9b5142a2f32b5c73ec1a0e6a48fee827234a82278a4a2ef	{"attr":{},"fout":{"0":"float"},"img":{},"tex":{"0":"*_depth"}}
 V	8560db7c984b51a9c9b5142a2f32b5c73ec1a0e6a48fee827234a82278a4a2ef	{"attr":{},"fout":{"0":"float"},"img":{},"tex":{"0":"2d"}}
 V	8560db7c984b51a9c9b5142a2f32b5c73ec1a0e6a48fee827234a82278a4a2ef	{"attr":{},"fout":{"0":"float"},"img":{},"tex":{"0":"2d_depth"}}
 V	85625104f396ec6906a104c7d1d112211578d40811f4b0a0b3c376590bcdf5bf	{"attr":{},"fout":{"0":"float"},"img":{},"tex":{"10":"2d","11":"2d","12":"2d","17":"2d","19":"2d"}}
@@ -41912,6 +41918,7 @@ V	b9040e690d97520683df1d5ad6c0e4ab50015b0987cd987e64d98e2f4d847a61	{"attr":{},"f
 V	b906481234a6a989e8fc4870d0f405e76293bc7e970c1d9ba88e000dbec1cfe1	{"attr":{},"fout":{"1":"float","3":"float"},"img":{},"tex":{"23":"2d","24":"2d"}}
 V	b906481234a6a989e8fc4870d0f405e76293bc7e970c1d9ba88e000dbec1cfe1	{"attr":{},"fout":{"1":"float","3":"float"},"img":{},"tex":{"23":"2darray","24":"2darray"}}
 V	b9065bd50239442609f7f60580917ca8b954b6da623f91b32ed14330b46ab066	{"attr":{},"fout":{"0":"float","1":"float","3":"float","5":"float","7":"float"},"img":{},"tex":{"13":"2d","14":"2d","15":"2d","16":"2d","27":"2d","28":"2d","8":"2d","9":"2d"}}
+V	b9078968005b6a2c04669d9e85b266a1057d2aab2a983fed8e123e4c9bf1f09e	{"attr":{},"fout":{},"img":{},"tex":{"6":"*_depth"}}
 V	b9078968005b6a2c04669d9e85b266a1057d2aab2a983fed8e123e4c9bf1f09e	{"attr":{},"fout":{},"img":{},"tex":{"6":"2d_depth"}}
 V	b9086b617478a7c0325139259828ec4dc327e733f86264724ae65891590c154c	{"attr":{},"fout":{"0":"float"},"img":{},"tex":{"0":"2d","1":"2d","10":"cube","4":"2d"}}
 V	b90963f4958fa9551e2181a20a1d64ff4b79c4c58acd9fd27b349054cfee578b	{"attr":{},"fout":{"0":"float","1":"float","3":"float","5":"float"},"img":{},"tex":{"15":"2d","16":"2d","17":"2d","18":"2d","19":"2d","20":"2d"}}

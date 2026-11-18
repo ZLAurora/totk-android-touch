@@ -61,7 +61,20 @@ static uint64_t copy_gate(uint8_t *src, VkBuffer dst, uint64_t dst_offset, VkEve
 }
 static void inflight(int shutdown) {
     size_t n = 131072, pg = (size_t)getpagesize(); uint8_t *src = pages(n), *alias = pages(n);
-    memset(src, 0x4d, n); register_pool(src, n); mtl_pool_add(src + pg, pg);
+    int alias_fd = -1;
+    const char *alias_setting = getenv("TOTK_WB_ALIAS");
+    if (alias_setting && !strcmp(alias_setting, "1")) {
+        alias_fd = memfd_create("finalize-private-alias", MFD_CLOEXEC);
+        need(alias_fd >= 0 && !ftruncate(alias_fd, n), "private alias fixture backing");
+        need(mmap(src, n, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, alias_fd, 0) == src,
+            "real shared owner backing before host import");
+    }
+    memset(src, 0x4d, n); register_pool(src, n);
+    if (alias_fd >= 0) {
+        need(vk_wb_test_alias_attach(src, n, alias_fd, 0), "private writer attached during genuine finalize/completion race");
+        close(alias_fd);
+    }
+    mtl_pool_add(src + pg, pg);
     if (mremap(src, 0, n, MREMAP_MAYMOVE | MREMAP_FIXED, alias) != alias) runtime_fail("shared alias");
     vk_record_test_alias(alias, (uint64_t)(uintptr_t)src, n);
     nvn_dirty_protect(src, n);

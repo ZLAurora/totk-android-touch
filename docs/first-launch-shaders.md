@@ -4,16 +4,19 @@
 
 旧打包器只复制 PSO 标识清单，没有复制标识对应的 MSL、反射和依赖索引。空缓存实测预热为 0 个着色器，清单中有 2,171 个着色器标识缺少实际翻译数据。已有存档机器上的预热效果不能代表首次安装。
 
-## Android list refresh (2026-11-11)
+## Android list refresh (2026-11-17)
 
 The counts and timings below are historical Mac/iOS evidence, not current Android setup costs.
-Android's V-only refresh adds 301 rows whose keys occur in the 1.4.3 inventory, while preserving
+Android's November 11 V-only refresh added 301 rows; the November 17 refresh adds seven more
+whose keys occur in the 1.4.3 inventory, while preserving
 all existing variants and warm rows. See [the integration ledger](../games/totk/android/UPSTREAM_MERGE.md)
 for the source pin, filtering and exclusions, and [Android install guidance](../games/totk/android/APP.md)
 for rebuilding an existing install. The list digest invalidates preparation/resume identity, not
 the completed installation or driver pipeline-cache identity; updating the APK alone does not
-regenerate an existing seed. Default/listed dependency deduplication still applies, so 301 requests
-must not be advertised as 301 additional translated modules.
+regenerate an existing seed. The seven new requests translate without failures or dependency duplicates:
+the current host seed grows from 25,032 to 25,039 modules (+440,192 packed bytes).
+Existing packs remain usable; a full rebuild regenerates `seed.vkpack` and `seed-id.txt` for this coverage.
+This is host structural/reflection validation, not device rendering qualification or a frame-rate claim.
 
 ## 构建与启动行为
 

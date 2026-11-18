@@ -6,6 +6,29 @@ This ledger classifies all 57 upstream-only commits before merging. **Useful** m
 Historical upstream device evidence is in `DEBUGGING.md`; dev device evidence is in `VULKAN.md`.
 The per-round sections below distinguish later owner-reported combined-build results from host-only verification.
 
+## November 17 shader-list refresh (V rows only)
+
+Repeat the November 11 identifier-only procedure against MacNativeGames
+`5fb080496ab7dc45af03fa02caa42f8ac3f87e11`, using the exact `(shader key, canonical dependency JSON)`
+identity and authenticated 1.4.3 inventory membership. The source adds 955 V rows since `a8ff9bc429bf`;
+seven apply to our inventory and are absent locally, while the earlier 301 remain present.
+Merge only those seven with `games/totk/scripts/shader_list.py merge`; preserve all existing rows
+and ordered non-V content, with no R/A/B/T/S imports or reference code/payloads.
+
+Final V/R/S/C counts are **58,073 / 61,613 / 1,557 / 63**; list SHA-256:
+`c4668305ac5838fbc30a22bb7de7d6a1329c0f291a641209c0203dc489ec995b`.
+Fresh current-source Vulkan translation produces **25,032 → 25,039 modules**, zero failures,
+and **+440,192 packed bytes**. The seven rows have no default/listed dependency duplicates;
+all surviving-name SPIR-V/reflection payloads are unchanged, and seven `.vv` indexes gain entries.
+Full pack layout/hash/identity/index/reflection checks pass on both sides.
+
+Existing packs remain valid: this data-only change requires no chain/epoch or driver-cache invalidation.
+To gain coverage, explicitly perform a full shader rebuild, regenerating `seed.vkpack` and `seed-id.txt`;
+preparation and interrupted-setup reuse identities change with the list digest. Preserve deployed desktop
+exact names using the existing procedure below. No APK update alone replaces an installed seed.
+Evidence: `.scratch/ref-updates-2026-11-17/apply/report.md` and `item1.json`.
+No device timing, visual qualification or steady-state speedup is claimed.
+
 ## November 11 shader-list refresh (V rows only)
 
 Source: switch2mac fetched `origin/main` `b2ad88d8cc2e880f5d895d7a2580e1355f00652b`

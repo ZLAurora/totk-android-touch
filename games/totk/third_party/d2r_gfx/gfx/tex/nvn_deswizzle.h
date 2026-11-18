@@ -22,6 +22,13 @@ int nvn_swizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const void
    Padding stays untouched. Spans beyond actual texels are allowed for trailing level/layer alignment. */
 int nvn_swizzle_span(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src_linear, size_t src_pitch,
                      void *dst_storage, uint64_t offset, uint64_t size);
+/* Same encoder into an independently mapped destination span: dst_span names the byte at
+   layer * layer_size + level_offset + offset, not the whole-texture storage start.
+   Arbitrary byte offsets/sizes are supported, including partial GOBs and 16-byte runs.
+   Only texel bytes inside the span are copied; padding and trailing alignment stay untouched.
+   No allocation or pointer before dst_span is needed. Return values match nvn_swizzle. */
+int nvn_swizzle_span_into(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src_linear, size_t src_pitch,
+                          void *dst_span, uint64_t offset, uint64_t size);
 /* The decoder over the same kind of span: only the texels stored in [offset, offset + size) of this level/layer land in
    dst_linear, at the places nvn_deswizzle puts them. Disjoint spans write disjoint bytes, so spans that tile the
    level/layer may be decoded concurrently and together equal nvn_deswizzle (parallel uploads, vk_upload_pool.c). */

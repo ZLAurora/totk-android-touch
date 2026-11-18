@@ -1209,6 +1209,21 @@ static int wb_copy(wb_ent *e) {
     if (!result) wb_tile_event(e->tile_version, "copy-allocation-failed", 0, 0);
     wb_diag_end(WB_D_COPY, start); return result;
 }
+/* Pool lifetime is already pinned by vk_wb_pool_lock. Every destination pointer
+   denotes a real mapped owner span, never an artificial whole-texture base
+   before an alias allocation. The encoder leaves padding untouched. */
+static int wb_swizzle_alias(const tex_t *t, unsigned level, unsigned layer,
+                            const void *source, size_t pitch, uint64_t first, uint64_t bytes) {
+    uint64_t storage = (uint64_t)layer * t->L.layer_size + nvn_tex_level_offset(&t->d, level);
+    while (bytes) {
+        size_t available = 0;
+        void *destination = vk_wb_alias_span_locked((uintptr_t)t->mem + storage + first, (size_t)bytes, &available);
+        if (!destination || !available) return -1; /* prevalidated under the same lifetime lock */
+        if (nvn_swizzle_span_into(&t->d, level, layer, source, pitch, destination, first, available)) return -1;
+        first += available; bytes -= available;
+    }
+    return 0;
+}
 /* Returns 3 for partial progress, 2 to defer without waiting, 1 if complete, 0 if CPU-newer, -1 if invalid. */
 static int wb_land_inner(wb_ent *e, enum wb_land_mode mode, uint64_t limit, uint64_t *advanced) {
     const tex_t *t = &e->t; int settled = mode != WB_SYNC; wb_shape s = wb_layout(e);
@@ -1227,10 +1242,25 @@ static int wb_land_inner(wb_ent *e, enum wb_land_mode mode, uint64_t limit, uint
     if (settled) nvn_dirty_test_wb_phase(t->mem, NVN_DIRTY_TEST_WB_BEFORE_OWNERSHIP);
 #endif
     void *token = NULL;
+    /* Mixed/unsupported backing and records without watch/ownership eligibility
+       retain the original protocol for this landing extent. Range registration
+       alone must not select a private destination for a no-token synchronous record. */
+    int alias_enabled = vk_wb_alias_enabled();
+    vk_wb_alias_reason alias_reason = VK_WB_ALIAS_PATH_OTHER;
+    if (alias_enabled) {
+        alias_reason = !e->tracked || !nvn_dirty_tracked(t->mem + offset, span) ?
+            VK_WB_ALIAS_PATH_OWNERSHIP :
+            vk_wb_alias_reason_locked((uintptr_t)t->mem + offset, (size_t)span);
+    }
+    int private_alias = alias_enabled && alias_reason == VK_WB_ALIAS_PATH_ALIAS;
     if (mode == WB_IDLE || mode == WB_INVALIDATE_TRY) {
-        if (!nvn_dirty_gpu_write_try_begin((void *)(t->mem + offset), span, &token)) { vk_wb_pool_unlock(); return 2; }
+        int ready = private_alias ?
+            nvn_dirty_gpu_write_alias_try_begin((void *)(t->mem + offset), span, &token) :
+            nvn_dirty_gpu_write_try_begin((void *)(t->mem + offset), span, &token);
+        if (!ready) { vk_wb_pool_unlock(); return 2; }
     } else if (e->tracked) {
-        token = nvn_dirty_gpu_write_begin(t->mem, t->L.size);
+        token = private_alias ? nvn_dirty_gpu_write_alias_begin(t->mem, t->L.size) :
+            nvn_dirty_gpu_write_begin(t->mem, t->L.size);
         if (!token) { vk_wb_pool_unlock(); wb_tile_event(e->tile_version, "ownership-untracked", 0, 0); return -1; }
     }
 #ifdef TOTK_VK_TESTS
@@ -1238,10 +1268,10 @@ static int wb_land_inner(wb_ent *e, enum wb_land_mode mode, uint64_t limit, uint
 #endif
     /* Check AFTER taking the existing dirty page/unit ownership: a writer already in the fault handler either wins
        first (and its newer stamp rejects us) or waits until restoration. Keep the pool lifetime locked through end.
-       CPU-visible physical pools have no private RW alias (totk_vpool_backing names the game's physical view), so this
-       uses the synchronous write-back's temporary-RW protocol. Residual window: a fresh direct game store while these
-       pages are temporarily RW can bypass the handler, including just BEFORE this freshness check. Only writers
-       which fault while RO participate in dirty ownership; this is not strict exclusion of arbitrary stores. */
+       The private-alias path leaves the guest mapping RO throughout ownership:
+       a fresh raw CPU store faults, waits on PG_BUSY, and is observed after end.
+       Unsupported backing keeps the old temporary-RW protocol and its documented
+       residual window; no stronger exclusion is claimed for that fallback. */
     int fresh = !(settled && !e->tracked) && !wb_cpu_newer(e);
 #ifdef TOTK_VK_TESTS
     if (settled) nvn_dirty_test_wb_phase(t->mem, NVN_DIRTY_TEST_WB_AFTER_FRESHNESS);
@@ -1250,13 +1280,18 @@ static int wb_land_inner(wb_ent *e, enum wb_land_mode mode, uint64_t limit, uint
         totk_texcopy_log(vk_submit_serial(), "phase=res event=invalidate-freshness ser=%llu image=%#llx result=%s",
             (unsigned long long)t->serial, (unsigned long long)(uintptr_t)e->im->img, fresh ? "gpu-authoritative" : "skip-cpu-newer");
     int ok = 1;
+    uint64_t dispatched_bytes = 0;
     if (fresh) do {
         unsigned l = e->land_level;
         uint64_t level = nvn_tex_level_offset(&t->d, l);
         uint64_t end = l + 1 < s.levels ? nvn_tex_level_offset(&t->d, l + 1) : t->L.layer_size;
         uint64_t n = mode == WB_IDLE ? span : end - level - e->land_pos;
         size_t pitch = (size_t)((MAXV(e->im->w >> l, 1u) + s.bw - 1) / s.bw) * s.bpb;
-        if (nvn_swizzle_span(&t->d, l, e->land_layer, e->bytes + e->land_src, pitch, (void *)t->mem, e->land_pos, n)) { ok = 0; break; }
+        if (alias_enabled) dispatched_bytes += n;
+        int encoded = private_alias ?
+            wb_swizzle_alias(t, l, e->land_layer, e->bytes + e->land_src, pitch, e->land_pos, n) :
+            nvn_swizzle_span(&t->d, l, e->land_layer, e->bytes + e->land_src, pitch, (void *)t->mem, e->land_pos, n);
+        if (encoded) { ok = 0; break; }
         e->land_pos += n; if (advanced) *advanced += n;
         if (e->land_pos == end - level) {
             e->land_pos = 0; e->land_src += wb_level_size(e, s, l);
@@ -1264,6 +1299,8 @@ static int wb_land_inner(wb_ent *e, enum wb_land_mode mode, uint64_t limit, uint
         }
         if (mode == WB_IDLE) break;
     } while (e->land_level < s.levels);
+    if (alias_enabled && dispatched_bytes)
+        vk_wb_alias_account(VK_WB_ALIAS_LANDING, alias_reason, dispatched_bytes);
     nvn_dirty_gpu_write_end(token);
 #ifdef TOTK_VK_TESTS
     if (settled) nvn_dirty_test_wb_phase(t->mem, NVN_DIRTY_TEST_WB_RESTORED);

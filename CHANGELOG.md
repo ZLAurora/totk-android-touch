@@ -6,6 +6,9 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
 ## Unreleased
 
 ### Developer tools
+- Add enabled-only `TOTK_WB_ALIAS=1` path coverage: cumulative operations/bytes by landing, report/event store
+  and publication, separated into alias and fallback reasons at periodic memory reports, Android pause and normal exit.
+  Publish pause-report enablement atomically so early Android lifecycle callbacks can race Vulkan initialization safely.
 - Add launch-only, default-off `TOTK_BENCH_TIME=HH:MM` for restored-save benchmark arms.
   It pins the native effective clock, overriding timeline/sleep/day progression; weather and randomness remain uncontrolled.
   Host guards and ARM64 state fixtures do not establish device HUD/sky or unchanged-save behavior.
@@ -30,6 +33,23 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   policy; game pacing and Android settings remain unchanged.
 
 ### Runtime
+- Refresh the shared shader list with seven more upstream variants applicable to game 1.4.3
+  (`5fb080496ab7`, V rows only). Fresh host translation prepares 25,039 modules instead of 25,032,
+  with zero failures and about 430 KiB of additional packed data. Existing shader packs stay valid;
+  run a full shader rebuild to receive the added coverage.
+- Add experimental, launch-only `TOTK_WB_ALIAS=1` (default off): use a retained same-backing private CPU mapping
+  for supported dirty-tracked write-back extents and eligible report/event/uniform stores, without temporarily
+  making protected guest pages writable. Preserve CPU-write detection, GPU synchronization and zero-on-recommit;
+  unsupported backing and contended report/event/uniform publications keep the old path. This closes the
+  protected-page temporary-RW race, not already-writable/unwatched aliases. Cost is extra mappings/VA, not copied backing.
+  Off preserves the original path and logs. First AYN Thor device evidence, over five common completed loads:
+  texture GPU-unprotect boundaries 0 versus 17,214; whole-process row growth averaged +1,025 versus +4,535/load.
+  No switch-attributable picture corruption was observed. Pooled standing frame tails were SAME, but some individual
+  phases had worse tails; this one ordered alias/legacy pair is not a speed proof. Odin and Duo remain untested.
+  Keep the switch default off; it prevents this fragmentation source, not all mapping growth.
+- Correct the experimental private writer's virtual-mapping authority across production MapVirtual replacements,
+  including anonymous unmaps and fallback remaps; serialize replacement and invalidation with borrowed writers.
+  Watch-slot-exhausted synchronous records keep the original no-token guest-store path rather than bypass ownership.
 - Fix shader translation for compute texture gathers with runtime offsets.
   The translator now lowers those offsets before emitting SPIR-V instead of putting runtime values in constants.
   Existing generated shader seeds need replacement to receive the corrected modules.

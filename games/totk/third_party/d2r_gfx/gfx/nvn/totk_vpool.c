@@ -39,7 +39,12 @@ static uint8_t *vm_fresh(uint64_t span) {
     if (p == MAP_FAILED) { LOG("【红】vpool: mmap(%#llx) failed: %s", (unsigned long long)span, strerror(errno)); return NULL; }
     return p;
 }
-static void vm_release(uint8_t *p, uint64_t span) { munmap(p, span); }
+static void vm_release(uint8_t *p, uint64_t span) {
+    /* Preserve the original ignored-munmap-error policy, but never repeat a handled attempt outside
+       the backend lock. Enabled release also retires GPU_NO_ACCESS MapVirtual registrations. */
+    if (mtl_vpool_release && mtl_vpool_release(p, span)) return;
+    munmap(p, span);
+}
 #else
 static void vm_release(uint8_t *p, uint64_t span) { mach_vm_deallocate(mach_task_self(), (mach_vm_address_t)(uintptr_t)p, span); }
 static uint8_t *vm_fresh(uint64_t span) {
@@ -104,17 +109,17 @@ int totk_vpool_backing(uintptr_t va, uint64_t len, uintptr_t *cpu) {
 #if !defined(__APPLE__)
 static int apply_request(pool_t *v, const totk_mapping_request *r) {
     uint8_t *dst = v->mem + r->virtual_offset;
+    const pool_t *p = (const pool_t *)(const void *)r->physical_pool;
+    uint8_t *src = p ? p->mem + r->physical_offset : NULL;
+    int handled = mtl_vpool_replace ? mtl_vpool_replace(dst, src, r->size) : 0;
     void *got;
-    if (!r->physical_pool) {   /* unmap: fresh zero pages */
+    if (handled) got = handled > 0 ? (void *)dst : MAP_FAILED;
+    else if (!src)             /* unmap: fresh zero pages */
         got = mmap(dst, r->size, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_SHARED | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-        if (got == dst) vmap_note((uintptr_t)dst, r->size, 0);
-    } else {                   /* alias the physical pages: a second mapping of the same shared pages */
-        const pool_t *p = (const pool_t *)(const void *)r->physical_pool;
-        uint8_t *src = p->mem + r->physical_offset;
+    else                       /* alias the physical pages: a second mapping of the same shared pages */
         got = mtl_pool_alias && mtl_pool_alias(dst, src, r->size) ? (void *)dst   /* the backend's own pool memory (nvn_mtl.h) */
             : mremap(src, 0, r->size, MREMAP_MAYMOVE | MREMAP_FIXED, dst);
-        if (got == dst) vmap_note((uintptr_t)dst, r->size, (uintptr_t)src);
-    }
+    if (got == dst) vmap_note((uintptr_t)dst, r->size, (uintptr_t)src);
     if (got != dst) {
         LOG("【红】vpool: %s at %p size %#llx failed: %s", r->physical_pool ? "alias" : "unmap", (void *)dst, (unsigned long long)r->size, strerror(errno));
         return 0;
