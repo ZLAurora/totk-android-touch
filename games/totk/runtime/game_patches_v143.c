@@ -215,7 +215,6 @@ static void patch_touch_orbit(Module *m) {
     if (original != expected)
         runtime_fail("1.4.3 touch-orbit original instruction mismatch");
    
-   return;
 
     /*
      * Existing 1.4.3 veneers occupy +20 through +916.
